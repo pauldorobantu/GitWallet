@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/dist/
+*.user
+.DS_Store
+Thumbs.db
+build-out.txt
+build-err.txt
+selftest-*.txt

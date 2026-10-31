@@ -1,0 +1,353 @@
+#include "ui/TitleBar.h"
+#include "ui/Icons.h"
+#include "ui/LanguageManager.h"
+#include "ui/ThemeManager.h"
+#include "core/SettingsRepo.h"
+
+#include <QAction>
+#include <QColor>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QMenu>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QRegularExpression>
+#include <QToolButton>
+#include <QVector>
+
+namespace {
+// Cele 5 limbi suportate (fără română) — cod + nume nativ.
+struct Lang { const char* code; const char* name; };
+const Lang kLangs[] = {
+    { "en", "English" }, { "es", "Español" }, { "fr", "Français" },
+    { "de", "Deutsch" }, { "ru", "Русский" },
+};
+} // namespace
+
+namespace app::ui {
+
+namespace {
+
+QIcon tbIcon(icon::Kind kind, const QColor& color)
+{
+    // The captions (minimize/maximize/restore/close) use the vector-drawn
+    // Win11 glyphs — Lucide's "Maximize"=expand arrows and
+    // "Restore"=copy are wrong for window buttons.
+    switch (kind) {
+    case icon::Kind::Minimize:
+    case icon::Kind::Maximize:
+    case icon::Kind::Restore:
+    case icon::Kind::Close:
+        return makeCaptionIcon(kind, color, 16);
+    default:
+        return makeIcon(kind, color, 16, 1.5);
+    }
+}
+
+QPixmap statusDotPixmap(bool active, qreal dpr)
+{
+    const int d = 8;
+    QPixmap pm(qRound(d * dpr), qRound(d * dpr));
+    pm.setDevicePixelRatio(dpr);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(Qt::NoPen);
+    p.setBrush(active ? theme::ThemeManager::instance()->color(QStringLiteral("accent"))
+                      : theme::ThemeManager::instance()->color(QStringLiteral("muted")));
+    p.drawEllipse(QRectF(0.5, 0.5, d - 1, d - 1));
+    p.end();
+    return pm;
+}
+
+} // namespace
+
+TitleBar::TitleBar(QWidget* window, QWidget* parent)
+    : QWidget(parent)
+    , window_(window)
+{
+    setObjectName(QStringLiteral("titleBar"));
+    // Fundalul #titleBar din QSS se pictează doar cu atributul ăsta (altfel
+    // bara arată culoarea ramei #appRoot de dedesubt).
+    setAttribute(Qt::WA_StyledBackground, true);
+    setFixedHeight(38);
+
+    auto* layout = new QHBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+
+    // The collapse hamburger now lives at the top of the sidebar (Claude
+    // desktop style); the title bar stays a drag zone + status + window controls.
+    layout->addStretch(1);
+
+    // Selector limbă (5 limbi, fără română) — buton cu codul curent + popup.
+    langBtn_ = new QToolButton(this);
+    langBtn_->setObjectName(QStringLiteral("tbLang"));
+    langBtn_->setCursor(Qt::PointingHandCursor);
+    langBtn_->setPopupMode(QToolButton::InstantPopup);
+    langBtn_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    langBtn_->setFixedHeight(34); // aceeași formă de hover ca themeBtn_ (34px)
+    {
+        auto* menu = new QMenu(langBtn_);
+        for (const Lang& l : kLangs) {
+            QAction* a = menu->addAction(QString::fromUtf8(l.name));
+            a->setData(QString::fromLatin1(l.code));
+            connect(a, &QAction::triggered, this, [this, a]() {
+                const QString code = a->data().toString();
+                SettingsRepo().set(QStringLiteral("ui.language"), code);
+                emit languageSelected(code);
+                refreshLangButton();
+            });
+        }
+        langBtn_->setMenu(menu);
+    }
+    langBtn_->setToolTip(QStringLiteral("Interface language"));
+    refreshLangButton();
+    // The language can also change from Settings → Application.
+    connect(LanguageManager::instance(), &LanguageManager::changed, this,
+            [this]() { refreshLangButton(); });
+    layout->addWidget(langBtn_, 0, Qt::AlignVCenter);
+
+    // Comutator temă light/dark.
+    themeBtn_ = new QToolButton(this);
+    themeBtn_->setObjectName(QStringLiteral("tbTheme"));
+    themeBtn_->setCursor(Qt::PointingHandCursor);
+    themeBtn_->setFixedSize(34, 34);
+    themeBtn_->setIconSize(QSize(17, 17));
+    refreshThemeIcon();
+    connect(themeBtn_, &QToolButton::clicked, this, []() {
+        auto* tm = theme::ThemeManager::instance();
+        auto app = tm->appearance();
+        app.theme = tm->isDark() ? QStringLiteral("light") : QStringLiteral("dark");
+        tm->updateAppearance(app); // salvează + aplică instant
+    });
+    connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this,
+            [this]() { refreshThemeIcon(); refreshStatusDot(); });
+    layout->addWidget(themeBtn_, 0, Qt::AlignVCenter);
+
+    // Settings + About — utilitățile stau în bara de sus, nu în sidebar.
+    const auto makeUtilityBtn = [this](const QString& tip) {
+        auto* btn = new QToolButton(this);
+        btn->setObjectName(QStringLiteral("tbTheme"));
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setFixedSize(34, 34);
+        btn->setIconSize(QSize(17, 17));
+        btn->setToolTip(tip);
+        return btn;
+    };
+    settingsBtn_ = makeUtilityBtn(QStringLiteral("Settings"));
+    aboutBtn_ = makeUtilityBtn(QStringLiteral("About"));
+    refreshUtilityIcons();
+    connect(settingsBtn_, &QToolButton::clicked, this, &TitleBar::settingsRequested);
+    connect(aboutBtn_, &QToolButton::clicked, this, &TitleBar::aboutRequested);
+    connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this,
+            [this]() { refreshUtilityIcons(); });
+    layout->addWidget(settingsBtn_, 0, Qt::AlignVCenter);
+    layout->addWidget(aboutBtn_, 0, Qt::AlignVCenter);
+    layout->addSpacing(8);
+
+    // Status live: chip pill cu punct colorat + text (page · running · proxy).
+    statusChip_ = new QWidget(this);
+    statusChip_->setObjectName(QStringLiteral("tbStatusChip"));
+    auto* chipLayout = new QHBoxLayout(statusChip_);
+    chipLayout->setContentsMargins(10, 4, 12, 4);
+    chipLayout->setSpacing(7);
+    statusDot_ = new QLabel(statusChip_);
+    statusDot_->setObjectName(QStringLiteral("tbStatusDot"));
+    statusText_ = new QLabel(statusChip_);
+    statusText_->setObjectName(QStringLiteral("tbStatusText"));
+    chipLayout->addWidget(statusDot_, 0, Qt::AlignVCenter);
+    chipLayout->addWidget(statusText_, 0, Qt::AlignVCenter);
+    statusChip_->hide();
+
+    layout->addSpacing(10);
+    layout->addWidget(statusChip_, 0, Qt::AlignVCenter);
+    layout->addSpacing(6);
+
+    auto* minBtn = makeWindowButton(static_cast<int>(icon::Kind::Minimize), "tbMin");
+    auto* maxBtn = makeWindowButton(static_cast<int>(icon::Kind::Maximize), "tbMax");
+    auto* closeBtn = makeWindowButton(static_cast<int>(icon::Kind::Close), "tbClose");
+    minBtn->setToolTip(QStringLiteral("Minimize"));
+    maxBtn->setToolTip(QStringLiteral("Maximize / Restore"));
+    closeBtn->setToolTip(QStringLiteral("Close"));
+    // The button glyph tracks the window state: maximized → Restore.
+    maxBtn_ = maxBtn;
+    window_->installEventFilter(this);
+    refreshMaxButton();
+
+    layout->addWidget(minBtn);
+    layout->addWidget(maxBtn);
+    layout->addWidget(closeBtn);
+
+    connect(minBtn, &QToolButton::clicked, this, &TitleBar::minimised);
+    connect(maxBtn, &QToolButton::clicked, this, &TitleBar::maximised);
+    connect(closeBtn, &QToolButton::clicked, this, &TitleBar::closed);
+}
+
+void TitleBar::setUtilityButtonsVisible(bool on)
+{
+    for (QToolButton* b : { settingsBtn_, aboutBtn_ })
+        if (b)
+            b->setVisible(on);
+}
+
+void TitleBar::setStatus(const QString& text)
+{
+    if (!statusChip_ || !statusText_)
+        return;
+    if (text.trimmed().isEmpty()) {
+        statusChip_->hide();
+        return;
+    }
+    statusText_->setText(text);
+    refreshStatusDot();
+    statusChip_->show();
+}
+
+void TitleBar::refreshStatusDot()
+{
+    if (!statusDot_)
+        return;
+    const QString text = statusText_ ? statusText_->text() : QString();
+    // "N running" (N > 0) → active green; otherwise gray.
+    const bool active = QRegularExpression(QStringLiteral("\\b[1-9]\\d* running"))
+                            .match(text)
+                            .hasMatch();
+    statusDot_->setPixmap(statusDotPixmap(active, devicePixelRatioF()));
+}
+
+void TitleBar::refreshThemeIcon()
+{
+    if (!themeBtn_)
+        return;
+    const bool dark = theme::ThemeManager::instance()->isDark();
+    const QColor c = theme::ThemeManager::instance()->color(QStringLiteral("textSoft"));
+    // Dark → arată soarele (comută spre light); light → luna.
+    themeBtn_->setIcon(makeIcon(dark ? icon::Kind::Sun : icon::Kind::Moon, c, 17, 1.8));
+    themeBtn_->setToolTip(dark ? QStringLiteral("Switch to light theme")
+                               : QStringLiteral("Switch to dark theme"));
+}
+
+void TitleBar::refreshUtilityIcons()
+{
+    const QColor c = theme::ThemeManager::instance()->color(QStringLiteral("textSoft"));
+    if (settingsBtn_)
+        settingsBtn_->setIcon(makeIcon(icon::Kind::Settings, c, 17, 1.8));
+    if (aboutBtn_)
+        aboutBtn_->setIcon(makeIcon(icon::Kind::Shield, c, 17, 1.8));
+}
+
+void TitleBar::refreshLangButton()
+{
+    if (!langBtn_)
+        return;
+    QString code = SettingsRepo().get(QStringLiteral("ui.language"));
+    if (code.isEmpty())
+        code = QStringLiteral("en");
+    langBtn_->setText(code.left(2).toUpper());
+}
+
+QToolButton* TitleBar::makeWindowButton(int iconKind, const char* objectName)
+{
+    auto* btn = new QToolButton(this);
+    const auto kind = static_cast<icon::Kind>(iconKind);
+    const bool isClose = kind == icon::Kind::Close;
+    const auto baseIcon = [kind](const QColor& c) {
+        return tbIcon(kind, c);
+    };
+    btn->setIcon(baseIcon(theme::ThemeManager::instance()->color(
+        QStringLiteral("textSoft"))));
+    btn->setIconSize(QSize(16, 16));
+    btn->setFixedSize(38, 38); // square, full bar height (Win11 style)
+    btn->setCursor(Qt::ArrowCursor);
+    btn->setObjectName(QString::fromLatin1(objectName));
+
+    // Close (Win11): on hover, red background + white glyph — the icon switches
+    // on enter/leave; the other buttons keep their glyph.
+    if (isClose) {
+        const QIcon white = baseIcon(QColor(0xFF, 0xFF, 0xFF));
+        btn->installEventFilter(this);
+        closeButtons_.append({ btn, white });
+    }
+
+    connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, btn,
+            [this, btn, kind, baseIcon, isClose]() {
+                if (isClose && btn->underMouse())
+                    return;
+                if (btn == maxBtn_) {
+                    refreshMaxButton();
+                    return;
+                }
+                btn->setIcon(baseIcon(theme::ThemeManager::instance()->color(
+                    QStringLiteral("textSoft"))));
+            });
+    return btn;
+}
+
+void TitleBar::refreshMaxButton()
+{
+    if (!maxBtn_)
+        return;
+    const bool maximized = window_ && window_->isMaximized();
+    maxBtn_->setIcon(tbIcon(maximized ? icon::Kind::Restore : icon::Kind::Maximize,
+                            theme::ThemeManager::instance()->color(
+                                QStringLiteral("textSoft"))));
+    maxBtn_->setToolTip(maximized ? QStringLiteral("Restore")
+                                  : QStringLiteral("Maximize / Restore"));
+}
+
+bool TitleBar::eventFilter(QObject* watched, QEvent* event)
+{
+    // Window state change (maximize/restore) → matching glyph.
+    if (watched == window_ && event->type() == QEvent::WindowStateChange)
+        refreshMaxButton();
+
+    // Close: white icon while the button is under the mouse (the red hover comes from QSS).
+    if (event->type() == QEvent::Enter || event->type() == QEvent::Leave) {
+        for (const auto& [btn, whiteIcon] : closeButtons_) {
+            if (btn == watched) {
+                const bool entering = (event->type() == QEvent::Enter);
+                if (entering)
+                    btn->setIcon(whiteIcon);
+                else
+                    btn->setIcon(tbIcon(icon::Kind::Close,
+                                        theme::ThemeManager::instance()->color(
+                                            QStringLiteral("textSoft"))));
+                break;
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void TitleBar::mousePressEvent(QMouseEvent* event)
+{
+    if (event->button() == Qt::LeftButton) {
+        dragging_ = true;
+        dragOrigin_ = event->globalPosition().toPoint() - window_->frameGeometry().topLeft();
+    }
+    QWidget::mousePressEvent(event);
+}
+
+void TitleBar::mouseMoveEvent(QMouseEvent* event)
+{
+    if (dragging_ && (event->buttons() & Qt::LeftButton)) {
+        window_->move(event->globalPosition().toPoint() - dragOrigin_);
+    }
+    QWidget::mouseMoveEvent(event);
+}
+
+void TitleBar::mouseReleaseEvent(QMouseEvent* event)
+{
+    dragging_ = false;
+    QWidget::mouseReleaseEvent(event);
+}
+
+void TitleBar::mouseDoubleClickEvent(QMouseEvent* event)
+{
+    if (event->button() == Qt::LeftButton)
+        emit maximised();
+    QWidget::mouseDoubleClickEvent(event);
+}
+
+} // namespace app::ui

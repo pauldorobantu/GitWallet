@@ -1,0 +1,16 @@
+<!-- @license lucide-static v0.544.0 - ISC -->
+<!-- ChevronUp tintat muted dark (#969188) — spin up / sort în QSS (dark). -->
+<svg
+  class="lucide lucide-chevron-up"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="#969188"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m18 15-6-6-6 6" />
+</svg>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Merged into app.exe's manifest (CMakeLists.txt). The DLLs app.exe loads sit
+     in lib\ (docs/portable-layout.md): this dependency on the private assembly
+     "lib" makes Windows take them from there, as listed in lib\lib.manifest
+     (written by cmake/DeployRuntime.cmake). -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="lib" version="1.0.0.0" processorArchitecture="amd64"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
