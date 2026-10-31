@@ -1,6 +1,7 @@
 #include "chain/SelfTest.h"
 
 #include "chain/Address.h"
+#include "chain/Amount.h"
 #include "chain/Bip32.h"
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
@@ -80,6 +81,55 @@ SelfTestResult runSelfTest()
         check("eth m/44'/60'/0'/0/0",
               addressAt(m, ScriptType::EthAccount, 0, 0, 0).address,
               "0x9858EfFD232B4033E47d90003D41EC34EcaEda94");
+    }
+
+    // --- Extended public keys (BIP32 TV1 serialization, parent fingerprints) -
+    {
+        const HdKey m = HdKey::fromSeed(fromHex("000102030405060708090a0b0c0d0e0f"));
+        check("bip32 m xpub", m.neuter().serialize(xpubVersion::kXpub),
+              "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8");
+        check("bip32 m/0' xpub", m.deriveChild(0, true).neuter().serialize(xpubVersion::kXpub),
+              "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw");
+    }
+
+    // --- Watch-only: account zpub + public derivation (BIP84 spec) -----------
+    {
+        const HdKey m = HdKey::fromSeed(bip39::toSeed(bip39::split(kTrezorMnemonic)));
+        const HdPubKey acct = m.derivePath(accountRootPath(ScriptType::P2WPKH, 0)).neuter();
+        const std::string zpub = acct.serialize(xpubVersion::kZpub);
+        check("bip84 account zpub", zpub,
+              "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs");
+
+        HdPubKey parsed;
+        uint32_t version = 0;
+        std::string err;
+        const bool ok = HdPubKey::parse(zpub, &parsed, &version, &err);
+        check("zpub parse round-trip",
+              ok ? parsed.serialize(version) : ("parse failed: " + err), zpub);
+
+        check("public derivation 0/0 == private",
+              addressFromAccount(acct, ScriptType::P2WPKH, 0, 0, 0).address,
+              "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu");
+        check("public derivation 1/0 (change) == private",
+              addressFromAccount(acct, ScriptType::P2WPKH, 0, 1, 0).address,
+              "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el");
+
+        const HdPubKey eth = m.derivePath(accountRootPath(ScriptType::EthAccount, 0)).neuter();
+        check("eth public derivation 0/0 == private",
+              addressFromAccount(eth, ScriptType::EthAccount, 0, 0, 0).address,
+              "0x9858EfFD232B4033E47d90003D41EC34EcaEda94");
+    }
+
+    // --- Amounts (uint256 wei, token units) ----------------------------------
+    {
+        Amount a;
+        Amount::fromDecimal("1234567890123456789012", &a);
+        check("amount format 18/6", a.format(18, 6), "1234.56789");
+        Amount wei;
+        Amount::fromHexQuantity("0x1bc16d674ec80000", &wei); // 2 ETH
+        check("amount hex quantity", wei.format(18, 8), "2");
+        check("amount sum", (wei + Amount::fromU64(500000000000000000ull)).format(18, 8), "2.5");
+        check("amount small", Amount::fromU64(1234).format(8, 8), "0.00001234");
     }
 
     r.ok = (r.passed == r.total);

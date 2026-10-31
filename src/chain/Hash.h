@@ -31,4 +31,9 @@ Bytes keccak256(const Bytes& data);
 std::string toHex(const Bytes& data);
 Bytes fromHex(const std::string& hex);
 
+// Overwrites the buffer with zeros in a way the optimiser may not remove, then
+// empties it. For keys, seeds and mnemonic text once they are no longer needed.
+void secureClear(Bytes& data);
+void secureClear(std::string& text);
+
 } // namespace chain

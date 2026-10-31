@@ -3,7 +3,6 @@
 #include "chain/Base58.h"
 #include "chain/Bech32.h"
 
-#include <array>
 #include <stdexcept>
 
 namespace chain {
@@ -40,13 +39,31 @@ const char* scriptTypeName(ScriptType t)
     return "?";
 }
 
-std::string accountPath(ScriptType t, uint32_t account, uint32_t change, uint32_t index)
+bool isBitcoin(ScriptType t)
+{
+    return t != ScriptType::EthAccount;
+}
+
+uint32_t xpubVersionFor(ScriptType t)
+{
+    switch (t) {
+    case ScriptType::P2WPKH:      return xpubVersion::kZpub;
+    case ScriptType::P2SH_P2WPKH: return xpubVersion::kYpub;
+    default:                      return xpubVersion::kXpub;
+    }
+}
+
+std::string accountRootPath(ScriptType t, uint32_t account)
 {
     uint32_t purpose = 0, coin = 0;
     coinParams(t, purpose, coin);
     return "m/" + std::to_string(purpose) + "'/" + std::to_string(coin) + "'/"
-           + std::to_string(account) + "'/" + std::to_string(change) + "/"
-           + std::to_string(index);
+           + std::to_string(account) + "'";
+}
+
+std::string accountPath(ScriptType t, uint32_t account, uint32_t change, uint32_t index)
+{
+    return accountRootPath(t, account) + "/" + std::to_string(change) + "/" + std::to_string(index);
 }
 
 std::string ethChecksumAddress(const Bytes& addr20)
@@ -65,25 +82,21 @@ std::string ethChecksumAddress(const Bytes& addr20)
     return out;
 }
 
-AddressInfo addressAt(const HdKey& master, ScriptType t,
-                      uint32_t account, uint32_t change, uint32_t index)
+AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const Bytes& uncompressedPub)
 {
     AddressInfo info;
-    info.path = accountPath(t, account, change, index);
-    const HdKey node = master.derivePath(info.path);
 
     if (t == ScriptType::EthAccount) {
-        Bytes pub = node.publicKeyUncompressed();     // 65 bytes, 0x04 prefix
-        Bytes xy(pub.begin() + 1, pub.end());          // drop 0x04 -> 64 bytes
-        Bytes h = keccak256(xy);
-        Bytes addr20(h.end() - 20, h.end());
+        if (uncompressedPub.size() != 65) throw std::invalid_argument("ETH needs a 65-byte public key");
+        const Bytes xy(uncompressedPub.begin() + 1, uncompressedPub.end()); // drop 0x04
+        const Bytes h = keccak256(xy);
+        const Bytes addr20(h.end() - 20, h.end());
         info.address = ethChecksumAddress(addr20);
         return info;
     }
 
-    // Bitcoin family.
-    const Bytes pub = node.publicKeyCompressed();
-    const Bytes h160 = hash160(pub);
+    if (compressedPub.size() != 33) throw std::invalid_argument("BTC needs a 33-byte public key");
+    const Bytes h160 = hash160(compressedPub);
 
     switch (t) {
     case ScriptType::P2PKH: {
@@ -91,7 +104,7 @@ AddressInfo addressAt(const HdKey& master, ScriptType t,
         payload.push_back(0x00); // mainnet P2PKH version
         payload.insert(payload.end(), h160.begin(), h160.end());
         info.address = base58::encodeCheck(payload);
-        // scriptPubKey: OP_DUP OP_HASH160 <20> <h160> OP_EQUALVERIFY OP_CHECKSIG
+        // OP_DUP OP_HASH160 <20> <h160> OP_EQUALVERIFY OP_CHECKSIG
         info.scriptPubKey = {0x76, 0xa9, 0x14};
         info.scriptPubKey.insert(info.scriptPubKey.end(), h160.begin(), h160.end());
         info.scriptPubKey.push_back(0x88);
@@ -99,7 +112,7 @@ AddressInfo addressAt(const HdKey& master, ScriptType t,
         break;
     }
     case ScriptType::P2SH_P2WPKH: {
-        // redeemScript = 0x00 0x14 <h160>; address hashes the redeemScript.
+        // redeemScript = OP_0 <20> <h160>; the address hashes the redeemScript.
         Bytes redeem = {0x00, 0x14};
         redeem.insert(redeem.end(), h160.begin(), h160.end());
         const Bytes rh = hash160(redeem);
@@ -107,7 +120,7 @@ AddressInfo addressAt(const HdKey& master, ScriptType t,
         payload.push_back(0x05); // mainnet P2SH version
         payload.insert(payload.end(), rh.begin(), rh.end());
         info.address = base58::encodeCheck(payload);
-        // scriptPubKey: OP_HASH160 <20> <rh> OP_EQUAL
+        // OP_HASH160 <20> <rh> OP_EQUAL
         info.scriptPubKey = {0xa9, 0x14};
         info.scriptPubKey.insert(info.scriptPubKey.end(), rh.begin(), rh.end());
         info.scriptPubKey.push_back(0x87);
@@ -115,7 +128,7 @@ AddressInfo addressAt(const HdKey& master, ScriptType t,
     }
     case ScriptType::P2WPKH: {
         info.address = bech32::segwitEncode("bc", 0, h160);
-        // scriptPubKey: OP_0 <20> <h160>
+        // OP_0 <20> <h160>
         info.scriptPubKey = {0x00, 0x14};
         info.scriptPubKey.insert(info.scriptPubKey.end(), h160.begin(), h160.end());
         break;
@@ -127,6 +140,35 @@ AddressInfo addressAt(const HdKey& master, ScriptType t,
     // Electrum subscribes by sha256(scriptPubKey), reversed, as hex.
     info.electrumScripthash = reverseHex(sha256(info.scriptPubKey));
     return info;
+}
+
+AddressInfo addressAt(const HdKey& master, ScriptType t,
+                      uint32_t account, uint32_t change, uint32_t index)
+{
+    const std::string path = accountPath(t, account, change, index);
+    const HdKey node = master.derivePath(path);
+    AddressInfo info = (t == ScriptType::EthAccount)
+        ? addressFromPublicKey(t, {}, node.publicKeyUncompressed())
+        : addressFromPublicKey(t, node.publicKeyCompressed(), {});
+    info.path = path;
+    return info;
+}
+
+AddressInfo addressFromChainNode(const HdPubKey& chainNode, ScriptType t,
+                                 uint32_t account, uint32_t change, uint32_t index)
+{
+    const HdPubKey node = chainNode.deriveChild(index);
+    AddressInfo info = (t == ScriptType::EthAccount)
+        ? addressFromPublicKey(t, {}, node.publicKeyUncompressed())
+        : addressFromPublicKey(t, node.publicKey(), {});
+    info.path = accountPath(t, account, change, index);
+    return info;
+}
+
+AddressInfo addressFromAccount(const HdPubKey& accountNode, ScriptType t,
+                               uint32_t account, uint32_t change, uint32_t index)
+{
+    return addressFromChainNode(accountNode.deriveChild(change), t, account, change, index);
 }
 
 } // namespace chain

@@ -2,6 +2,7 @@
 
 #include <botan/hash.h>
 #include <botan/mac.h>
+#include <botan/mem_ops.h>
 #include <botan/pwdhash.h>
 
 #include <stdexcept>
@@ -82,6 +83,18 @@ Bytes fromHex(const std::string& hex)
         out.push_back(static_cast<uint8_t>((hi << 4) | lo));
     }
     return out;
+}
+
+void secureClear(Bytes& data)
+{
+    if (!data.empty()) Botan::secure_scrub_memory(data.data(), data.size());
+    data.clear();
+}
+
+void secureClear(std::string& text)
+{
+    if (!text.empty()) Botan::secure_scrub_memory(text.data(), text.size());
+    text.clear();
 }
 
 } // namespace chain
