@@ -5,7 +5,9 @@ rem (already built for FlowSuite) are not rebuilt; only secp256k1 compiles.
 setlocal
 cd /d "%~dp0"
 
-rem GW_VCPKG / GW_VCPKG_INSTALLED point elsewhere on the build machine (CI).
+rem GW_VCPKG / GW_VCPKG_INSTALLED point elsewhere on the build machine (CI);
+rem GW_BUILD_DIR keeps an existing build folder as it is.
+if not defined GW_BUILD_DIR set "GW_BUILD_DIR=build"
 if not defined GW_VCPKG set "GW_VCPKG=C:\app-vcpkg"
 if not defined GW_VCPKG_INSTALLED set "GW_VCPKG_INSTALLED=C:/app-vcpkg-installed"
 if not exist "%GW_VCPKG%\vcpkg.exe" (
@@ -30,22 +32,23 @@ if not exist "%QT_DIR%\bin\windeployqt.exe" (
     exit /b 1
 )
 
-cmake -S . -B build -G Ninja ^
+cmake -S . -B "%GW_BUILD_DIR%" -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_PREFIX_PATH=%QT_DIR% ^
     -DCMAKE_TOOLCHAIN_FILE="%VCPKG_TOOLCHAIN%" ^
     -DVCPKG_TARGET_TRIPLET=x64-windows-release-only ^
     -DVCPKG_OVERLAY_TRIPLETS="%REPO%\cmake\triplets" ^
     -DVCPKG_INSTALLED_DIR=%GW_VCPKG_INSTALLED% || exit /b 1
-cmake --build build || exit /b 1
+cmake --build "%GW_BUILD_DIR%" || exit /b 1
 
-rem dist\ = a folder that runs on its own: the exe, its DLLs and the Qt plugins
-rem in lib\plugins, where the embedded qt.conf (Prefix = lib) looks for them.
+rem dist\ = the folder that runs: the exe, its DLLs and the Qt plugins in
+rem lib\plugins, where the embedded qt.conf (Prefix = lib) looks for them. The exe
+rem in the build folder has neither, so that one cannot start on its own.
 set "DIST=%REPO%\dist"
 if exist "%DIST%" rmdir /s /q "%DIST%" || (echo [build] dist\ is in use - close GitWallet & exit /b 1)
 mkdir "%DIST%" || exit /b 1
-copy /y build\GitWallet.exe "%DIST%\" >nul || exit /b 1
-copy /y build\*.dll "%DIST%\" >nul || exit /b 1
+copy /y "%GW_BUILD_DIR%\GitWallet.exe" "%DIST%\" >nul || exit /b 1
+copy /y "%GW_BUILD_DIR%\*.dll" "%DIST%\" >nul || exit /b 1
 "%QT_DIR%\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler ^
     --no-system-dxc-compiler --no-opengl-sw --no-compiler-runtime ^
     --plugindir "%DIST%\lib\plugins" "%DIST%\GitWallet.exe" >nul || exit /b 1
@@ -55,4 +58,4 @@ rem The Visual C++ runtime next to the exe, so the folder also runs where it is
 rem not installed.
 copy /y "%VCToolsRedistDir%x64\Microsoft.VC143.CRT\*.dll" "%DIST%\" >nul || exit /b 1
 
-echo [build] OK: build\GitWallet.exe, runnable copy in dist\
+echo [build] OK: start dist\GitWallet.exe

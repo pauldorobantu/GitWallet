@@ -254,7 +254,7 @@ int main(int argc, char** argv)
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("GitWallet"));
     QApplication::setOrganizationName(QStringLiteral("GitWallet"));
-    QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QApplication::setApplicationVersion(QStringLiteral("0.2.0"));
     const QStringList args = app.arguments();
 
     // Prove the derivation engine against published vectors before anything

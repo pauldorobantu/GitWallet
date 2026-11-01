@@ -49,38 +49,44 @@ jobs:
           path: C:/gw-vcpkg-installed
           key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}
 
+      # All of these start the deployed folder as a user's PC would: see
+      # .github/start-gitwallet.ps1. Offscreen runs with the Qt install on hand
+      # cannot tell whether the app really starts.
+      - name: Start like a user
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force walkthrough | Out-Null
+          $shot = "$PWD\walkthrough\00-started-like-a-user.png"
+          ./.github/start-gitwallet.ps1 -Arguments '--data-dir', "$env:RUNNER_TEMP\gw-start", '--screenshot', $shot
+          $code = $LASTEXITCODE
+          "exit code: $code"
+          if ($code -ne 0) { exit 1 }
+          if (-not (Test-Path $shot)) { 'the window never rendered'; exit 1 }
+          "window rendered: $((Get-Item $shot).Length) bytes"
+
       - name: Self-test
         shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
-          QT_QPA_FONTDIR: C:\Windows\Fonts
         run: |
-          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins\platforms"
-          $p = Start-Process dist\GitWallet.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow -RedirectStandardOutput selftest.txt
+          ./.github/start-gitwallet.ps1 -Arguments '--selftest' -StdOut selftest.txt
+          $code = $LASTEXITCODE
           Get-Content selftest.txt
-          exit $p.ExitCode
+          exit $code
 
       - name: Store test
         shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
-          QT_QPA_FONTDIR: C:\Windows\Fonts
         run: |
-          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins\platforms"
-          $p = Start-Process dist\GitWallet.exe -ArgumentList '--data-dir', "$env:RUNNER_TEMP\gw-store", '--store-test' -Wait -PassThru -NoNewWindow -RedirectStandardOutput storetest.txt
+          ./.github/start-gitwallet.ps1 -Arguments '--data-dir', "$env:RUNNER_TEMP\gw-store", '--store-test' -StdOut storetest.txt
+          $code = $LASTEXITCODE
           Get-Content storetest.txt
-          exit $p.ExitCode
+          exit $code
 
       - name: UI walkthrough
         shell: pwsh
         timeout-minutes: 30
-        env:
-          QT_QPA_PLATFORM: offscreen
-          QT_QPA_FONTDIR: C:\Windows\Fonts
         run: |
-          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins\platforms"
           $out = "$PWD\walkthrough"
-          $p = Start-Process dist\GitWallet.exe -ArgumentList '--data-dir', "$env:RUNNER_TEMP\gw", '--walkthrough', $out -Wait -PassThru -NoNewWindow
+          ./.github/start-gitwallet.ps1 -Arguments '--data-dir', "$env:RUNNER_TEMP\gw", '--walkthrough', $out
+          $code = $LASTEXITCODE
           $summary = Get-Content "$out\walkthrough.json" -Raw | ConvertFrom-Json
           foreach ($step in $summary.steps) {
             foreach ($check in $step.checks) {
@@ -88,8 +94,8 @@ jobs:
               "$mark $($step.name): $($check.check)"
             }
           }
-          "failures: $($summary.failures), exit code: $($p.ExitCode)"
-          exit $p.ExitCode
+          "failures: $($summary.failures), exit code: $code"
+          exit $code
 
       - name: Keep the walkthrough's screenshots
         if: always()

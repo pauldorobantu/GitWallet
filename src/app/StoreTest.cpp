@@ -84,6 +84,11 @@ StoreTestResult runStoreTest()
         if (ok) ++result.passed;
         result.report += (ok ? QStringLiteral("ok    ") : QStringLiteral("FAIL  ")) + what + QLatin1Char('\n');
     };
+    // For a call that reports through `error`: read here, once the call has run.
+    QString error;
+    const auto done = [&check, &error](bool ok, const QString& what) {
+        check(ok, ok ? what : what + QStringLiteral(": ") + error);
+    };
 
     try {
         const QList<wallet::AccountKey> first = accountsOf(kFirstMnemonic);
@@ -91,11 +96,10 @@ StoreTestResult runStoreTest()
         check(first.size() == 4 && second.size() == 4, QStringLiteral("a seed derives 4 account keys"));
 
         // A file from before many wallets: one wallet, its name and settings kept.
-        QString error;
-        check(wallet::WalletStore::writeRawForTest(legacyBody(first), &error),
-              QStringLiteral("a first-format wallet.dat was written ") + error);
+        done(wallet::WalletStore::writeRawForTest(legacyBody(first), &error),
+             QStringLiteral("a first-format wallet.dat was written"));
         wallet::WalletStore store;
-        check(store.load(&error), QStringLiteral("a first-format wallet.dat loads ") + error);
+        done(store.load(&error), QStringLiteral("a first-format wallet.dat loads"));
         check(store.wallets.size() == 1, QStringLiteral("it is one wallet"));
         const bool legacyOk = !store.wallets.isEmpty() && store.wallets.first().label == QStringLiteral("Old wallet")
                               && store.wallets.first().accounts.size() == 4 && !store.wallets.first().fromKeys;
@@ -110,36 +114,42 @@ StoreTestResult runStoreTest()
         const quint32 secondId = store.takeWalletId();
         check(secondId != firstId && secondId != 0, QStringLiteral("a new wallet gets its own id"));
         store.wallets.append(entryOf(secondId, QStringLiteral("Warehouse"), second));
-        check(store.save(&error), QStringLiteral("two wallets save ") + error);
+        done(store.save(&error), QStringLiteral("two wallets save"));
         wallet::WalletStore reread;
-        check(reread.load(&error), QStringLiteral("two wallets load ") + error);
+        done(reread.load(&error), QStringLiteral("two wallets load"));
         check(reread.wallets.size() == 2 && reread.find(secondId)
                   && reread.find(secondId)->label == QStringLiteral("Warehouse"),
               QStringLiteral("both come back, by id and name"));
         check(reread.allAccounts().size() == 8, QStringLiteral("with all 8 keys"));
         check(reread.find(secondId) && reread.find(secondId)->accounts.first().wallet == secondId,
               QStringLiteral("keys read back name their wallet"));
-        QFile raw(wallet::WalletStore::filePath());
-        const QByteArray bytes = raw.open(QIODevice::ReadOnly) ? raw.readAll() : QByteArray();
-        check(!bytes.contains("zpub") && !bytes.contains("Warehouse"), QStringLiteral("the file stays encrypted"));
+        {
+            QFile raw(wallet::WalletStore::filePath()); // closed before the next save: Windows refuses to replace an open file
+            const QByteArray bytes = raw.open(QIODevice::ReadOnly) ? raw.readAll() : QByteArray();
+            check(!bytes.isEmpty() && !bytes.contains("zpub") && !bytes.contains("Warehouse"),
+                  QStringLiteral("the file stays encrypted"));
+        }
 
         // An id is not reused, not even after its wallet went.
         reread.wallets.removeLast();
-        check(reread.save(&error), QStringLiteral("one wallet removed saves ") + error);
+        done(reread.save(&error), QStringLiteral("one wallet removed saves"));
         wallet::WalletStore afterRemove;
-        check(afterRemove.load(&error) && afterRemove.takeWalletId() > secondId,
-              QStringLiteral("the removed wallet's id is not handed out again"));
+        done(afterRemove.load(&error), QStringLiteral("one wallet removed loads"));
+        check(afterRemove.wallets.size() == 1 && afterRemove.find(firstId) && !afterRemove.find(secondId),
+              QStringLiteral("only that wallet is gone"));
+        check(afterRemove.takeWalletId() > secondId, QStringLiteral("the removed wallet's id is not handed out again"));
 
         // One set of addresses has one owner, also in the file.
         wallet::WalletStore repeated;
         repeated.wallets.append(entryOf(repeated.takeWalletId(), QStringLiteral("A"), first));
         repeated.wallets.append(entryOf(repeated.takeWalletId(), QStringLiteral("B"), first));
-        check(!repeated.save(&error), QStringLiteral("the same key in two wallets is refused: ") + error);
+        check(!repeated.save(&error) && error.contains(QStringLiteral("two wallets")),
+              QStringLiteral("the same key in two wallets is refused"));
 
         // Public keys.
         QList<wallet::AccountKey> keys;
         check(wallet::WalletStore::accountsFromPublicKeys({first.at(0).xpub, first.at(1).xpub}, false, &keys, &error)
-                  && keys.size() == 2 && keys.at(0).type == chain::ScriptType::P2WPKH
+                  && keys.size() == 2 && keys.at(0).account == 0 && keys.at(0).type == chain::ScriptType::P2WPKH
                   && keys.at(1).type == chain::ScriptType::P2SH_P2WPKH,
               QStringLiteral("zpub and ypub are read as native and nested SegWit"));
         check(wallet::WalletStore::accountsFromPublicKeys({first.at(2).xpub}, false, &keys, &error) && keys.size() == 1

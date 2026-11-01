@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(GitWallet VERSION 0.1.0 LANGUAGES CXX)
+project(GitWallet VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,8 @@ option(GW_BUILD_SMOKE "Compile the --selftest/-smoke entry points" ON)
 qt_add_executable(GitWallet WIN32
     ${GW_SOURCES}
     res/app.qrc
+    res/app.rc
+    res/app.manifest
 )
 
 target_include_directories(GitWallet PRIVATE
