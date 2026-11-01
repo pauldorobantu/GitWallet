@@ -28,12 +28,22 @@ QList<AssetInfo> erc20Assets();   // USDT, USDC
 
 // One stored account: the public node at m/purpose'/coin'/account'.
 struct AccountKey {
+    quint32 wallet = 0; // WalletEntry::id of its wallet; the entry's position in the file says it
     chain::ScriptType type = chain::ScriptType::P2WPKH;
     quint32 account = 0;
     QString xpub; // serialized with chain::xpubVersionFor(type)
 
     // Parses `xpub`; throws std::runtime_error if it is not a valid extended key.
     chain::HdPubKey node() const;
+};
+
+// One wallet of the file: the accounts of a seed, or public keys added on their
+// own. Either way only public keys are kept, so no wallet can spend from here.
+struct WalletEntry {
+    quint32 id = 0;        // stable and never 0; keys and rows refer to it
+    QString label;         // the name the user gave it
+    bool fromKeys = false; // added as public keys, without a seed's words
+    QList<AccountKey> accounts;
 };
 
 enum class AddressState { Unknown, Unused, Used, Funded };
@@ -49,6 +59,7 @@ enum class Problem {
 };
 
 struct AddressRow {
+    quint32 wallet = 0; // WalletEntry::id
     chain::ScriptType type = chain::ScriptType::P2WPKH;
     quint32 account = 0;
     quint32 change = 0; // 0 receive, 1 change (Bitcoin); always 0 for Ethereum

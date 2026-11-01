@@ -1,0 +1,78 @@
+#include "ui/Figures.h"
+
+#include <QLocale>
+#include <QtNumeric>
+
+namespace app::ui::figures {
+
+namespace {
+
+// Fraction digits shown per asset: satoshis for BTC, the wei tail cut at
+// micro-ether, cents for the dollar tokens.
+int shownDecimals(wallet::Asset asset)
+{
+    switch (asset) {
+    case wallet::Asset::BTC: return 8;
+    case wallet::Asset::ETH: return 6;
+    case wallet::Asset::USDT:
+    case wallet::Asset::USDC: return 2;
+    }
+    return 2;
+}
+
+bool isDollarToken(wallet::Asset asset)
+{
+    return asset == wallet::Asset::USDT || asset == wallet::Asset::USDC;
+}
+
+} // namespace
+
+QString dash()
+{
+    return QStringLiteral("—");
+}
+
+QString formatAmount(const chain::Amount& amount, const wallet::AssetInfo& info)
+{
+    const int shown = shownDecimals(info.asset);
+    const QString plain = QString::fromStdString(amount.format(info.decimals, shown));
+    // Dust that truncates to zero reads "<0.000001", as on the Addresses page:
+    // a bare "0" next to "3 funded addresses" would look like a bug.
+    if (plain == QLatin1String("0") && !amount.isZero() && shown > 0)
+        return QStringLiteral("<0.") + QStringLiteral("1").rightJustified(shown, QLatin1Char('0'));
+    const qsizetype dot = plain.indexOf(QLatin1Char('.'));
+    QString whole = dot < 0 ? plain : plain.left(dot);
+    QString fraction = dot < 0 ? QString() : plain.mid(dot + 1);
+    if (isDollarToken(info.asset))
+        fraction = fraction.leftJustified(2, QLatin1Char('0'));
+    for (qsizetype i = whole.size() - 3; i > 0; i -= 3)
+        whole.insert(i, QLatin1Char(','));
+    return fraction.isEmpty() ? whole : whole + QLatin1Char('.') + fraction;
+}
+
+QString formatUsd(double value)
+{
+    if (!qIsFinite(value))
+        return dash();
+    if (value > 0.0 && value < 0.01)
+        return QStringLiteral("<$0.01");
+    return QStringLiteral("$") + QLocale(QLocale::English).toString(qMax(0.0, value), 'f', 2);
+}
+
+QString formatCount(int n)
+{
+    return QLocale(QLocale::English).toString(n);
+}
+
+QString atLeast(const QString& figure)
+{
+    if (figure == dash())
+        return figure;
+    if (figure.startsWith(QLatin1String("<$")))
+        return QStringLiteral("> $0");
+    if (figure.startsWith(QLatin1Char('<')))
+        return QStringLiteral("> 0");
+    return QStringLiteral("≥ ") + figure;
+}
+
+} // namespace app::ui::figures

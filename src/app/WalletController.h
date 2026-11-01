@@ -50,15 +50,24 @@ public:
     // read.
     bool loadExisting(QString* error);
 
-    // Validates the mnemonic, derives the account xpubs, saves them (DPAPI) and
-    // starts scanning. Never stores the words; the caller scrubs its own copies.
-    // Refused while another GitWallet process holds the data folder.
-    bool importMnemonic(const std::vector<std::string>& words, const std::string& passphrase,
-                        QString* error);
+    // Validates the mnemonic, derives the account xpubs and adds them as a wallet
+    // named `label` (empty: "Wallet N"), saved with the others (DPAPI), then
+    // scans it too. Never stores the words; the caller scrubs its own copies.
+    // Refused while another GitWallet process holds the data folder, and for a
+    // seed whose keys another wallet already has.
+    bool addMnemonicWallet(const std::vector<std::string>& words, const std::string& passphrase,
+                           const QString& label, QString* error);
+    // The same for public keys from WalletStore::accountsFromPublicKeys().
+    bool addKeysWallet(const QList<wallet::AccountKey>& keys, const QString& label, QString* error);
 
-    // Deletes wallet.dat, stops scanning and clears the model. Refused while
-    // another GitWallet process holds the data folder.
-    bool removeWallet(QString* error);
+    // Forgets one wallet: its keys leave wallet.dat, its rows the model; the
+    // others keep their data and go on being watched.
+    bool removeWallet(quint32 id, QString* error);
+    bool renameWallet(quint32 id, const QString& label, QString* error);
+
+    // Deletes wallet.dat, settings included, stops scanning and clears the
+    // model. Refused while another GitWallet process holds the data folder.
+    bool removeAllWallets(QString* error);
 
     // Saves new scan settings and restarts the scanners / clients with them.
     // When wallet.dat is not this session's to write (another process holds
@@ -93,6 +102,7 @@ public:
 
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
+    double totalUsd(quint32 wallet) const;      // one wallet's
 
 signals:
     void walletChanged();  // loaded / imported / removed
@@ -131,6 +141,15 @@ private:
     bool lockDataDir();
     // Empty when settings alone may be written to wallet.dat now, else why not.
     QString settingsSaveBlocker();
+    // Adds `accounts` as a wallet, saves and restarts the scanners. What a
+    // refusal says starts with `what` ("The seed was not added").
+    bool addWallet(QList<wallet::AccountKey> accounts, const QString& label, bool fromKeys,
+                   const QString& what, QString* error);
+    // Empty when the wallet list may be written to wallet.dat now, else why not.
+    // A file that never opened is moved aside first: it may hold other wallets
+    // and still open for the right Windows user, so it is never overwritten.
+    QString walletSaveBlocker();
+    void restartServices(); // stop + start, keeping the model's rows
 
     wallet::WalletStore store_;
     wallet::WalletModel* model_ = nullptr;

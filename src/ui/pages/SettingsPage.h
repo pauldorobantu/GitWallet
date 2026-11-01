@@ -10,9 +10,9 @@ namespace app::ui {
 
 // The Settings page, as kit sections: Scanning (BTC receive / change gap, ETH gap,
 // ETH refresh interval), Network (Electrum servers, Ethereum RPC endpoints, one
-// per line; empty = defaults; shows the server in use), Wallet (the account
-// xpubs, copyable, and a "Remove wallet from this PC" action with confirmation).
-// Save applies through WalletController::applySettings.
+// per line; empty = defaults; shows the server in use), Wallets (how many, and a
+// "Remove all wallets from this PC" action with confirmation). Save applies
+// through WalletController::applySettings.
 class SettingsPage : public QWidget
 {
     Q_OBJECT
@@ -25,8 +25,8 @@ private:
     // --- implementation (SettingsPage.cpp) ---
     struct Ui; // the page's widgets
 
-    void load();          // the form from the stored settings, plus the xpubs
-    void rebuildWallet(); // one row per stored account
+    void load();          // the form from the stored settings, plus the wallet count
+    void rebuildWallet(); // the wallet count, and whether Remove is on offer
     void updateInUse();   // the Electrum server / Ethereum endpoint in use
     void resetToDefaults();
     void save();

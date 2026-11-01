@@ -5,6 +5,7 @@
 #include "chain/Amount.h"
 #include "net/PriceFeed.h"
 #include "ui/Feedback.h"
+#include "ui/Figures.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
@@ -42,10 +43,11 @@ constexpr int kDayCheckMs = 60 * 1000;
 // Bits of a row's pending mask: bit i stands for wallet::assets()[i].
 constexpr qsizetype kMaskBits = 32;
 
-QString dash()
-{
-    return QStringLiteral("—");
-}
+using figures::atLeast;
+using figures::dash;
+using figures::formatAmount;
+using figures::formatCount;
+using figures::formatUsd;
 
 // BTC lives on Bitcoin rows; ETH and the ERC-20 tokens on Ethereum rows.
 bool onChain(const wallet::AddressRow& row, const wallet::AssetInfo& info)
@@ -83,37 +85,6 @@ quint32 pendingMask(const wallet::AddressRow& row)
     return mask;
 }
 
-// What is known so far, as the lower bound it is: "≥ 0.5", "≥ $1,234.00".
-// Dust that only reads "<0.000001" or "<$0.01" becomes "> 0" / "> $0".
-QString atLeast(const QString& figure)
-{
-    if (figure == dash())
-        return figure;
-    if (figure.startsWith(QLatin1String("<$")))
-        return QStringLiteral("> $0");
-    if (figure.startsWith(QLatin1Char('<')))
-        return QStringLiteral("> 0");
-    return QStringLiteral("≥ ") + figure;
-}
-
-// Fraction digits shown per asset: satoshis for BTC, the wei tail cut at
-// micro-ether, cents for the dollar tokens.
-int shownDecimals(wallet::Asset asset)
-{
-    switch (asset) {
-    case wallet::Asset::BTC: return 8;
-    case wallet::Asset::ETH: return 6;
-    case wallet::Asset::USDT:
-    case wallet::Asset::USDC: return 2;
-    }
-    return 2;
-}
-
-bool isDollarToken(wallet::Asset asset)
-{
-    return asset == wallet::Asset::USDT || asset == wallet::Asset::USDC;
-}
-
 // The card's second line: what the symbol stands for, and that the dollar
 // tokens counted are the Ethereum (ERC-20) ones only.
 QString assetName(wallet::Asset asset)
@@ -125,42 +96,6 @@ QString assetName(wallet::Asset asset)
     case wallet::Asset::USDC: return QStringLiteral("USD Coin · ERC-20");
     }
     return QString();
-}
-
-// Amount::format() does the exact conversion (truncated, trailing zeros
-// trimmed); on top of it the whole part gets thousands separators and the
-// dollar tokens keep two decimals: 1234567.5 USDT reads "1,234,567.50".
-// Throws whatever Amount::format() throws.
-QString formatAmount(const chain::Amount& amount, const wallet::AssetInfo& info)
-{
-    const int shown = shownDecimals(info.asset);
-    const QString plain = QString::fromStdString(amount.format(info.decimals, shown));
-    // Dust that truncates to zero reads "<0.000001", as on the Addresses page:
-    // a bare "0" next to "3 funded addresses" would look like a bug.
-    if (plain == QLatin1String("0") && !amount.isZero() && shown > 0)
-        return QStringLiteral("<0.") + QStringLiteral("1").rightJustified(shown, QLatin1Char('0'));
-    const qsizetype dot = plain.indexOf(QLatin1Char('.'));
-    QString whole = dot < 0 ? plain : plain.left(dot);
-    QString fraction = dot < 0 ? QString() : plain.mid(dot + 1);
-    if (isDollarToken(info.asset))
-        fraction = fraction.leftJustified(2, QLatin1Char('0'));
-    for (qsizetype i = whole.size() - 3; i > 0; i -= 3)
-        whole.insert(i, QLatin1Char(','));
-    return fraction.isEmpty() ? whole : whole + QLatin1Char('.') + fraction;
-}
-
-QString formatUsd(double value)
-{
-    if (!qIsFinite(value))
-        return dash();
-    if (value > 0.0 && value < 0.01)
-        return QStringLiteral("<$0.01");
-    return QStringLiteral("$") + QLocale(QLocale::English).toString(qMax(0.0, value), 'f', 2);
-}
-
-QString formatCount(int n)
-{
-    return QLocale(QLocale::English).toString(n);
 }
 
 // Why a figure is not final yet: how many addresses have no answer, or, while
@@ -264,8 +199,8 @@ QWidget* OverviewPage::buildEmptyState()
 {
     QWidget* empty = page::makeEmptyState(
         this, static_cast<int>(icon::Kind::Dashboard), QStringLiteral("No wallet yet"),
-        QStringLiteral("Import a seed to see every Bitcoin and Ethereum address it controls."));
-    auto* importButton = new QPushButton(QStringLiteral("Import seed"), empty);
+        QStringLiteral("Add a seed, or its public keys, to see every Bitcoin and Ethereum address it controls."));
+    auto* importButton = new QPushButton(QStringLiteral("Add wallet"), empty);
     importButton->setObjectName(QStringLiteral("primaryButton"));
     connect(importButton, &QPushButton::clicked, this, &OverviewPage::importRequested);
 
@@ -339,6 +274,7 @@ QWidget* OverviewPage::buildWalletState()
         form->addRow(label, value);
         return value;
     };
+    walletsLabel_ = addValueRow(QStringLiteral("Wallets"));
     scannedLabel_ = addValueRow(QStringLiteral("Addresses scanned"));
     usedLabel_ = addValueRow(QStringLiteral("Used addresses"));
     fundedLabel_ = addValueRow(QStringLiteral("Funded addresses"));
@@ -479,11 +415,11 @@ void OverviewPage::refreshView()
     // Only xpubs are stored, so every start begins with an empty model. An
     // account whose first row does not exist yet has not been derived (or its
     // key could not be read): no balance of its chain is known.
-    const QList<wallet::AccountKey>& accounts = controller_->store().accounts;
+    const QList<wallet::AccountKey> accounts = controller_->store().allAccounts();
     bool btcMissing = false;
     bool ethMissing = false;
     for (const wallet::AccountKey& account : accounts) {
-        if (model && model->find(account.type, account.account, 0, 0) >= 0)
+        if (model && model->find(account.wallet, account.type, account.account, 0, 0) >= 0)
             continue;
         (chain::isBitcoin(account.type) ? btcMissing : ethMissing) = true;
     }
@@ -639,6 +575,7 @@ void OverviewPage::refreshView()
         setChip(scanLabel_, trText(QStringLiteral("Up to date")), Tone::Success);
     const int derived = model ? model->size() : 0;
     const int checked = model ? model->checkedCount() : 0;
+    walletsLabel_->setText(formatCount(int(controller_->store().wallets.size())));
     scannedLabel_->setText(checked >= derived
                                ? formatCount(derived)
                                : trText(QStringLiteral("%1 of %2"))

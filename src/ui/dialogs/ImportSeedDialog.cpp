@@ -7,17 +7,21 @@
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
 #include "ui/design/Style.h"
+#include "wallet/WalletStore.h"
 
 #include <QByteArray>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QFile>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSignalBlocker>
 #include <QSizePolicy>
+#include <QStackedWidget>
 #include <QTextDocument>
 #include <QVBoxLayout>
 
@@ -173,19 +177,54 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     : QDialog(parent)
     , controller_(controller)
 {
-    setWindowTitle(QStringLiteral("Import seed"));
+    setWindowTitle(QStringLiteral("Add wallet"));
     // The themed title bar and frame go on before anything is laid out or shown.
     applyDialogChrome(this);
 
     auto* root = new QVBoxLayout(this);
     page::applyDialogLayout(root);
 
-    // The words, with the live check right under them.
+    // The name it will go by, and what it is made from.
+    auto* identity = new QHBoxLayout;
+    identity->setSpacing(tokens::layout::kFormHSpacing);
+    auto* nameBlock = new QVBoxLayout;
+    nameBlock->setSpacing(tokens::layout::kFormVSpacing);
+    auto* nameLabel = new QLabel(QStringLiteral("Wallet name"), this);
+    nameLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    name_ = new QLineEdit(this);
+    name_->setObjectName(QStringLiteral("walletName"));
+    name_->setMaxLength(wallet::WalletStore::kMaxLabelChars);
+    name_->setPlaceholderText(QStringLiteral("For example: Online shop"));
+    nameLabel->setBuddy(name_);
+    nameBlock->addWidget(nameLabel);
+    nameBlock->addWidget(name_);
+    identity->addLayout(nameBlock, 1);
+    auto* sourceBlock = new QVBoxLayout;
+    sourceBlock->setSpacing(tokens::layout::kFormVSpacing);
+    auto* sourceLabel = new QLabel(QStringLiteral("Add from"), this);
+    sourceLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    source_ = new QComboBox(this);
+    source_->setObjectName(QStringLiteral("walletSource"));
+    source_->addItems({QStringLiteral("Seed words"), QStringLiteral("Public keys (watch only)")});
+    sourceLabel->setBuddy(source_);
+    sourceBlock->addWidget(sourceLabel);
+    sourceBlock->addWidget(source_);
+    identity->addLayout(sourceBlock, 1);
+    root->addLayout(identity);
+
+    pages_ = new QStackedWidget(this);
+    auto* wordsPage = new QWidget(pages_);
+    auto* wordsColumn = new QVBoxLayout(wordsPage);
+    wordsColumn->setContentsMargins(0, 0, 0, 0);
+    wordsColumn->setSpacing(tokens::layout::kFormVSpacing);
+
+    // The words; the live check is right under the pages.
     auto* wordsBlock = new QVBoxLayout;
     wordsBlock->setSpacing(tokens::layout::kFormVSpacing);
     auto* wordsLabel = new QLabel(QStringLiteral("Seed words"), this);
     wordsLabel->setObjectName(QStringLiteral("formSectionLabel"));
     words_ = new QPlainTextEdit(this);
+    words_->setObjectName(QStringLiteral("seedWords"));
     words_->setTabChangesFocus(true);
     words_->setUndoRedoEnabled(false); // no undo stack keeping earlier versions of the words
     // Added to the hints already there (the editor's Qt::ImhMultiLine), not
@@ -206,8 +245,7 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     setStatus(status_, QString(), Tone::Muted);
     wordsBlock->addWidget(wordsLabel);
     wordsBlock->addWidget(words_, 1);
-    wordsBlock->addWidget(status_);
-    root->addLayout(wordsBlock, 1); // the words field takes the spare height
+    wordsColumn->addLayout(wordsBlock, 1); // the words field takes the spare height
 
     // The optional passphrase, shown only while the box is ticked.
     auto* passphraseBlock = new QVBoxLayout;
@@ -223,23 +261,51 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     passphrase_->setVisible(false);
     passphraseBlock->addWidget(hasPassphrase_);
     passphraseBlock->addWidget(passphrase_);
-    root->addLayout(passphraseBlock);
+    wordsColumn->addLayout(passphraseBlock);
+    pages_->addWidget(wordsPage);
 
-    auto* info = new QLabel(
-        QStringLiteral("GitWallet derives the public keys of your accounts from the seed and "
-                       "keeps only those, encrypted for your Windows user. The seed itself is "
-                       "never saved."),
-        this);
-    info->setWordWrap(true);
-    setTone(info, Tone::Muted);
-    root->addWidget(info);
+    // Or public keys alone: no secret, so nothing to wipe.
+    auto* keysPage = new QWidget(pages_);
+    auto* keysColumn = new QVBoxLayout(keysPage);
+    keysColumn->setContentsMargins(0, 0, 0, 0);
+    keysColumn->setSpacing(tokens::layout::kFormVSpacing);
+    auto* keysLabel = new QLabel(QStringLiteral("Public keys"), keysPage);
+    keysLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    keys_ = new QPlainTextEdit(keysPage);
+    keys_->setObjectName(QStringLiteral("publicKeys"));
+    keys_->setTabChangesFocus(true);
+    keys_->setPlaceholderText(QStringLiteral("One account key per line: zpub (native SegWit), ypub (nested "
+                                             "SegWit) or xpub"));
+    keysLabel->setBuddy(keys_);
+    keysColumn->addWidget(keysLabel);
+    keysColumn->addWidget(keys_, 1);
+    xpubRow_ = new QWidget(keysPage);
+    auto* xpubLayout = new QHBoxLayout(xpubRow_);
+    xpubLayout->setContentsMargins(0, 0, 0, 0);
+    xpubLayout->setSpacing(tokens::layout::kFormHSpacing);
+    xpubLayout->addWidget(new QLabel(QStringLiteral("An xpub key is"), xpubRow_));
+    xpubKind_ = new QComboBox(xpubRow_);
+    xpubKind_->addItems({QStringLiteral("Bitcoin legacy (m/44'/0'/…)"), QStringLiteral("Ethereum (m/44'/60'/…)")});
+    xpubKind_->setToolTip(QStringLiteral("The prefix cannot tell the two apart; a wrong choice shows other addresses."));
+    xpubLayout->addWidget(xpubKind_);
+    xpubLayout->addStretch(1);
+    xpubRow_->setVisible(false);
+    keysColumn->addWidget(xpubRow_);
+    pages_->addWidget(keysPage);
+    root->addWidget(pages_, 1);
+    root->addWidget(status_);
+
+    info_ = new QLabel(this);
+    info_->setWordWrap(true);
+    setTone(info_, Tone::Muted);
+    root->addWidget(info_);
 
     // Cancel, then the primary action on the far right (the kit's order).
     auto* buttons = new QHBoxLayout;
     buttons->setSpacing(tokens::layout::kToolbarSpacing);
     buttons->addStretch(1);
     auto* cancel = new QPushButton(QStringLiteral("Cancel"), this);
-    import_ = new QPushButton(QStringLiteral("Import"), this);
+    import_ = new QPushButton(QStringLiteral("Add wallet"), this);
     import_->setObjectName(QStringLiteral("primaryButton"));
     import_->setDefault(true);
     import_->setEnabled(false);
@@ -247,7 +313,10 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     buttons->addWidget(import_);
     root->addLayout(buttons);
 
+    connect(source_, &QComboBox::currentIndexChanged, this, &ImportSeedDialog::sourceChanged);
     connect(words_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateWords);
+    connect(keys_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateKeys);
+    connect(xpubKind_, &QComboBox::currentIndexChanged, this, &ImportSeedDialog::validateKeys);
     connect(hasPassphrase_, &QCheckBox::toggled, this, [this](bool on) {
         // Unticked means "no passphrase": what was typed must not be imported
         // unseen, so it goes at once.
@@ -262,7 +331,8 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
     connect(import_, &QPushButton::clicked, this, &ImportSeedDialog::importSeed);
 
-    words_->setFocus();
+    sourceChanged();
+    name_->setFocus();
     page::fitDialog(this, page::DialogSize::Form);
 }
 
@@ -277,9 +347,62 @@ void ImportSeedDialog::done(int result)
     wipeFields();
     // Shown again, the dialog starts blank: no stale status, no passphrase.
     hasPassphrase_->setChecked(false);
+    name_->clear();
+    keys_->clear();
+    source_->setCurrentIndex(0);
     setStatus(status_, QString(), Tone::Muted);
     updateImportEnabled();
     QDialog::done(result);
+}
+
+bool ImportSeedDialog::wordsMode() const
+{
+    return pages_->currentIndex() == 0;
+}
+
+void ImportSeedDialog::sourceChanged()
+{
+    pages_->setCurrentIndex(source_->currentIndex());
+    info_->setText(wordsMode()
+                       ? trText(QStringLiteral("GitWallet derives the public keys of your accounts from the "
+                                               "seed and keeps only those, encrypted for your Windows user. "
+                                               "The seed itself is never saved."))
+                       : trText(QStringLiteral("Public keys show addresses and balances but can never spend. "
+                                               "A wallet added this way needs no seed on this PC.")));
+    if (wordsMode())
+        validateWords();
+    else
+        validateKeys();
+}
+
+void ImportSeedDialog::validateKeys()
+{
+    wordsValid_ = false; // this source does not use them
+    parsedKeys_.clear();
+    QString message;
+    Tone tone = Tone::Muted;
+    static const QRegularExpression space(QStringLiteral("\\s+"));
+    const QStringList keys = keys_->toPlainText().split(space, Qt::SkipEmptyParts);
+    const bool anyXpub = std::any_of(keys.cbegin(), keys.cend(), [](const QString& key) {
+        return key.startsWith(QLatin1String("xpub"));
+    });
+    xpubRow_->setVisible(anyXpub);
+    if (!keys.isEmpty()) {
+        QString why;
+        QList<wallet::AccountKey> parsed;
+        if (wallet::WalletStore::accountsFromPublicKeys(keys, xpubKind_->currentIndex() == 1, &parsed, &why)) {
+            parsedKeys_ = parsed;
+            message = trText(parsed.size() == 1 ? QStringLiteral("1 account key · OK")
+                                                : QStringLiteral("%1 account keys · OK"))
+                          .arg(parsed.size());
+            tone = Tone::Success;
+        } else {
+            message = why;
+            tone = Tone::Error;
+        }
+    }
+    setStatus(status_, message, tone);
+    updateImportEnabled();
 }
 
 void ImportSeedDialog::wipeFields()
@@ -348,6 +471,10 @@ void ImportSeedDialog::validateWords()
 
 void ImportSeedDialog::updateImportEnabled()
 {
+    if (!wordsMode()) {
+        import_->setEnabled(controller_ != nullptr && !parsedKeys_.isEmpty());
+        return;
+    }
     // A ticked box with an empty field is unfinished input, not "no passphrase".
     const bool passphraseReady = !hasPassphrase_->isChecked() || !passphrase_->text().isEmpty();
     import_->setEnabled(controller_ != nullptr && wordsValid_ && passphraseReady);
@@ -355,7 +482,17 @@ void ImportSeedDialog::updateImportEnabled()
 
 void ImportSeedDialog::importSeed()
 {
-    if (!controller_ || !wordsValid_)
+    if (!controller_)
+        return;
+    if (!wordsMode()) {
+        QString error;
+        if (controller_->addKeysWallet(parsedKeys_, name_->text(), &error))
+            accept();
+        else
+            setStatus(status_, error.isEmpty() ? trText(QStringLiteral("Could not add the keys")) : error, Tone::Error);
+        return;
+    }
+    if (!wordsValid_)
         return;
 
     QString error;
@@ -370,7 +507,7 @@ void ImportSeedDialog::importSeed()
             QString passphrase = passphrase_->text().normalized(QString::NormalizationForm_KD);
             takeUtf8(passphrase, seed.passphrase);
         }
-        imported = controller_->importMnemonic(seed.words, seed.passphrase, &error);
+        imported = controller_->addMnemonicWallet(seed.words, seed.passphrase, name_->text(), &error);
     } catch (const std::exception&) {
         imported = false;
         error.clear();
@@ -379,7 +516,7 @@ void ImportSeedDialog::importSeed()
 
     if (!imported) {
         setStatus(status_,
-                  error.isEmpty() ? trText(QStringLiteral("Could not import the seed")) : error,
+                  error.isEmpty() ? trText(QStringLiteral("Could not add the seed")) : error,
                   Tone::Error);
         return;
     }

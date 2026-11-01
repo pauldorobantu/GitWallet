@@ -17,13 +17,13 @@ class MainWindow;
 }
 
 // End-to-end check of the real UI, driven like a user would: it types into the
-// import dialog, presses the buttons, switches pages, changes a setting, closes
-// and reopens the window, removes the wallet — and after every step checks what
-// the app shows and saves a screenshot. Started by --walkthrough <dir>, which
-// main() only accepts together with --data-dir, so it never touches the real
-// wallet; the only seed it ever types is the public BIP39 test mnemonic.
-// Writes <dir>/walkthrough.json and NN-step.png files; quits with 0 when every
-// check passed, 1 otherwise.
+// add-wallet dialog, adds seeds and public keys, presses the buttons, switches
+// pages, changes a setting, closes and reopens the window, removes wallets — and
+// after every step checks what the app shows and saves a screenshot. Started by
+// --walkthrough <dir>, which main() only accepts together with --data-dir, so it
+// never touches the real wallets; the only seeds it ever types are public BIP39
+// test mnemonics. Writes <dir>/walkthrough.json, addresses.csv and NN-step.png
+// files; quits with 0 when every check passed, 1 otherwise.
 class Walkthrough : public QObject
 {
 public:
@@ -65,6 +65,7 @@ private:
     // Values remembered across steps.
     int rowsBeforeReopen_ = 0;
     QString totalsBeforeReopen_;
+    quint32 removedWallet_ = 0;
 };
 
 } // namespace app

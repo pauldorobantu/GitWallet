@@ -1,6 +1,7 @@
 #include "ui/pages/AddressesPage.h"
 
 #include "app/WalletController.h"
+#include "net/PriceFeed.h"
 #include "ui/AddressTableModel.h"
 #include "ui/Feedback.h"
 #include "ui/HoverRowTable.h"
@@ -11,8 +12,10 @@
 #include "ui/ThemeManager.h"
 #include "wallet/Types.h"
 #include "wallet/WalletModel.h"
+#include "wallet/WalletStore.h"
 
 #include <QComboBox>
+#include <QFileDialog>
 #include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -20,11 +23,15 @@
 #include <QLineEdit>
 #include <QLocale>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QSortFilterProxyModel>
 #include <QStyle>
 #include <QTimer>
 #include <QVBoxLayout>
+
+#include <exception>
 
 namespace app::ui {
 
@@ -61,8 +68,13 @@ public:
         if (state != state_)
             change([&] { state_ = state; });
     }
+    void setWallet(quint32 wallet)
+    {
+        if (wallet != wallet_)
+            change([&] { wallet_ = wallet; });
+    }
     // A combo narrows the list (the search text is reported separately).
-    bool filtered() const { return chain_ != ChainAll || state_ != StateAll; }
+    bool filtered() const { return wallet_ != 0 || chain_ != ChainAll || state_ != StateAll; }
     // The search text or a combo hides rows; otherwise every row passes.
     bool narrowed() const { return filtered() || !query_.isEmpty(); }
 
@@ -73,6 +85,8 @@ protected:
         if (!source)
             return false;
         const QModelIndex first = source->index(sourceRow, 0, sourceParent);
+        if (wallet_ != 0 && first.data(AddressTableModel::WalletRole).toUInt() != wallet_)
+            return false;
         if (chain_ != ChainAll
             && first.data(AddressTableModel::IsBitcoinRole).toBool() != (chain_ == ChainBitcoin))
             return false;
@@ -102,9 +116,37 @@ private:
     }
 
     QString query_;
+    quint32 wallet_ = 0; // 0: every wallet
     int chain_ = ChainAll;
     int state_ = StateAll;
 };
+
+// A CSV field: quoted when it has to be. A name opening with what a spreadsheet
+// reads as a formula is defused, so opening the export never runs anything.
+QString csvField(const QString& text)
+{
+    QString field = text;
+    if (!field.isEmpty() && QStringLiteral("=+-@\t\r").contains(field.at(0)))
+        field.prepend(QLatin1Char('\''));
+    if (field.contains(QLatin1Char(',')) || field.contains(QLatin1Char('"')) || field.contains(QLatin1Char('\n'))
+        || field.contains(QLatin1Char('\r'))) {
+        field.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+        field = QLatin1Char('"') + field + QLatin1Char('"');
+    }
+    return field;
+}
+
+// The row's amount of `info` in whole units, every digit kept; empty for an asset
+// of the other chain, and for a zero that may only mean "no answer yet".
+QString csvAmount(const wallet::AddressRow& row, const wallet::AssetInfo& info)
+{
+    if ((info.asset == wallet::Asset::BTC) != row.isBitcoin())
+        return QString();
+    const chain::Amount amount = row.amount(info.asset);
+    if (amount.isZero() && !row.checked)
+        return QString();
+    return QString::fromStdString(amount.format(info.decimals, info.decimals));
+}
 
 // "500 addresses · 3 funded", or "12 of 500 addresses · 1 funded" while a
 // filter hides some.
@@ -150,11 +192,13 @@ struct AddressesPage::Ui : QObject
     AddressFilter* filter = nullptr;
     HoverRowTableView* view = nullptr;
     QLineEdit* search = nullptr;
+    QComboBox* wallet = nullptr;
     QComboBox* chain = nullptr;
     QComboBox* state = nullptr;
     QLabel* count = nullptr;
+    QPushButton* exportCsv = nullptr;
     QPushButton* refresh = nullptr;
-    QWidget* noWallet = nullptr; // first run: no seed imported yet
+    QWidget* noWallet = nullptr; // first run: no wallet added yet
     QWidget* waiting = nullptr;  // a wallet whose first addresses are not derived yet
     QWidget* noResults = nullptr;
     QTimer* update = nullptr;    // batches recounts while a scan streams rows in
@@ -198,7 +242,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     root->addWidget(view, 1);
 
     ui_->noWallet = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("No wallet yet"),
-                                         QStringLiteral("Import a seed on the Overview page."));
+                                         QStringLiteral("Add a wallet on the Wallets page."));
     ui_->waiting = page::makeEmptyState(this, int(icon::Kind::Refresh), QStringLiteral("Scanning addresses"),
                                         QStringLiteral("Addresses appear here as GitWallet derives and checks them."));
     ui_->noResults = page::makeNoResultsState(this);
@@ -208,6 +252,10 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
 
     const page::ActionBar bar = page::makeActionBar(this);
     ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search address or path"));
+    ui_->wallet = new QComboBox(bar.widget);
+    ui_->wallet->setObjectName(QStringLiteral("walletFilter"));
+    ui_->wallet->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    ui_->wallet->setMaximumWidth(page::kFieldMaxW / 2); // a long name is cut, not the toolbar
     ui_->chain = new QComboBox(bar.widget);
     ui_->chain->addItems({QStringLiteral("All chains"), QStringLiteral("Bitcoin"), QStringLiteral("Ethereum")});
     ui_->chain->setSizeAdjustPolicy(QComboBox::AdjustToContents);
@@ -218,10 +266,15 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->count = new QLabel(bar.widget);
     ui_->count->setObjectName(QStringLiteral("mimCount"));
     bar.left->addWidget(ui_->search);
+    bar.left->addWidget(ui_->wallet);
     bar.left->addWidget(ui_->chain);
     bar.left->addWidget(ui_->state);
     bar.left->addWidget(ui_->count);
 
+    ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
+    ui_->exportCsv->setToolTip(QStringLiteral("Save the rows shown to a spreadsheet file. It is not encrypted: "
+                                              "anyone who reads it sees these addresses and balances."));
+    bar.right->addWidget(ui_->exportCsv);
     ui_->refresh = new QPushButton(QStringLiteral("Refresh"), bar.widget);
     ui_->refresh->setToolTip(QStringLiteral("Fetch prices and Ethereum balances now (Bitcoin updates live)"));
     page::setLabeledIcon(ui_->refresh, refreshIcon());
@@ -241,6 +294,10 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->filter->setQuery(text.trimmed());
         updateState();
     });
+    connect(ui_->wallet, &QComboBox::currentIndexChanged, this, [this](int) {
+        ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
+        updateState();
+    });
     connect(ui_->chain, &QComboBox::currentIndexChanged, this, [this](int index) {
         ui_->filter->setChain(index);
         updateState();
@@ -258,6 +315,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->cooldown->start();
         ui_->refresh->setEnabled(false);
     });
+    connect(ui_->exportCsv, &QPushButton::clicked, this, &AddressesPage::chooseExportFile);
 
     // Scan results arrive as inserts and single-row changes, hundreds a second:
     // recount in batches.
@@ -278,9 +336,101 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         applyColumnWidths();
         updateState();
     });
-    if (controller_)
-        connect(controller_, &WalletController::walletChanged, this, &AddressesPage::updateState);
+    if (controller_) {
+        connect(controller_, &WalletController::walletChanged, this, [this] {
+            rebuildWalletFilter();
+            updateState();
+        });
+    }
+    rebuildWalletFilter();
     updateState();
+}
+
+void AddressesPage::rebuildWalletFilter()
+{
+    const quint32 chosen = ui_->wallet->currentData().toUInt();
+    const QList<wallet::WalletEntry> wallets =
+        controller_ ? controller_->store().wallets : QList<wallet::WalletEntry>();
+    {
+        const QSignalBlocker quiet(ui_->wallet);
+        ui_->wallet->clear();
+        ui_->wallet->addItem(QStringLiteral("All wallets"), quint32(0));
+        for (const wallet::WalletEntry& w : wallets)
+            ui_->wallet->addItem(w.label, w.id);
+        const int keep = ui_->wallet->findData(chosen);
+        ui_->wallet->setCurrentIndex(keep >= 0 ? keep : 0); // a wallet removed: back to all
+    }
+    ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
+    ui_->wallet->setVisible(wallets.size() > 1);
+    ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallets.size() < 2);
+}
+
+void AddressesPage::showWallet(quint32 id)
+{
+    const int index = ui_->wallet->findData(id);
+    ui_->wallet->setCurrentIndex(index >= 0 ? index : 0);
+}
+
+void AddressesPage::chooseExportFile()
+{
+    const QString path = QFileDialog::getSaveFileName(
+        this, trText(QStringLiteral("Export addresses")), QStringLiteral("gitwallet-addresses.csv"),
+        QStringLiteral("CSV (*.csv)"));
+    if (path.isEmpty())
+        return;
+    QString error;
+    if (exportCsv(path, &error))
+        Feedback::show(ui_->exportCsv, Feedback::Type::Success, trText(QStringLiteral("Addresses exported")));
+    else
+        Feedback::show(this, Feedback::Type::Error, error);
+}
+
+bool AddressesPage::exportCsv(const QString& path, QString* error) const
+{
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    const net::PriceFeed* prices = controller_ ? controller_->prices() : nullptr;
+    QStringList lines;
+    lines << QStringLiteral("wallet,chain,type,path,address,state,BTC,ETH,USDT,USDC,USD");
+    for (int row = 0; model && row < ui_->filter->rowCount(); ++row) {
+        const QModelIndex first = ui_->filter->mapToSource(ui_->filter->index(row, 0));
+        if (first.row() >= model->size())
+            continue;
+        const wallet::AddressRow& r = model->at(first.row());
+        const auto cell = [&](int column) { return first.siblingAtColumn(column).data().toString(); };
+        QStringList fields;
+        fields << csvField(cell(AddressTableModel::ColWallet))
+               << csvField(cell(AddressTableModel::ColChain))
+               << csvField(cell(AddressTableModel::ColType))
+               << csvField(r.path)
+               << csvField(r.address)
+               << csvField(cell(AddressTableModel::ColState));
+        double usd = 0.0;
+        bool priced = r.checked || r.state() == wallet::AddressState::Funded;
+        try {
+            for (const wallet::AssetInfo& info : wallet::assets()) {
+                fields << csvAmount(r, info);
+                const chain::Amount amount = r.amount(info.asset);
+                if (amount.isZero())
+                    continue;
+                const double price = prices ? prices->usd(info.symbol) : 0.0;
+                priced = priced && price > 0.0;
+                usd += amount.toDouble(info.decimals) * price;
+            }
+        } catch (const std::exception&) {
+            *error = trText(QStringLiteral("An amount could not be read; nothing was exported."));
+            return false;
+        }
+        fields << (priced ? QString::number(usd, 'f', 2) : QString());
+        lines << fields.join(QLatin1Char(','));
+    }
+
+    QSaveFile file(path);
+    const QByteArray body = QByteArray("\xEF\xBB\xBF") + lines.join(QStringLiteral("\r\n")).toUtf8() + "\r\n";
+    if (!file.open(QIODevice::WriteOnly) || file.write(body) != body.size() || !file.commit()) {
+        *error = trText(QStringLiteral("Could not write the file: %1")).arg(file.errorString());
+        return false;
+    }
+    return true;
 }
 
 void AddressesPage::applyColumnWidths()
@@ -312,6 +462,7 @@ void AddressesPage::applyColumnWidths()
         header->setSectionResizeMode(column, QHeaderView::Interactive);
         header->resizeSection(column, width);
     };
+    fit(AddressTableModel::ColWallet, {QStringLiteral("A wallet name")}, 0);
     fit(AddressTableModel::ColChain, {QStringLiteral("BTC"), QStringLiteral("ETH")}, 0);
     fit(AddressTableModel::ColType,
         {QStringLiteral("Native SegWit"), QStringLiteral("Nested SegWit"), QStringLiteral("Ethereum")}, 0);
@@ -361,11 +512,13 @@ void AddressesPage::updateState()
     ui_->update->stop();
     const bool hasWallet = controller_ && controller_->hasWallet();
     ui_->search->setEnabled(hasWallet);
+    ui_->wallet->setEnabled(hasWallet);
     ui_->chain->setEnabled(hasWallet);
     ui_->state->setEnabled(hasWallet);
     ui_->refresh->setEnabled(hasWallet && !ui_->cooldown->isActive());
 
     const int shown = ui_->filter->rowCount();
+    ui_->exportCsv->setEnabled(shown > 0);
     const int total = ui_->model->rowCount();
     int funded = 0;
     if (!ui_->filter->narrowed()) {

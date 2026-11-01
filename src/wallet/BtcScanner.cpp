@@ -45,11 +45,12 @@ constexpr int kMaxGap = 100000;
 // drops a row, so a buggy or hostile server that calls every address used
 // would otherwise grow the wallet, its subscriptions and its balance requests
 // without end (a limit per chain still let six chains reach six times as
-// much). Each chain's own gap window is always derived, inside the limit; the
-// rest leaves room for close to 10,000 used addresses or more at any gap the
-// controller allows (20 to 5,000). The ceiling stays below what public servers
-// let one client subscribe (ElectrumX: 50,000 per session by default; Fulcrum:
-// 75,000 per IP), so an honest server never refuses part of a full wallet.
+// much). Each chain's own gap window is derived first, inside the limit; for one
+// wallet the rest leaves room for close to 10,000 used addresses or more at any
+// gap the controller allows (20 to 5,000). The ceiling stays below what public
+// servers let one client subscribe (ElectrumX: 50,000 per session by default;
+// Fulcrum: 75,000 per IP), so an honest server never refuses part of a full
+// wallet; all wallets share it, since they share one connection.
 constexpr qint64 kRowsPerGapRow = 20;
 constexpr int kMinWalletRows = 10000;
 constexpr int kMaxWalletRows = 40000;
@@ -167,6 +168,11 @@ QString errorKey(const QString& text)
     return key;
 }
 
+QString chainKey(quint32 wallet, chain::ScriptType type, quint32 account, quint32 change)
+{
+    return QStringLiteral("%1/%2/%3/%4").arg(wallet).arg(static_cast<int>(type)).arg(account).arg(change);
+}
+
 } // namespace
 
 int BtcScanner::Chain::window() const
@@ -206,13 +212,13 @@ BtcScanner::BtcScanner(net::ElectrumClient* client, WalletModel* model, QObject*
 
 void BtcScanner::setAccounts(const QList<AccountKey>& accounts)
 {
-    // Takes effect at the next start(). One chain per (type, account): a
+    // Takes effect at the next start(). One chain per (wallet, type, account): a
     // repeated account would derive and subscribe every row twice.
     accounts_.clear();
     for (const AccountKey& a : accounts) {
         if (!chain::isBitcoin(a.type)) continue;
         const bool repeated = std::any_of(accounts_.cbegin(), accounts_.cend(), [&a](const AccountKey& b) {
-            return b.type == a.type && b.account == a.account;
+            return b.wallet == a.wallet && b.type == a.type && b.account == a.account;
         });
         if (!repeated) accounts_.append(a);
     }
@@ -235,6 +241,7 @@ void BtcScanner::start()
     ++generation_; // replies to anything sent before are dropped from now on
     running_ = true;
     chains_.clear();
+    chainByKey_.clear();
     tracked_.clear();
     subQueue_.clear();
     balanceQueue_.clear();
@@ -271,6 +278,7 @@ void BtcScanner::start()
         }
         for (quint32 change = 0; change <= 1; ++change) {
             Chain c;
+            c.wallet = acct.wallet;
             c.type = acct.type;
             c.account = acct.account;
             c.change = change;
@@ -282,6 +290,7 @@ void BtcScanner::start()
                                    .arg(where, QString::number(change), QString::fromUtf8(e.what())));
                 continue;
             }
+            chainByKey_.insert(chainKey(c.wallet, c.type, c.account, c.change), int(chains_.size()));
             chains_.append(c);
         }
     }
@@ -319,7 +328,7 @@ void BtcScanner::adoptModelRows()
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
         if (!row.isBitcoin() || row.index >= quint32(kMaxChainRows)) continue; // never derived
-        const int ci = findChain(row.type, row.account, row.change);
+        const int ci = findChain(row);
         if (ci < 0) continue;
         const int index = static_cast<int>(row.index);
         const QString sh = row.scripthash.toLower();
@@ -450,7 +459,7 @@ void BtcScanner::onScripthashChanged(const QString& scripthash, const QString& s
     const int pos = model_->findByScripthash(scripthash);
     if (pos < 0) return;
     const AddressRow& row = model_->at(pos);
-    if (!row.isBitcoin() || findChain(row.type, row.account, row.change) < 0) return; // not ours
+    if (!row.isBitcoin() || findChain(row) < 0) return; // not ours
     const QString sh = row.scripthash.toLower(); // the spelling tracked_ uses
 
     QString text;
@@ -536,7 +545,7 @@ int BtcScanner::adoptOrDerive(int chainIndex, int index)
 {
     const Chain& c = chains_.at(chainIndex);
     const quint32 i = quint32(index);
-    const int pos = model_->find(c.type, c.account, c.change, i);
+    const int pos = model_->find(c.wallet, c.type, c.account, c.change, i);
     if (pos >= 0 && c.reuse) {
         const QString sh = model_->at(pos).scripthash.toLower();
         if (!sh.isEmpty()) {
@@ -546,6 +555,7 @@ int BtcScanner::adoptOrDerive(int chainIndex, int index)
     }
 
     AddressRow row;
+    row.wallet = c.wallet;
     row.type = c.type;
     row.account = c.account;
     row.change = c.change;
@@ -597,7 +607,9 @@ qint64 BtcScanner::reservedRows() const
 bool BtcScanner::mayDerive(const Chain& c) const
 {
     if (c.next >= c.target()) return false;
-    if (c.next < c.base()) return true;
+    // What the gap alone asks for, unless so many wallets add up past the ceiling
+    // that a server would refuse the rest anyway.
+    if (c.next < c.base()) return tracked_.size() < kMaxWalletRows;
     // Growth a used status asked for: only within the row limit.
     return qint64(tracked_.size()) + reservedRows() < rowLimit();
 }
@@ -820,7 +832,7 @@ void BtcScanner::applyStatus(const QString& scripthash, bool used)
     const int pos = model_->findByScripthash(scripthash);
     if (pos < 0) return;
     AddressRow row = model_->at(pos);
-    const int ci = findChain(row.type, row.account, row.change);
+    const int ci = findChain(row);
     const int index = static_cast<int>(row.index);
     // An unused address is checked with its status alone. A used one is
     // checked once its balance has answered as well: until its first balance
@@ -867,7 +879,7 @@ void BtcScanner::applyBalance(const QString& scripthash, qint64 confirmed, qint6
     row.used = row.used || coins;
     row.btcConfirmed = confirmed;
     row.btcUnconfirmed = unconfirmed;
-    const int ci = findChain(row.type, row.account, row.change);
+    const int ci = findChain(row);
     const int index = static_cast<int>(row.index);
     const quint64 gen = generation_;
     model_->upsert(row);
@@ -897,6 +909,18 @@ void BtcScanner::reportLimits()
     limitReported_ = true;
     static const QLocale english(QLocale::English, QLocale::UnitedStates); // "15,000", as the UI groups
     const QString count = english.toString(qlonglong(tracked_.size()));
+    // Many wallets reach the ceiling on their gaps alone, whatever a server says.
+    qint64 baseRows = 0;
+    for (const Chain& c : std::as_const(chains_)) baseRows += c.base();
+    if (baseRows >= kMaxWalletRows) {
+        emit problem(Problem::Limit,
+                     QStringLiteral("Bitcoin scan stopped at %1 addresses, the most GitWallet follows on one "
+                                    "connection: these wallets' gaps alone reach it. Lower the gaps in "
+                                    "Settings or remove wallets you do not need here.")
+                         .arg(count),
+                     QString());
+        return;
+    }
     emit problem(Problem::Limit,
                  rowLimit() < kMaxWalletRows
                      ? QStringLiteral("Bitcoin scan stopped at %1 addresses, the limit for these gap settings: the "
@@ -934,13 +958,9 @@ void BtcScanner::recount(const QString& scripthash)
     noteProgress();
 }
 
-int BtcScanner::findChain(chain::ScriptType type, quint32 account, quint32 change) const
+int BtcScanner::findChain(const AddressRow& row) const
 {
-    for (int i = 0; i < chains_.size(); ++i) {
-        const Chain& c = chains_.at(i);
-        if (c.type == type && c.account == account && c.change == change) return i;
-    }
-    return -1;
+    return chainByKey_.value(chainKey(row.wallet, row.type, row.account, row.change), -1);
 }
 
 // ------------------------------------------------------------------ progress ----

@@ -48,6 +48,8 @@ const Tr kTr[] = {
     { "Try a different search or clear the filter.", "Prueba otra búsqueda o quita el filtro.", "Essayez une autre recherche ou effacez le filtre.", "Versuchen Sie eine andere Suche oder entfernen Sie den Filter.", "Измените запрос или сбросьте фильтр." },
     // ---- GitWallet ----
     { "Wallet", "Billetera", "Portefeuille", "Wallet", "Кошелёк" },
+    { "Wallets", "Billeteras", "Portefeuilles", "Wallets", "Кошельки" },
+    { "Add wallet", "Añadir billetera", "Ajouter un portefeuille", "Wallet hinzufügen", "Добавить кошелёк" },
     { "Overview", "Resumen", "Vue d'ensemble", "Übersicht", "Обзор" },
     { "Addresses", "Direcciones", "Adresses", "Adressen", "Адреса" },
     { "Send", "Enviar", "Envoyer", "Senden", "Отправить" },

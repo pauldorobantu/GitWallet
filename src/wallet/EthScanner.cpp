@@ -305,11 +305,13 @@ void EthScanner::setAccounts(const QList<AccountKey>& accounts)
 {
     // Applies at the next start(); a running scan works on its own copy.
     accounts_.clear();
+    owned_.clear();
     for (const AccountKey& key : accounts) {
-        // A second key for the same account number would fight over its rows.
-        if (key.type != chain::ScriptType::EthAccount || ownsAccount(key.account))
+        // A second key for the same account number of a wallet would fight over its rows.
+        if (key.type != chain::ScriptType::EthAccount || ownsAccount(key.wallet, key.account))
             continue;
         accounts_.append(key);
+        owned_.insert({key.wallet, key.account});
     }
 }
 
@@ -448,7 +450,8 @@ void EthScanner::adoptRows(int i)
     QString lowestAddress;
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
-        if (row.type != chain::ScriptType::EthAccount || row.account != a.key.account
+        if (row.type != chain::ScriptType::EthAccount || row.wallet != a.key.wallet
+            || row.account != a.key.account
             || row.change != 0 || qint64(row.index) >= kMaxEthRows) // past the cap: never derived here
             continue;
         const qint64 index = row.index;
@@ -485,6 +488,7 @@ bool EthScanner::deriveRow(const AccountState& account, quint32 index, AddressRo
         const chain::AddressInfo info = chain::addressFromChainNode(
             account.chainNode, chain::ScriptType::EthAccount, account.key.account, 0, index);
         AddressRow row;
+        row.wallet = account.key.wallet;
         row.type = chain::ScriptType::EthAccount;
         row.account = account.key.account;
         row.change = 0;
@@ -511,7 +515,8 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
     for (qint64 index = from; index < to; ++index) {
         const quint32 idx = quint32(index);
         if (replace
-            || model_->find(chain::ScriptType::EthAccount, acc_.at(i).key.account, 0, idx) < 0) {
+            || model_->find(acc_.at(i).key.wallet, chain::ScriptType::EthAccount, acc_.at(i).key.account,
+                            0, idx) < 0) {
             AddressRow row;
             QString why;
             if (!deriveRow(acc_.at(i), idx, &row, &why)) {
@@ -599,8 +604,8 @@ void EthScanner::nextChunk()
     attempts_ = 0;
     while (queueHead_ < queue_.size() && chunk_.size() < kChunk) {
         Slot s = queue_.at(queueHead_++);
-        const int pos = model_->find(chain::ScriptType::EthAccount, acc_.at(s.account).key.account,
-                                     0, s.index);
+        const AccountKey& key = acc_.at(s.account).key;
+        const int pos = model_->find(key.wallet, chain::ScriptType::EthAccount, key.account, 0, s.index);
         if (pos < 0)
             continue;
         s.address = model_->at(pos).address;
@@ -816,8 +821,8 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
 
     for (qsizetype i = 0; i < attempt.size(); ++i) {
         const Slot& s = attempt.at(i);
-        const int pos = model_->find(chain::ScriptType::EthAccount, acc_.at(s.account).key.account,
-                                     0, s.index);
+        const AccountKey& key = acc_.at(s.account).key;
+        const int pos = model_->find(key.wallet, chain::ScriptType::EthAccount, key.account, 0, s.index);
         if (pos < 0 || model_->at(pos).address.compare(s.address, Qt::CaseInsensitive) != 0)
             continue; // replaced or removed while the request was out
         const AddressRow old = model_->at(pos);
@@ -943,7 +948,7 @@ bool EthScanner::windowChecked() const
     for (const AccountState& a : acc_) {
         const qint64 target = windowEnd(a);
         for (qint64 index = 0; index < target; ++index) {
-            const int pos = model_->find(chain::ScriptType::EthAccount, a.key.account, 0,
+            const int pos = model_->find(a.key.wallet, chain::ScriptType::EthAccount, a.key.account, 0,
                                          quint32(index));
             if (pos < 0 || !model_->at(pos).checked)
                 return false;
@@ -1063,7 +1068,7 @@ void EthScanner::countRows(int* checked, int* derived) const
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
         if (row.type != chain::ScriptType::EthAccount || row.change != 0
-            || !ownsAccount(row.account))
+            || !ownsAccount(row.wallet, row.account))
             continue;
         ++*derived;
         if (row.checked)
@@ -1071,12 +1076,9 @@ void EthScanner::countRows(int* checked, int* derived) const
     }
 }
 
-bool EthScanner::ownsAccount(quint32 account) const
+bool EthScanner::ownsAccount(quint32 wallet, quint32 account) const
 {
-    for (const AccountKey& key : accounts_)
-        if (key.account == account)
-            return true;
-    return false;
+    return owned_.contains({wallet, account});
 }
 
 } // namespace wallet

@@ -21,6 +21,7 @@ namespace app::ui {
 class TitleBar;
 class SideNav;
 class OverviewPage;
+class WalletsPage;
 class AddressesPage;
 class SettingsPage;
 
@@ -37,7 +38,7 @@ public:
 
     WalletController* controller() const { return controller_; }
 
-    // "overview" | "addresses" | "send" | "settings" (for --page and tests).
+    // "overview" | "wallets" | "addresses" | "send" | "settings" (for --page and tests).
     void showPage(const QString& name);
 
 protected:
@@ -103,6 +104,7 @@ private:
     SideNav* nav_ = nullptr;
     QStackedWidget* stack_ = nullptr;
     OverviewPage* overview_ = nullptr;
+    WalletsPage* wallets_ = nullptr;
     AddressesPage* addresses_ = nullptr;
     SettingsPage* settings_ = nullptr;
     QWidget* noticeBar_ = nullptr; // shown while a notice waits to be read

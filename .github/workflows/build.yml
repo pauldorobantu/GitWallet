@@ -28,7 +28,8 @@ jobs:
           cache: true
 
       - name: Restore the built libraries
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: libraries
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: C:/gw-vcpkg-installed
           key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}
@@ -39,6 +40,15 @@ jobs:
           set "QT_DIR=%QT_ROOT_DIR%"
           call build.bat
 
+      # Right after the build, not at the end of the job: a failed test must not
+      # cost the next run half an hour of compiling Botan again.
+      - name: Save the built libraries
+        if: steps.libraries.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:/gw-vcpkg-installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}
+
       - name: Self-test
         shell: pwsh
         env:
@@ -48,6 +58,17 @@ jobs:
           $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins\platforms"
           $p = Start-Process dist\GitWallet.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow -RedirectStandardOutput selftest.txt
           Get-Content selftest.txt
+          exit $p.ExitCode
+
+      - name: Store test
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QPA_FONTDIR: C:\Windows\Fonts
+        run: |
+          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins\platforms"
+          $p = Start-Process dist\GitWallet.exe -ArgumentList '--data-dir', "$env:RUNNER_TEMP\gw-store", '--store-test' -Wait -PassThru -NoNewWindow -RedirectStandardOutput storetest.txt
+          Get-Content storetest.txt
           exit $p.ExitCode
 
       - name: UI walkthrough

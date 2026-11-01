@@ -37,8 +37,9 @@ namespace wallet {
 
 namespace {
 
-constexpr int kFormatVersion = 1;
-constexpr qint64 kMaxFileBytes = 1 << 20; // a real wallet.dat is a few KB
+constexpr int kFormatVersion = 2;
+constexpr int kLegacyFormatVersion = 1;   // one wallet: "label" + "accounts" at the top
+constexpr qint64 kMaxFileBytes = 1 << 20; // under 1 KB per wallet, so kMaxWallets fit with room to spare
 constexpr qsizetype kMaxXpubChars = 128;  // a serialized extended key is 111 chars
 
 // A server list holds a handful of host:port entries or URLs. The caps bound
@@ -64,8 +65,8 @@ constexpr chain::ScriptType kAccountTypes[] = {
 };
 
 struct StoreData {
-    QString label;
-    QList<AccountKey> accounts;
+    QList<WalletEntry> wallets;
+    quint32 nextWalletId = 1;
     ScanSettings settings;
 };
 
@@ -233,7 +234,6 @@ bool checkAccount(const AccountKey& k, QString* why)
     return true;
 }
 
-// Shared by save() and load(), so a file save() writes always loads again.
 bool checkAccounts(const QList<AccountKey>& accounts, QString* why)
 {
     QSet<QString> seen;
@@ -245,6 +245,30 @@ bool checkAccounts(const QList<AccountKey>& accounts, QString* why)
                                  .arg(QString::fromLatin1(chain::scriptTypeName(k.type)))
                                  .arg(k.account));
         seen.insert(id);
+    }
+    return true;
+}
+
+// Shared by save() and load(), so a file save() writes always loads again. The
+// same key in two wallets would make both claim one set of addresses.
+bool checkWallets(const QList<WalletEntry>& wallets, QString* why)
+{
+    if (wallets.size() > WalletStore::kMaxWallets)
+        return fail(why, QStringLiteral("it lists more than %1 wallets").arg(WalletStore::kMaxWallets));
+    QSet<quint32> ids;
+    QSet<QString> keys;
+    for (const WalletEntry& w : wallets) {
+        if (w.id == 0 || ids.contains(w.id))
+            return fail(why, QStringLiteral("a wallet has a missing or repeated number"));
+        ids.insert(w.id);
+        if (w.accounts.isEmpty())
+            return fail(why, QStringLiteral("a wallet has no account keys"));
+        if (!checkAccounts(w.accounts, why)) return false;
+        for (const AccountKey& k : w.accounts) {
+            if (keys.contains(k.xpub))
+                return fail(why, QStringLiteral("an account key is listed in two wallets"));
+            keys.insert(k.xpub);
+        }
     }
     return true;
 }
@@ -263,7 +287,8 @@ bool readAccountIndex(const QJsonValue& v, quint32* out)
 
 QString labelOrDefault(const QString& label)
 {
-    return label.trimmed().isEmpty() ? QStringLiteral("Wallet") : label;
+    const QString clean = WalletStore::cleanLabel(label);
+    return clean.isEmpty() ? QStringLiteral("Wallet") : clean;
 }
 
 // Trimmed, no blanks, no repeats; the order is the user's preference order.
@@ -319,15 +344,24 @@ QStringList readList(const QJsonObject& o, const QString& key)
 
 // ------------------------------------------------------------ file body ----
 
-QByteArray toJson(const QString& label, const QList<AccountKey>& accounts, const ScanSettings& s)
+QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const ScanSettings& s)
 {
-    QJsonArray list;
-    for (const AccountKey& k : accounts) {
-        QJsonObject a;
-        a.insert(QStringLiteral("type"), typeId(k.type));
-        a.insert(QStringLiteral("account"), static_cast<qint64>(k.account));
-        a.insert(QStringLiteral("xpub"), k.xpub);
-        list.append(a);
+    QJsonArray entries;
+    for (const WalletEntry& w : wallets) {
+        QJsonArray list;
+        for (const AccountKey& k : w.accounts) {
+            QJsonObject a;
+            a.insert(QStringLiteral("type"), typeId(k.type));
+            a.insert(QStringLiteral("account"), static_cast<qint64>(k.account));
+            a.insert(QStringLiteral("xpub"), k.xpub);
+            list.append(a);
+        }
+        QJsonObject entry;
+        entry.insert(QStringLiteral("id"), static_cast<qint64>(w.id));
+        entry.insert(QStringLiteral("label"), labelOrDefault(w.label));
+        entry.insert(QStringLiteral("fromKeys"), w.fromKeys);
+        entry.insert(QStringLiteral("accounts"), list);
+        entries.append(entry);
     }
 
     QJsonObject settings;
@@ -341,10 +375,30 @@ QByteArray toJson(const QString& label, const QList<AccountKey>& accounts, const
     QJsonObject root;
     root.insert(QStringLiteral("format"), QStringLiteral("gitwallet"));
     root.insert(QStringLiteral("version"), kFormatVersion);
-    root.insert(QStringLiteral("label"), label);
-    root.insert(QStringLiteral("accounts"), list);
+    root.insert(QStringLiteral("nextWalletId"), static_cast<qint64>(nextWalletId));
+    root.insert(QStringLiteral("wallets"), entries);
     root.insert(QStringLiteral("settings"), settings);
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
+}
+
+// An "accounts" array as both formats write it, each key marked as `wallet`'s.
+// False + why when it is not one.
+bool readAccounts(const QJsonValue& value, quint32 wallet, QList<AccountKey>* out, QString* why)
+{
+    if (!value.isArray()) return fail(why, QStringLiteral("it has no account list"));
+    const QJsonArray entries = value.toArray();
+    for (const QJsonValue& entry : entries) {
+        const QJsonObject o = entry.toObject(); // empty for a non-object: fails below
+        AccountKey k;
+        k.wallet = wallet;
+        if (!typeFromId(o.value(QStringLiteral("type")).toString(), &k.type))
+            return fail(why, QStringLiteral("an account has an unknown type"));
+        if (!readAccountIndex(o.value(QStringLiteral("account")), &k.account))
+            return fail(why, QStringLiteral("an account has an invalid number"));
+        k.xpub = o.value(QStringLiteral("xpub")).toString();
+        out->append(k);
+    }
+    return true;
 }
 
 // Parses and validates the decrypted body. Qt's JSON objects keep their own
@@ -368,25 +422,45 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
         return fail(error, QStringLiteral("The wallet file %1 was written by a newer version of GitWallet "
                                           "(format %2). Update GitWallet to open it.")
                                .arg(nativePath(path), QString::number(version.toDouble())));
-    if (!version.isDouble() || version.toDouble() != kFormatVersion)
+    const bool legacy = version.isDouble() && version.toDouble() == kLegacyFormatVersion;
+    if (!version.isDouble() || (!legacy && version.toDouble() != kFormatVersion))
         return damaged(QStringLiteral("unsupported format version"));
 
-    const QJsonValue accountList = root.value(QStringLiteral("accounts"));
-    if (!accountList.isArray()) return damaged(QStringLiteral("it has no account list"));
-    QList<AccountKey> accounts;
-    const QJsonArray entries = accountList.toArray();
-    for (const QJsonValue& entry : entries) {
-        const QJsonObject o = entry.toObject(); // empty for a non-object: fails below
-        AccountKey k;
-        if (!typeFromId(o.value(QStringLiteral("type")).toString(), &k.type))
-            return damaged(QStringLiteral("an account has an unknown type"));
-        if (!readAccountIndex(o.value(QStringLiteral("account")), &k.account))
-            return damaged(QStringLiteral("an account has an invalid number"));
-        k.xpub = o.value(QStringLiteral("xpub")).toString();
-        accounts.append(k);
-    }
     QString why;
-    if (!checkAccounts(accounts, &why)) return damaged(why);
+    QList<WalletEntry> wallets;
+    quint32 nextId = 1;
+    if (legacy) {
+        // One wallet at the top. Settings saved before the first import made a
+        // file without accounts: no wallet yet.
+        WalletEntry only;
+        only.id = 1;
+        only.label = labelOrDefault(root.value(QStringLiteral("label")).toString());
+        if (!readAccounts(root.value(QStringLiteral("accounts")), only.id, &only.accounts, &why))
+            return damaged(why);
+        if (!only.accounts.isEmpty()) wallets.append(only);
+        nextId = 2;
+    } else {
+        const QJsonValue list = root.value(QStringLiteral("wallets"));
+        if (!list.isArray()) return damaged(QStringLiteral("it has no wallet list"));
+        const QJsonArray entries = list.toArray();
+        for (const QJsonValue& value : entries) {
+            const QJsonObject o = value.toObject();
+            WalletEntry w;
+            if (!readAccountIndex(o.value(QStringLiteral("id")), &w.id))
+                return damaged(QStringLiteral("a wallet has an invalid number"));
+            w.label = labelOrDefault(o.value(QStringLiteral("label")).toString());
+            w.fromKeys = o.value(QStringLiteral("fromKeys")).toBool();
+            if (!readAccounts(o.value(QStringLiteral("accounts")), w.id, &w.accounts, &why))
+                return damaged(why);
+            nextId = std::max(nextId, w.id + 1);
+            wallets.append(w);
+        }
+        // Past every id in the file whatever the field says: an id is never reused.
+        quint32 stored = 0;
+        if (readAccountIndex(root.value(QStringLiteral("nextWalletId")), &stored))
+            nextId = std::max(nextId, stored);
+    }
+    if (!checkWallets(wallets, &why)) return damaged(why);
 
     // Settings are not critical: a missing or mistyped field takes its default.
     const QJsonObject so = root.value(QStringLiteral("settings")).toObject();
@@ -399,8 +473,8 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
     s.electrumServers = readList(so, QStringLiteral("electrumServers"));
     s.ethEndpoints = readList(so, QStringLiteral("ethEndpoints"));
 
-    out->label = labelOrDefault(root.value(QStringLiteral("label")).toString());
-    out->accounts = std::move(accounts);
+    out->wallets = std::move(wallets);
+    out->nextWalletId = nextId;
     out->settings = sanitized(s);
     return true;
 }
@@ -500,8 +574,8 @@ bool WalletStore::load(QString* error)
     } // the plaintext is zeroed here
 
     // Only a fully valid file replaces what this object holds.
-    label = std::move(data.label);
-    accounts = std::move(data.accounts);
+    wallets = std::move(data.wallets);
+    nextWalletId_ = data.nextWalletId;
     settings = std::move(data.settings);
     return true;
 }
@@ -512,12 +586,12 @@ bool WalletStore::save(QString* error) const
     const QString dir = QFileInfo(path).absolutePath();
 
     QString why;
-    if (!checkAccounts(accounts, &why))
+    if (!checkWallets(wallets, &why))
         return fail(error, QStringLiteral("The wallet was not saved: %1.").arg(why));
 
     QByteArray blob;
     {
-        QByteArray json = toJson(labelOrDefault(label), accounts, sanitized(settings));
+        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings));
         const auto wipe = qScopeGuard([&json] { scrub(json); });
         DWORD code = 0;
         if (!protect(json, &blob, &code))
@@ -555,7 +629,111 @@ bool WalletStore::remove(QString* error)
     if (file.exists() && !file.remove())
         return fail(error, QStringLiteral("Cannot delete the wallet file %1: %2")
                                .arg(nativePath(path), file.errorString()));
-    *this = WalletStore(); // label, accounts and settings back to their defaults
+    *this = WalletStore(); // wallets and settings back to their defaults
+    return true;
+}
+
+bool WalletStore::writeRawForTest(const QByteArray& json, QString* error)
+{
+    QByteArray blob;
+    DWORD code = 0;
+    if (!protect(json, &blob, &code))
+        return fail(error, windowsError(code));
+    QSaveFile file(filePath());
+    if (!file.open(QIODevice::WriteOnly) || file.write(blob) != blob.size() || !file.commit())
+        return fail(error, file.errorString());
+    return true;
+}
+
+QList<AccountKey> WalletStore::allAccounts() const
+{
+    QList<AccountKey> out;
+    for (const WalletEntry& w : wallets)
+        out.append(w.accounts);
+    return out;
+}
+
+const WalletEntry* WalletStore::find(quint32 id) const
+{
+    for (const WalletEntry& w : wallets) {
+        if (w.id == id) return &w;
+    }
+    return nullptr;
+}
+
+quint32 WalletStore::takeWalletId()
+{
+    return nextWalletId_++;
+}
+
+QString WalletStore::cleanLabel(const QString& label)
+{
+    QString line;
+    line.reserve(label.size());
+    for (const QChar c : label) {
+        if (c.isSpace())
+            line.append(QLatin1Char(' '));
+        else if (c.category() != QChar::Other_Control && c.category() != QChar::Other_Format)
+            line.append(c);
+    }
+    line = line.simplified();
+    if (line.size() > kMaxLabelChars) {
+        qsizetype cut = kMaxLabelChars;
+        if (line.at(cut - 1).isHighSurrogate()) --cut; // never half a character
+        line.truncate(cut);
+    }
+    return line;
+}
+
+bool WalletStore::accountsFromPublicKeys(const QStringList& keys, bool xpubIsEthereum,
+                                         QList<AccountKey>* out, QString* why)
+{
+    QList<AccountKey> accounts;
+    for (qsizetype i = 0; i < keys.size(); ++i) {
+        const QString number = QString::number(i + 1);
+        const QString text = keys.at(i).trimmed();
+        if (text.size() > kMaxXpubChars)
+            return fail(why, QStringLiteral("Key %1 is too long to be a public key.").arg(number));
+
+        chain::HdPubKey node;
+        uint32_t version = 0;
+        bool parsed = false;
+        try {
+            parsed = chain::HdPubKey::parse(text.toStdString(), &node, &version);
+        } catch (const std::exception&) {
+            parsed = false;
+        }
+        if (!parsed)
+            return fail(why, QStringLiteral("Key %1 is not a valid zpub, ypub or xpub.").arg(number));
+
+        // Account level is m/purpose'/coin'/account': a key from any other depth
+        // would show addresses no wallet of this seed ever handed out.
+        constexpr uint32_t kHardened = 0x80000000u;
+        if (node.depth() != 3 || (node.childNumber() & kHardened) == 0)
+            return fail(why, QStringLiteral("Key %1 is not an account key (m/purpose'/coin'/account'). "
+                                            "Export the account's public key from the other wallet.")
+                                 .arg(number));
+
+        AccountKey key;
+        key.account = node.childNumber() & ~kHardened;
+        key.xpub = text;
+        switch (version) {
+        case chain::xpubVersion::kZpub: key.type = chain::ScriptType::P2WPKH; break;
+        case chain::xpubVersion::kYpub: key.type = chain::ScriptType::P2SH_P2WPKH; break;
+        case chain::xpubVersion::kXpub:
+            key.type = xpubIsEthereum ? chain::ScriptType::EthAccount : chain::ScriptType::P2PKH;
+            break;
+        default:
+            return fail(why, QStringLiteral("Key %1 is not a mainnet zpub, ypub or xpub.").arg(number));
+        }
+        accounts.append(key);
+    }
+    QString problem;
+    if (!checkAccounts(accounts, &problem)) {
+        if (why) *why = QStringLiteral("These keys cannot be added together: %1.").arg(problem);
+        return false;
+    }
+    *out = accounts;
     return true;
 }
 

@@ -1,3 +1,4 @@
+#include "app/StoreTest.h"
 #include "app/WalletController.h"
 #include "app/Walkthrough.h"
 #include "chain/Bip39.h"
@@ -190,6 +191,7 @@ bool writeScanReport(const QString& path, app::WalletController* c, bool timedOu
     for (int i = 0; i < m->size(); ++i) {
         const wallet::AddressRow& r = m->at(i);
         QJsonObject o{
+            {QStringLiteral("wallet"), qint64(r.wallet)},
             {QStringLiteral("path"), r.path},
             {QStringLiteral("address"), r.address},
             {QStringLiteral("checked"), r.checked},
@@ -213,8 +215,10 @@ bool writeScanReport(const QString& path, app::WalletController* c, bool timedOu
     for (const wallet::AssetInfo& a : wallet::assets())
         prices.insert(a.symbol, c->prices()->usd(a.symbol));
     QJsonArray accounts; // public keys only — lets a test compare with Electrum watch-only
-    for (const wallet::AccountKey& k : c->store().accounts)
-        accounts.append(QJsonObject{{QStringLiteral("type"), QString::fromLatin1(chain::scriptTypeName(k.type))},
+    const QList<wallet::AccountKey> keys = c->store().allAccounts();
+    for (const wallet::AccountKey& k : keys)
+        accounts.append(QJsonObject{{QStringLiteral("wallet"), qint64(k.wallet)},
+                                    {QStringLiteral("type"), QString::fromLatin1(chain::scriptTypeName(k.type))},
                                     {QStringLiteral("account"), int(k.account)},
                                     {QStringLiteral("xpub"), k.xpub}});
     const QJsonObject report{
@@ -276,7 +280,8 @@ int main(int argc, char** argv)
     // they only run on a separate --data-dir: refused without one, and when the
     // folder WalletStore actually resolved is the real wallet's after all.
     for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
-                                QStringLiteral("--scan-report"), QStringLiteral("--screenshot")}) {
+                                QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
+                                QStringLiteral("--store-test")}) {
         if (!args.contains(name)) continue;
         if (dataDir.isEmpty() || sameFolder(wallet::WalletStore::dataDir(), realDataDir())) {
             attachParentConsole();
@@ -284,6 +289,17 @@ int main(int argc, char** argv)
                          qPrintable(name));
             return 2;
         }
+    }
+
+    // --store-test: the wallet file and the address model without a window or a
+    // network, on the separate --data-dir checked above.
+    if (args.contains(QStringLiteral("--store-test"))) {
+        attachParentConsole();
+        const app::StoreTestResult result = app::runStoreTest();
+        std::fputs(result.report.toUtf8().constData(), stdout);
+        std::fprintf(stdout, "GitWallet store test: %d/%d passed\n", result.passed, result.total);
+        std::fflush(stdout);
+        return result.passed == result.total ? 0 : 1;
     }
 
     app::ui::theme::ThemeManager::instance()->loadFromSettings();
@@ -346,7 +362,8 @@ int main(int argc, char** argv)
         QTimer::singleShot(0, controller, [controller] {
             if (controller->hasWallet()) return;
             QString error;
-            if (!controller->importMnemonic(chain::bip39::split(kPublicTestMnemonic), {}, &error))
+            if (!controller->addMnemonicWallet(chain::bip39::split(kPublicTestMnemonic), {},
+                                               QStringLiteral("Test"), &error))
                 qWarning().noquote() << "[test] import failed:" << error;
         });
     }

@@ -12,6 +12,7 @@
 #include "ui/WindowShell.h"
 #include "ui/design/Style.h"
 #include "ui/dialogs/ImportSeedDialog.h"
+#include "ui/pages/WalletsPage.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/OverviewPage.h"
 #include "ui/pages/SettingsPage.h"
@@ -45,7 +46,7 @@ namespace app::ui {
 namespace {
 
 // Page ids = the stacked-widget indices.
-enum PageId { PageOverview = 0, PageAddresses, PageSend, PageSettings };
+enum PageId { PageOverview = 0, PageWallets, PageAddresses, PageSend, PageSettings };
 
 // What a notice depends on besides the wallet (Notice::depends). It goes when
 // one of them changes: the scanners then restart and report again whatever
@@ -241,6 +242,7 @@ void MainWindow::buildUi()
     nav_ = new SideNav(this);
     nav_->addSection(QStringLiteral("Wallet"));
     nav_->addItem(PageOverview, QStringLiteral("Overview"), int(icon::Kind::Dashboard));
+    nav_->addItem(PageWallets, QStringLiteral("Wallets"), int(icon::Kind::Key));
     nav_->addItem(PageAddresses, QStringLiteral("Addresses"), int(icon::Kind::ListRows));
     nav_->addItem(PageSend, QStringLiteral("Send"), int(icon::Kind::ExternalLink));
     nav_->addItem(PageSettings, QStringLiteral("Settings"), int(icon::Kind::Settings));
@@ -248,9 +250,11 @@ void MainWindow::buildUi()
 
     stack_ = new QStackedWidget(this);
     overview_ = new OverviewPage(controller_, stack_);
+    wallets_ = new WalletsPage(controller_, stack_);
     addresses_ = new AddressesPage(controller_, stack_);
     settings_ = new SettingsPage(controller_, stack_);
     stack_->addWidget(overview_);
+    stack_->addWidget(wallets_);
     stack_->addWidget(addresses_);
     // Spending comes in stage 2, after the view has been verified against
     // other wallets and block explorers.
@@ -270,6 +274,11 @@ void MainWindow::buildUi()
     root_->addLayout(body, 1);
 
     connect(overview_, &OverviewPage::importRequested, this, &MainWindow::openImportDialog);
+    connect(wallets_, &WalletsPage::addRequested, this, &MainWindow::openImportDialog);
+    connect(wallets_, &WalletsPage::showAddressesRequested, this, [this](quint32 wallet) {
+        addresses_->showWallet(wallet);
+        openPage(PageAddresses);
+    });
 
     connect(title_, &TitleBar::minimised, this, &QWidget::showMinimized);
     connect(title_, &TitleBar::maximised, this, [this] {
@@ -336,6 +345,7 @@ void MainWindow::showPage(const QString& name)
 {
     static const QHash<QString, int> ids = {
         {QStringLiteral("overview"), PageOverview},
+        {QStringLiteral("wallets"), PageWallets},
         {QStringLiteral("addresses"), PageAddresses},
         {QStringLiteral("send"), PageSend},
         {QStringLiteral("settings"), PageSettings},
@@ -629,9 +639,10 @@ MainWindow::Inputs MainWindow::currentInputs() const
 {
     const wallet::WalletStore& store = controller_->store();
     Inputs in;
-    for (const wallet::AccountKey& key : store.accounts)
-        in.wallet = qHashMulti(in.wallet, int(key.type), key.account, key.xpub);
-    if (!store.accounts.isEmpty() && in.wallet == 0)
+    const QList<wallet::AccountKey> accounts = store.allAccounts();
+    for (const wallet::AccountKey& key : accounts)
+        in.wallet = qHashMulti(in.wallet, key.wallet, int(key.type), key.account, key.xpub);
+    if (!accounts.isEmpty() && in.wallet == 0)
         in.wallet = 1; // 0 stands for "no wallet"
     const wallet::ScanSettings& s = store.settings;
     in.receiveGap = s.btcReceiveGap;

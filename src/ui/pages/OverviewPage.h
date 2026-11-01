@@ -13,8 +13,8 @@ class WalletController;
 
 namespace app::ui {
 
-// The Overview page. Without a wallet: an empty state with an "Import seed"
-// primary button (emits importRequested). With a wallet: the grand total in USD,
+// The Overview page. Without a wallet: an empty state with an "Add wallet"
+// primary button (emits importRequested). With wallets: the grand total in USD,
 // one card per asset (BTC, ETH, USDT, USDC: amount in its own unit + USD), the
 // scan progress and when the prices were last updated, and a Refresh action in
 // the bottom action bar. A figure reads plain only once every balance behind it
@@ -56,6 +56,7 @@ private:
     // Chip: "Connecting…" / "Address limit reached" / "Ethereum endpoint not on
     // mainnet" / "ETH balances from 14:02" / "Scanning…" / "Incomplete" / "Up to date"
     QLabel* scanLabel_ = nullptr;
+    QLabel* walletsLabel_ = nullptr;
     QLabel* scannedLabel_ = nullptr;
     QLabel* usedLabel_ = nullptr;
     QLabel* fundedLabel_ = nullptr;

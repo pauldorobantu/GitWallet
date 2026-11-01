@@ -240,12 +240,13 @@ int typeRank(chain::ScriptType type)
     return 4;
 }
 
-// Paths sort numerically: type, account, change, index — so ".../0/10"
-// follows ".../0/9" and each chain's addresses stay together.
+// Paths sort numerically: wallet, type, account, change, index — so ".../0/10"
+// follows ".../0/9" and each wallet's chains stay together.
 qint64 pathKey(const wallet::AddressRow& row)
 {
-    const qint64 account = qMin<qint64>(row.account, 0xFFFFF); // 20 bits
-    return (qint64(typeRank(row.type)) << 56) | (account << 33)
+    const qint64 wallet = qMin<qint64>(row.wallet, 0x7FFFF); // 19 bits
+    const qint64 account = qMin<qint64>(row.account, 0xFF);  // 8 bits
+    return (wallet << 44) | (qint64(typeRank(row.type)) << 41) | (account << 33)
            | (qint64(row.change & 1u) << 32) | qint64(row.index);
 }
 
@@ -310,6 +311,8 @@ AddressTableModel::AddressTableModel(WalletController* controller, QObject* pare
     if (!controller_)
         return;
     prices_ = currentPrices(controller_);
+    refreshLabels();
+    connect(controller_, &WalletController::walletChanged, this, &AddressTableModel::refreshLabels);
     if (wallet::WalletModel* model = controller_->model()) {
         rows_ = model->size();
         connect(model, &wallet::WalletModel::rowsAppended, this, &AddressTableModel::appendRows);
@@ -355,6 +358,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
         switch (role) {
         case Qt::DisplayRole:
             switch (column) {
+            case ColWallet:
+                return labels_.value(row.wallet);
             case ColChain:
                 return coinOf(row).symbol;
             case ColType:
@@ -377,6 +382,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             break;
         case SortRole:
             switch (column) {
+            case ColWallet:
+                return labels_.value(row.wallet);
             case ColChain:
                 return row.isBitcoin() ? 0 : 1;
             case ColType:
@@ -398,6 +405,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             return int(row.state());
         case AddressRole:
             return row.address;
+        case WalletRole:
+            return row.wallet;
         case kCopyRole:
             return column == ColAddress ? QVariant(row.address) : QVariant();
         case Qt::ToolTipRole:
@@ -450,6 +459,8 @@ QVariant AddressTableModel::headerData(int section, Qt::Orientation orientation,
     if (role != Qt::DisplayRole)
         return {};
     switch (section) {
+    case ColWallet:
+        return trText(QStringLiteral("Wallet"));
     case ColChain:
         return trText(QStringLiteral("Chain"));
     case ColType:
@@ -532,6 +543,15 @@ void AddressTableModel::refreshPrices()
     prices_ = std::move(now);
     if (rows_ > 0)
         emit dataChanged(index(0, ColBalance), index(rows_ - 1, ColUsd));
+}
+
+void AddressTableModel::refreshLabels()
+{
+    labels_.clear();
+    for (const wallet::WalletEntry& w : controller_->store().wallets)
+        labels_.insert(w.id, w.label);
+    if (rows_ > 0)
+        emit dataChanged(index(0, ColWallet), index(rows_ - 1, ColWallet));
 }
 
 } // namespace app::ui

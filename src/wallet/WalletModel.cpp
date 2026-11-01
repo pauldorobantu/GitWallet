@@ -1,14 +1,17 @@
 #include "wallet/WalletModel.h"
 
+#include <utility>
+
 namespace wallet {
 
 namespace {
 
 // A row's identity is its position in the HD tree, never its address.
-QString keyOf(chain::ScriptType type, quint32 account, quint32 change, quint32 index)
+QString keyOf(quint32 wallet, chain::ScriptType type, quint32 account, quint32 change, quint32 index)
 {
-    return QString::number(static_cast<int>(type)) + QLatin1Char('/') + QString::number(account)
-           + QLatin1Char('/') + QString::number(change) + QLatin1Char('/') + QString::number(index);
+    return QString::number(wallet) + QLatin1Char('/') + QString::number(static_cast<int>(type))
+           + QLatin1Char('/') + QString::number(account) + QLatin1Char('/') + QString::number(change)
+           + QLatin1Char('/') + QString::number(index);
 }
 
 } // namespace
@@ -25,9 +28,36 @@ void WalletModel::clear()
     byAddress_.clear();
     byKey_.clear();
     totals_.clear();
+    walletTotals_.clear();
     usedCount_ = 0;
     fundedCount_ = 0;
     checkedCount_ = 0;
+    walletCounts_.clear();
+    emit cleared();
+    emit totalsChanged();
+}
+
+void WalletModel::removeWallet(quint32 wallet)
+{
+    const QVector<AddressRow> before = std::exchange(rows_, {});
+    byScripthash_.clear();
+    byAddress_.clear();
+    byKey_.clear();
+    totals_.clear();
+    walletTotals_.clear();
+    usedCount_ = 0;
+    fundedCount_ = 0;
+    checkedCount_ = 0;
+    walletCounts_.clear();
+    rows_.reserve(before.size());
+    for (const AddressRow& row : before) {
+        if (row.wallet == wallet) continue;
+        const int i = static_cast<int>(rows_.size());
+        rows_.append(row);
+        byKey_.insert(keyOf(row.wallet, row.type, row.account, row.change, row.index), i);
+        addLookups(row, i);
+        countRow(row, +1);
+    }
     emit cleared();
     emit totalsChanged();
 }
@@ -36,7 +66,7 @@ int WalletModel::upsert(const AddressRow& row)
 {
     // Every member is brought up to date before the first signal, so a slot
     // that reads the model (or upserts again) sees a consistent state.
-    const QString key = keyOf(row.type, row.account, row.change, row.index);
+    const QString key = keyOf(row.wallet, row.type, row.account, row.change, row.index);
     const auto found = byKey_.constFind(key);
     if (found == byKey_.cend()) {
         const int i = static_cast<int>(rows_.size());
@@ -78,9 +108,10 @@ int WalletModel::findByAddress(const QString& address) const
     return address.isEmpty() ? -1 : byAddress_.value(address.toLower(), -1);
 }
 
-int WalletModel::find(chain::ScriptType type, quint32 account, quint32 change, quint32 index) const
+int WalletModel::find(quint32 wallet, chain::ScriptType type, quint32 account, quint32 change,
+                      quint32 index) const
 {
-    return byKey_.value(keyOf(type, account, change, index), -1);
+    return byKey_.value(keyOf(wallet, type, account, change, index), -1);
 }
 
 chain::Amount WalletModel::total(Asset a) const
@@ -95,6 +126,27 @@ chain::Amount WalletModel::total(Asset a) const
     }
     totals_.insert(a, sum);
     return sum;
+}
+
+chain::Amount WalletModel::total(Asset a, quint32 wallet) const
+{
+    QMap<Asset, chain::Amount>& cache = walletTotals_[wallet];
+    const auto cached = cache.constFind(a);
+    if (cached != cache.cend()) return cached.value();
+
+    chain::Amount sum;
+    for (const AddressRow& r : rows_) {
+        if (r.wallet != wallet) continue;
+        const chain::Amount v = r.amount(a);
+        if (!v.isZero()) sum += v;
+    }
+    cache.insert(a, sum);
+    return sum;
+}
+
+WalletCounts WalletModel::counts(quint32 wallet) const
+{
+    return walletCounts_.value(wallet);
 }
 
 int WalletModel::usedCount() const
@@ -136,10 +188,21 @@ void WalletModel::dropLookups(const AddressRow& row, int index)
 void WalletModel::countRow(const AddressRow& row, int sign)
 {
     const bool funded = row.state() == AddressState::Funded;
+    WalletCounts& own = walletCounts_[row.wallet];
+    own.rows += sign;
     // A balance implies history even if a scanner left `used` unset.
-    if (row.used || funded) usedCount_ += sign;
-    if (funded) fundedCount_ += sign;
-    if (row.checked) checkedCount_ += sign;
+    if (row.used || funded) {
+        usedCount_ += sign;
+        own.used += sign;
+    }
+    if (funded) {
+        fundedCount_ += sign;
+        own.funded += sign;
+    }
+    if (row.checked) {
+        checkedCount_ += sign;
+        own.checked += sign;
+    }
 }
 
 bool WalletModel::dropChangedTotals(const AddressRow& before, const AddressRow& after)
@@ -148,6 +211,8 @@ bool WalletModel::dropChangedTotals(const AddressRow& before, const AddressRow& 
     for (const AssetInfo& info : assets()) {
         if (before.amount(info.asset) != after.amount(info.asset)) {
             totals_.remove(info.asset);
+            const auto own = walletTotals_.find(after.wallet);
+            if (own != walletTotals_.end()) own->remove(info.asset);
             changed = true;
         }
     }

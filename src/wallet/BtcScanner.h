@@ -59,8 +59,9 @@ signals:
 private:
     // --- implementation (BtcScanner.cpp may add private members) ---
 
-    // One chain of one account: receive (change 0) or change (change 1).
+    // One chain of one account of one wallet: receive (change 0) or change (change 1).
     struct Chain {
+        quint32 wallet = 0;
         chain::ScriptType type = chain::ScriptType::P2WPKH;
         quint32 account = 0;
         quint32 change = 0;
@@ -125,7 +126,7 @@ private:
     void reportLimits();
     void markConfirmed(const QString& scripthash);
     void recount(const QString& scripthash); // checked_ after its status or row changed
-    int findChain(chain::ScriptType type, quint32 account, quint32 change) const;
+    int findChain(const AddressRow& row) const;
 
     bool busy() const;
     void checkIdle();
@@ -143,6 +144,7 @@ private:
     bool running_ = false;
 
     QList<Chain> chains_;
+    QHash<QString, int> chainByKey_;     // positions in chains_: many wallets, a lookup per status
     QHash<QString, Tracked> tracked_;    // every row followed since the last start()
     QStringList subQueue_;               // scripthashes to subscribe, in derivation order
     QStringList balanceQueue_;           // scripthashes whose balance to fetch (sent first)

@@ -5,6 +5,8 @@
 #include <QDateTime>
 #include <QList>
 #include <QObject>
+#include <QPair>
+#include <QSet>
 
 class QTimer;
 
@@ -112,11 +114,12 @@ private:
     void noteProgress();
     void emitProgress();
     void countRows(int* checked, int* derived) const;
-    bool ownsAccount(quint32 account) const;
+    bool ownsAccount(quint32 wallet, quint32 account) const;
 
     net::EthRpc* rpc_ = nullptr;
     WalletModel* model_ = nullptr;
     QList<AccountKey> accounts_;
+    QSet<QPair<quint32, quint32>> owned_; // (wallet, account) of accounts_: asked once per row
     QTimer* refreshTimer_ = nullptr;
     int gap_ = 100;
     int refreshSeconds_ = 60;

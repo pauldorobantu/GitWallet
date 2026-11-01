@@ -1,30 +1,21 @@
 #include "ui/pages/SettingsPage.h"
 
 #include "app/WalletController.h"
-#include "chain/Address.h"
 #include "net/ElectrumClient.h"
 #include "net/EthRpc.h"
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
-#include "ui/Icons.h"
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
-#include "ui/TableUtil.h"
-#include "ui/ThemeManager.h"
 #include "ui/design/Style.h"
 #include "wallet/Types.h"
 #include "wallet/WalletStore.h"
 
-#include <QAction>
-#include <QContextMenuEvent>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
-#include <QKeyEvent>
 #include <QLabel>
-#include <QLineEdit>
-#include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -36,8 +27,6 @@
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QtMath>
-
-#include <exception>
 
 namespace app::ui {
 
@@ -111,78 +100,6 @@ QStringList electrumDefaults()
     return out;
 }
 
-// "Native SegWit (bech32)"; accounts past the first are numbered.
-QString accountLabel(const wallet::AccountKey& key)
-{
-    QString label = QString::fromLatin1(chain::scriptTypeName(key.type));
-    if (key.account > 0)
-        label += QStringLiteral(", account %1").arg(key.account);
-    return label;
-}
-
-QString accountPath(const wallet::AccountKey& key)
-{
-    try {
-        return QString::fromStdString(chain::accountRootPath(key.type, key.account));
-    } catch (const std::exception&) {
-        return QString();
-    }
-}
-
-QIcon copyIcon()
-{
-    return makeIcon(icon::Kind::Copy, page::accent(), 16);
-}
-
-// An xpub reveals every address of its account. QLineEdit's own copy (Ctrl+C,
-// the context menu) puts plain text on the clipboard, which Windows keeps in
-// its history and may sync; every copy here goes through copyTextToClipboard()
-// instead, which keeps it out of both.
-class XpubField : public QLineEdit
-{
-public:
-    using QLineEdit::QLineEdit;
-
-protected:
-    void keyPressEvent(QKeyEvent* event) override
-    {
-        if (event->matches(QKeySequence::Copy)) {
-            copySelection();
-            return;
-        }
-        QLineEdit::keyPressEvent(event);
-    }
-
-    // Read-only: Copy and Select All are all the standard menu would offer.
-    void contextMenuEvent(QContextMenuEvent* event) override
-    {
-        QMenu menu(this);
-        menu.addAction(QStringLiteral("Copy"), this, [this] { copySelection(); });
-        menu.addAction(QStringLiteral("Select All"), this, &QLineEdit::selectAll);
-        menu.exec(event->globalPos());
-    }
-
-private:
-    void copySelection() { copyTextToClipboard(this, hasSelectedText() ? selectedText() : text()); }
-};
-
-// A read-only xpub with a copy button at its end (a line-edit action, as
-// the search field carries its magnifier).
-QLineEdit* makeXpubField(QWidget* parent, const wallet::AccountKey& key)
-{
-    auto* edit = new XpubField(key.xpub, parent);
-    edit->setReadOnly(true);
-    edit->setCursorPosition(0); // the prefix (xpub / ypub / zpub) stays visible
-    edit->setToolTip(QStringLiteral("%1\n%2").arg(accountPath(key), key.xpub));
-    QAction* copy = edit->addAction(copyIcon(), QLineEdit::TrailingPosition);
-    copy->setToolTip(QStringLiteral("Copy"));
-    const QString xpub = key.xpub;
-    QObject::connect(copy, &QAction::triggered, edit, [edit, xpub] { copyTextToClipboard(edit, xpub); });
-    QObject::connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, copy,
-                     [copy] { copy->setIcon(copyIcon()); });
-    return edit;
-}
-
 // The trimmed, non-empty lines of a list field, each passed through `accept`
 // (which may normalise it), without duplicates. Stops at the first line
 // `accept` refuses and reports its 0-based number.
@@ -245,7 +162,6 @@ struct SettingsPage::Ui : QObject
 
     QFormLayout* scanForm = nullptr;
     QFormLayout* networkForm = nullptr;
-    QFormLayout* walletForm = nullptr;
     QSpinBox* receiveGap = nullptr;
     QSpinBox* changeGap = nullptr;
     QSpinBox* ethGap = nullptr;
@@ -254,8 +170,7 @@ struct SettingsPage::Ui : QObject
     QPlainTextEdit* ethRpc = nullptr;
     QLabel* electrumInUse = nullptr;
     QLabel* ethInUse = nullptr;
-    QFrame* walletCard = nullptr;
-    QLabel* noWallet = nullptr;
+    QLabel* walletCount = nullptr;
     QWidget* removeRow = nullptr;
     QPushButton* remove = nullptr;
 
@@ -326,22 +241,19 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     column->addWidget(network.card);
 
     const page::Section walletSection = page::makeSection(
-        content, QStringLiteral("Wallet"),
-        QStringLiteral("The account public keys (xpubs) GitWallet watches. They reveal every address "
-                       "and balance but cannot spend."));
-    ui_->walletCard = walletSection.card;
-    ui_->noWallet = new QLabel(QStringLiteral("No wallet on this PC yet. Import a seed on the Overview page."),
-                               walletSection.card);
-    setTone(ui_->noWallet, Tone::Muted);
-    walletSection.body->addWidget(ui_->noWallet);
-    ui_->walletForm = page::addSectionForm(walletSection);
+        content, QStringLiteral("Wallets"),
+        QStringLiteral("GitWallet keeps only public keys (xpubs). They reveal every address and balance "
+                       "but cannot spend. Each wallet's keys are on the Wallets page."));
+    ui_->walletCount = new QLabel(walletSection.card);
+    setTone(ui_->walletCount, Tone::Muted);
+    walletSection.body->addWidget(ui_->walletCount);
     ui_->removeRow = new QWidget(walletSection.card);
     auto* removeLayout = new QHBoxLayout(ui_->removeRow);
     removeLayout->setContentsMargins(0, 0, 0, 0);
     removeLayout->setSpacing(page::kFormHSpacing);
-    ui_->remove = new QPushButton(QStringLiteral("Remove wallet from this PC"), ui_->removeRow);
+    ui_->remove = new QPushButton(QStringLiteral("Remove all wallets from this PC"), ui_->removeRow);
     ui_->remove->setObjectName(QStringLiteral("dangerButton"));
-    auto* removeNote = new QLabel(QStringLiteral("Deletes the saved xpubs and settings. The seed is never "
+    auto* removeNote = new QLabel(QStringLiteral("Deletes the saved xpubs and settings. Seeds are never "
                                                  "stored, so funds are not affected."),
                                   ui_->removeRow);
     removeNote->setWordWrap(true);
@@ -385,18 +297,14 @@ void SettingsPage::load()
 
 void SettingsPage::rebuildWallet()
 {
-    QFormLayout* form = ui_->walletForm;
-    while (form->rowCount() > 0)
-        form->removeRow(0); // deletes the row's label and field
-    const bool hasWallet = controller_ && controller_->hasWallet();
-    if (hasWallet) {
-        for (const wallet::AccountKey& key : controller_->store().accounts)
-            form->addRow(accountLabel(key), makeXpubField(ui_->walletCard, key));
-    }
-    ui_->noWallet->setVisible(!hasWallet);
-    ui_->removeRow->setVisible(hasWallet);
-    // Labels of every card share one column, also after the rows changed.
-    page::finishForms({ui_->scanForm, ui_->networkForm, ui_->walletForm});
+    const int wallets = controller_ ? int(controller_->store().wallets.size()) : 0;
+    ui_->walletCount->setText(wallets == 0 ? trText(QStringLiteral("No wallet on this PC yet."))
+                              : wallets == 1
+                                  ? trText(QStringLiteral("1 wallet on this PC."))
+                                  : trText(QStringLiteral("%1 wallets on this PC.")).arg(wallets));
+    ui_->removeRow->setVisible(wallets > 0);
+    // Labels of every card share one column.
+    page::finishForms({ui_->scanForm, ui_->networkForm});
 }
 
 void SettingsPage::updateInUse()
@@ -463,14 +371,14 @@ void SettingsPage::confirmRemove()
 {
     if (!controller_ || !controller_->hasWallet())
         return;
-    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Remove wallet"),
-                                QStringLiteral("Remove the wallet from this PC?"), QMessageBox::NoButton,
+    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Remove all wallets"),
+                                QStringLiteral("Remove every wallet from this PC?"), QMessageBox::NoButton,
                                 this);
     box->setInformativeText(
         QStringLiteral("GitWallet deletes wallet.dat (the saved xpubs and settings) and stops scanning. "
-                       "The seed was never stored, so nothing changes on the blockchain: importing the "
-                       "seed again shows the same addresses."));
-    QPushButton* remove = box->addButton(QStringLiteral("Remove wallet"), QMessageBox::DestructiveRole);
+                       "Seeds were never stored, so nothing changes on the blockchain: adding a seed "
+                       "again shows the same addresses."));
+    QPushButton* remove = box->addButton(QStringLiteral("Remove all wallets"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));
     QPushButton* cancel = box->addButton(QMessageBox::Cancel);
     box->setDefaultButton(cancel);
@@ -490,14 +398,14 @@ void SettingsPage::removeWallet()
     if (!controller_)
         return;
     QString error;
-    if (!controller_->removeWallet(&error)) {
+    if (!controller_->removeAllWallets(&error)) {
         Feedback::show(this, Feedback::Type::Error,
-                       error.isEmpty() ? trText(QStringLiteral("Could not remove the wallet")) : error);
+                       error.isEmpty() ? trText(QStringLiteral("Could not remove the wallets")) : error);
         return;
     }
     load(); // walletChanged reloads as well; this keeps the page right either way
     Feedback::show(this, Feedback::Type::Success,
-                   trText(QStringLiteral("Wallet removed from this PC")));
+                   trText(QStringLiteral("All wallets removed from this PC")));
 }
 
 } // namespace app::ui
