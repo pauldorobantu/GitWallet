@@ -301,7 +301,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     bar.left->addWidget(ui_->wallet);
     bar.left->addWidget(ui_->chain);
     bar.left->addWidget(ui_->state);
-    bar.left->addWidget(ui_->count);
+    page::addBarCount(bar, ui_->count);
 
     ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
     ui_->exportCsv->setToolTip(QStringLiteral("Save the rows shown to a spreadsheet file. It is not encrypted: "

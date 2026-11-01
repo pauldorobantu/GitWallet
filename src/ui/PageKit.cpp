@@ -99,6 +99,17 @@ ActionBar makeActionBar(QWidget* parent)
     return bar;
 }
 
+void addBarCount(const ActionBar& bar, QLabel* count)
+{
+    count->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    bar.left->addWidget(count, 1);
+    // The left side takes the room the bar has to spare, so the count reads whole
+    // whenever it fits; the stretch that held it apart has nothing left to do.
+    auto* row = static_cast<QHBoxLayout*>(bar.widget->layout());
+    row->setStretch(0, 1);
+    row->setStretch(1, 0);
+}
+
 void applyFormLayout(QFormLayout* form)
 {
     if (!form)
@@ -179,13 +190,26 @@ void finishForms(const QList<QFormLayout*>& forms)
     }
 }
 
+namespace {
+
+// Its usual width as a hint, not a floor: on a narrow window the search gives way
+// before the buttons beside it.
+class SearchEdit : public QLineEdit
+{
+public:
+    using QLineEdit::QLineEdit;
+    QSize sizeHint() const override { return {kSearchMin, QLineEdit::sizeHint().height()}; }
+};
+
+} // namespace
+
 QLineEdit* makeSearch(QWidget* parent, const QString& placeholder)
 {
-    auto* edit = new QLineEdit(parent);
+    auto* edit = new SearchEdit(parent);
     edit->setObjectName(QStringLiteral("mimSearch"));
     edit->setPlaceholderText(placeholder);
     edit->setClearButtonEnabled(true);
-    edit->setMinimumWidth(kSearchMin);
+    edit->setMinimumWidth(tokens::layout::kSearchShrunk);
     edit->setMaximumWidth(kSearchMax);
     QAction* lupa = edit->addAction(makeIcon(icon::Kind::Search, muted(), 15),
                                     QLineEdit::LeadingPosition);

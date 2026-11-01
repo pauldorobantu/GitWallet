@@ -93,10 +93,10 @@ private:
     void ensureRows(int account, qint64 from, qint64 to, bool replace, bool enqueue);
     qint64 windowEnd(const AccountState& account) const; // the window is [0, windowEnd)
     bool cutAtLimit(const AccountState& account) const;  // the window wants rows past kMaxEthRows
-    void extendWindow(int account, bool enqueue);
     void extendWindowTo(int account, bool enqueue, qint64 upTo); // the part of the window below `upTo`
     void startPass();
     void deriveWindows(); // the start of a pass, a slice per event-loop turn
+    void growWindows();   // during a pass, the same way
     void nextChunk();
     void sendNonces();
     void onNonces(const QList<quint64>& nonces, const QList<bool>& ok, const QList<Issue>& issues);
@@ -131,6 +131,7 @@ private:
     QTimer* progressTimer_ = nullptr;
     QList<AccountState> acc_;  // the accounts of the current start()
     int deriving_ = 0;         // the account deriveWindows() has got to
+    QList<int> growing_;       // accounts whose window a used address moved, for growWindows()
     qint64 totalRows_ = 0;     // rows of all accounts' windows
     bool totalCut_ = false;    // a window was cut at the limit over all accounts
     QList<AssetInfo> tokens_;  // ERC-20s read for every address

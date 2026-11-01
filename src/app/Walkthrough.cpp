@@ -181,6 +181,23 @@ void Walkthrough::buildSteps()
         QWidget* b = findButton(importDialog(), QStringLiteral("Add wallets"));
         return b && b->isEnabled();
     };
+    // Empty if the dialog never came: the step's checks fail, the run goes on to its report.
+    auto dialogFocus = [this] {
+        auto* dialog = window_->findChild<ui::ImportSeedDialog*>();
+        QWidget* focus = dialog ? dialog->focusWidget() : nullptr;
+        return focus ? focus->objectName() : QString();
+    };
+    // What a figure of a public seed is cannot be promised, as anyone can send to it.
+    auto isFigure = [](const QString& cell) { return !cell.isEmpty() && cell != QStringLiteral("—"); };
+    // On the narrowest window too: no button is cut to fit what is beside it.
+    auto wholeButtons = [this](QWidget* page, const QStringList& texts) {
+        for (const QString& text : texts) {
+            const QWidget* button = findButton(page, text);
+            if (!button || button->width() < button->sizeHint().width())
+                return false;
+        }
+        return true;
+    };
     // Asynchronous click: the dialog runs its own event loop (exec), inside
     // which the rest of the walkthrough keeps going.
     auto clickLater = [](QWidget* button) {
@@ -258,17 +275,16 @@ void Walkthrough::buildSteps()
         {QStringLiteral("import-dialog"),
          [this, clickLater] { clickLater(findButton(window_, QStringLiteral("Add wallet"))); },
          [importDialog] { return importDialog() != nullptr; }, 5000,
-         [this, importEnabled] {
+         [this, importEnabled, dialogFocus] {
              expect(true, QStringLiteral("the add-wallet dialog opened"));
              expect(!importEnabled(), QStringLiteral("Add wallet is disabled while the field is empty"));
-             QWidget* focus = window_->findChild<ui::ImportSeedDialog*>()->focusWidget();
-             expect(focus && focus->objectName() == QStringLiteral("seedWords"),
+             expect(dialogFocus() == QStringLiteral("seedWords"),
                     QStringLiteral("a phrase pasted straight away lands in the seed field"));
          },
          importDialog},
         {QStringLiteral("seed-in-name"), [typeName] { typeName(kPublicTestMnemonic); }, nullptr, 3000,
          [this, importDialog] {
-             auto* name = importDialog()->findChild<QLineEdit*>(QStringLiteral("walletName"));
+             auto* name = importDialog() ? importDialog()->findChild<QLineEdit*>(QStringLiteral("walletName")) : nullptr;
              expect(name && name->text().isEmpty(), QStringLiteral("seed words typed as a name are not kept"));
              expect(visibleText(importDialog()).contains(QStringLiteral("looks like seed words")),
                     QStringLiteral("and the status says why"));
@@ -386,7 +402,7 @@ void Walkthrough::buildSteps()
          importDialog},
         {QStringLiteral("seed-in-keys"), [typeKeys] { typeKeys(kPublicTestMnemonic); }, nullptr, 3000,
          [this, importEnabled, importDialog] {
-             auto* keys = importDialog()->findChild<QPlainTextEdit*>(QStringLiteral("publicKeys"));
+             auto* keys = importDialog() ? importDialog()->findChild<QPlainTextEdit*>(QStringLiteral("publicKeys")) : nullptr;
              expect(keys && keys->toPlainText().isEmpty(), QStringLiteral("seed words in the keys field are not kept"));
              expect(visibleText(importDialog()).contains(QStringLiteral("look like seed words")),
                     QStringLiteral("and the status says why"));
@@ -471,7 +487,7 @@ void Walkthrough::buildSteps()
              window_->showPage(QStringLiteral("wallets"));
          },
          nullptr, 3000,
-         [this, walletsTable] {
+         [this, walletsTable, isFigure] {
              for (const QString& name : {kFirstName, kSecondName, kKeysName}) {
                  expect(walletCell(walletsTable(), name, QStringLiteral("State")) == QStringLiteral("Up to date"),
                         QStringLiteral("%1 reads Up to date").arg(name));
@@ -480,9 +496,9 @@ void Walkthrough::buildSteps()
                     QStringLiteral("a wallet without an Ethereum key shows no ETH figure, not a zero"));
              expect(walletCell(walletsTable(), kKeysName, QStringLiteral("USDT")) == QStringLiteral("—"),
                     QStringLiteral("nor a USDT figure"));
-             expect(walletCell(walletsTable(), kKeysName, QStringLiteral("BTC")) == QStringLiteral("0"),
+             expect(isFigure(walletCell(walletsTable(), kKeysName, QStringLiteral("BTC"))),
                     QStringLiteral("but its checked BTC figure"));
-             expect(walletCell(walletsTable(), kFirstName, QStringLiteral("USDT")) == QStringLiteral("0.00"),
+             expect(isFigure(walletCell(walletsTable(), kFirstName, QStringLiteral("USDT"))),
                     QStringLiteral("a wallet with an Ethereum key shows its checked USDT figure"));
          },
          nullptr},
@@ -492,11 +508,14 @@ void Walkthrough::buildSteps()
              clickLater(findButton(walletsPage(), QStringLiteral("View addresses")));
          },
          nullptr, 3000,
-         [this, controller, tableRows] {
+         [this, controller, tableRows, wholeButtons] {
              const QList<wallet::WalletEntry>& list = controller()->store().wallets;
              const quint32 id = list.value(1).id;
              expect(tableRows() == controller()->model()->counts(id).rows,
                     QStringLiteral("View addresses narrows the table to that wallet (%1 rows)").arg(tableRows()));
+             expect(wholeButtons(window_->findChild<ui::AddressesPage*>(),
+                                 {QStringLiteral("Export CSV"), QStringLiteral("Refresh")}),
+                    QStringLiteral("and the buttons of its bar have their whole width"));
          },
          nullptr},
         {QStringLiteral("export-csv"),
@@ -740,9 +759,8 @@ void Walkthrough::buildSteps()
         // Many at once: the list opens from its own button, reads a file and a paste,
         // takes the good lines together and leaves only what needs the user.
         {QStringLiteral("many-dialog"), openManyDialog, [importDialog] { return importDialog() != nullptr; }, 5000,
-         [this, listEnabled] {
-             QWidget* focus = window_->findChild<ui::ImportSeedDialog*>()->focusWidget();
-             expect(focus && focus->objectName() == QStringLiteral("seedList"),
+         [this, listEnabled, dialogFocus] {
+             expect(dialogFocus() == QStringLiteral("seedList"),
                     QStringLiteral("Add many opens on the list of seeds, ready for a paste"));
              expect(!listEnabled(), QStringLiteral("Add wallets is disabled while the list is empty"));
          },
@@ -821,9 +839,13 @@ void Walkthrough::buildSteps()
         {QStringLiteral("many-closed"),
          [this, importDialog, clickLater] { clickLater(findButton(importDialog(), QStringLiteral("Close"))); },
          [importDialog] { return !importDialog(); }, 3000,
-         [this, walletsTable] {
+         [this, walletsTable, walletsPage, wholeButtons] {
              expect(walletsTable() && walletsTable()->isVisible() && walletsTable()->model()->rowCount() == 5,
                     QStringLiteral("closing it leaves the Wallets page listing all 5"));
+             expect(wholeButtons(walletsPage(), {QStringLiteral("Public keys"), QStringLiteral("Rename"),
+                                                 QStringLiteral("Remove"), QStringLiteral("View addresses"),
+                                                 QStringLiteral("Add many"), QStringLiteral("Add wallet")}),
+                    QStringLiteral("and every button of its bar has its whole width"));
          },
          nullptr},
         {QStringLiteral("many-scanned"), nullptr,
@@ -936,6 +958,8 @@ void Walkthrough::buildSteps()
          [this, confirmBox] {
              expect(confirmBox() && confirmBox()->text().contains(QStringLiteral("Remove every wallet")),
                     QStringLiteral("removing them all asks for confirmation first"));
+             expect(confirmBox() && confirmBox()->informativeText().contains(QStringLiteral("no seed on this PC")),
+                    QStringLiteral("and says that wallets from public keys have no seed to come back from"));
          },
          [confirmBox]() -> QWidget* { return confirmBox(); }},
         {QStringLiteral("removed"),
@@ -961,9 +985,8 @@ void Walkthrough::buildSteps()
         {QStringLiteral("empty-many-dialog"),
          [this, clickLater] { clickLater(findButton(window_, QStringLiteral("Add many"))); },
          [importDialog] { return importDialog() != nullptr; }, 5000,
-         [this] {
-             QWidget* focus = window_->findChild<ui::ImportSeedDialog*>()->focusWidget();
-             expect(focus && focus->objectName() == QStringLiteral("seedList"),
+         [this, dialogFocus] {
+             expect(dialogFocus() == QStringLiteral("seedList"),
                     QStringLiteral("the empty Overview's Add many opens the list of seeds"));
          },
          importDialog},

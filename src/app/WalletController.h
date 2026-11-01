@@ -75,12 +75,20 @@ public:
     // process holds the data folder, or when the file changed after this window read it.
     bool removeAllWallets(QString* error);
 
+    // The older files removeAllWallets() would delete with wallet.dat.
+    int walletFilesKeptAside() const;
+    // What happens to a wallet.dat that could not be loaded, for the user to read:
+    // kept aside at the next add, or moved by hand if it cannot even be opened.
+    QString unreadFileNote() const;
+
     // Addresses with history that `settings` would leave out: a fresh scan walks
     // each chain from index 0 and stops once a gap of unused addresses follows the
-    // last used one.
+    // last used one, or at the Bitcoin row limit, which falls with the gaps. What
+    // this session's rows say: only the addresses that have answered so far.
     struct GapImpact {
-        int used = 0;   // used addresses past where the scan would stop
-        int funded = 0; // those holding a balance
+        int used = 0;       // used addresses past where the scan would stop
+        int funded = 0;     // those holding a balance
+        bool atMost = false; // the row limit cuts some: which ones depends on the scan
     };
     GapImpact gapImpact(const wallet::ScanSettings& settings) const;
 

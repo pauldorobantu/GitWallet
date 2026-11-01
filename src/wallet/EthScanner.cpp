@@ -297,12 +297,13 @@ EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
     // start() the controller issues right after supersedes this restart, since
     // the scan itself only begins on the next event-loop turn. The balances
     // that balancesAt() dated are gone with the rows, stopped or not, unless other
-    // wallets' rows stayed (one wallet removed): those figures are as old as ever.
+    // wallets' answered rows stayed (one wallet removed): those figures are as old
+    // as ever.
     if (model_) {
         connect(model_, &WalletModel::cleared, this, [this] {
             bool rowsLeft = false;
             for (int r = 0; r < model_->size() && !rowsLeft; ++r)
-                rowsLeft = model_->at(r).type == chain::ScriptType::EthAccount;
+                rowsLeft = model_->at(r).type == chain::ScriptType::EthAccount && model_->at(r).checked;
             if (!rowsLeft) {
                 balancesAt_ = QDateTime();
                 refreshFailing_ = false;
@@ -582,13 +583,8 @@ bool EthScanner::cutAtLimit(const AccountState& account) const
     return qMin(account.lastUsed + 1 + gap_, account.limit) > kMaxEthRows;
 }
 
-// Derives (and, during a pass, queues) the rows the window gained since it was
-// last computed.
-void EthScanner::extendWindow(int i, bool enqueue)
-{
-    extendWindowTo(i, enqueue, windowEnd(acc_.at(i)));
-}
-
+// Derives (and, during a pass, queues) the part below `upTo` of the rows the window
+// gained since it was last computed.
 void EthScanner::extendWindowTo(int i, bool enqueue, qint64 upTo)
 {
     AccountState& a = acc_[i];
@@ -622,6 +618,7 @@ void EthScanner::startPass()
     queue_.clear();
     queueHead_ = 0;
     deriving_ = 0;
+    growing_.clear(); // deriveWindows() covers every window
     deriveWindows();
 }
 
@@ -654,8 +651,35 @@ void EthScanner::deriveWindows()
     defer(&EthScanner::nextChunk);
 }
 
+// The windows a used address moved during the pass, queued as they grow: the same
+// slices as deriveWindows(), so a far-out address never freezes the window either.
+void EthScanner::growWindows()
+{
+    const quint64 gen = gen_;
+    qint64 budget = kDeriveSlice;
+    while (!growing_.isEmpty() && budget > 0 && !totalCut_) {
+        const int i = growing_.constFirst();
+        const qint64 before = acc_.at(i).end;
+        extendWindowTo(i, true, qMin(windowEnd(acc_.at(i)), before + budget));
+        if (gen != gen_)
+            return; // a model slot restarted or stopped the scan
+        budget -= acc_.at(i).end - before;
+        // Whole, or ended early at an index that cannot be derived: on to the next.
+        if (acc_.at(i).end >= windowEnd(acc_.at(i)))
+            growing_.removeFirst();
+    }
+    if (totalCut_)
+        growing_.clear();
+    noteProgress();
+    defer(growing_.isEmpty() ? &EthScanner::nextChunk : &EthScanner::growWindows);
+}
+
 void EthScanner::nextChunk()
 {
+    if (!growing_.isEmpty()) {
+        growWindows();
+        return;
+    }
     chunk_.clear();
     attempts_ = 0;
     while (queueHead_ < queue_.size() && chunk_.size() < kChunk) {
@@ -921,9 +945,8 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
     }
 
     for (int a : std::as_const(grown)) {
-        extendWindow(a, true);
-        if (gen != gen_)
-            return;
+        if (!growing_.contains(a))
+            growing_.append(a); // nextChunk() derives them first
     }
     noteProgress();
 
@@ -971,9 +994,10 @@ void EthScanner::finishPass()
     chunk_.clear();
     // The balances are current as of now only if every row of the pass got a
     // full answer and the whole window exists; otherwise balancesAt() keeps
-    // the end of the last pass that did.
+    // the end of the last pass that did. Past the limit over all accounts no row
+    // will ever exist: nothing failed, and limitReached() says what is missing.
     const bool windowDone = windowChecked();
-    const bool complete = !passSkipped_ && windowDone;
+    const bool complete = !passSkipped_ && (windowDone || totalCut_);
     if (complete)
         balancesAt_ = QDateTime::currentDateTime();
     refreshFailing_ = !complete;
@@ -1055,6 +1079,10 @@ void EthScanner::stopWork()
     passFailed_ = false;
     passSkipped_ = false;
     offMainnet_.clear();
+    // limitReached() reads these whether a scan runs or not.
+    totalRows_ = 0;
+    totalCut_ = false;
+    growing_.clear();
 }
 
 // `url` (as the reply named it) gave an answer nothing can be read from: EthRpc

@@ -382,10 +382,8 @@ void MainWindow::loadWallet()
     if (controller_->loadExisting(&error) || error.isEmpty()) return;
     // The file exists but cannot be read (another Windows user, damaged).
     QMessageBox box(QMessageBox::Warning, QStringLiteral("GitWallet"),
-                    QStringLiteral("The saved wallets could not be opened.\n\n%1\n\nThe file stays as it "
-                                   "is. If you add a wallet now, GitWallet keeps it aside under another "
-                                   "name and says where.")
-                        .arg(error),
+                    QStringLiteral("The saved wallets could not be opened.\n\n%1\n\n%2")
+                        .arg(error, controller_->unreadFileNote()),
                     QMessageBox::Ok, this);
     applyDialogChrome(&box);
     box.exec();

@@ -266,9 +266,12 @@ bool checkWallets(const QList<WalletEntry>& wallets, QString* why)
             return fail(why, QStringLiteral("a wallet has no account keys"));
         if (!checkAccounts(w.accounts, why)) return false;
         for (const AccountKey& k : w.accounts) {
-            if (keys.contains(k.xpub))
+            // With its type: the same text is another set of addresses as a legacy
+            // account and as an Ethereum one.
+            const QString key = typeId(k.type) + QLatin1Char('/') + k.xpub;
+            if (keys.contains(key))
                 return fail(why, QStringLiteral("an account key is listed in two wallets"));
-            keys.insert(k.xpub);
+            keys.insert(key);
         }
     }
     return true;

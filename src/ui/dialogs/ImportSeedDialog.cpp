@@ -526,6 +526,8 @@ void ImportSeedDialog::sourceChanged()
     pages_->setCurrentIndex(chosen);
     const bool seeds = chosen == OneSeed || chosen == ManySeeds;
     const bool many = chosen == ManySeeds || chosen == ManyKeys;
+    hasPassphrase_->setText(many ? trText(QStringLiteral("Every seed in the list has this passphrase (25th word)"))
+                                 : trText(QStringLiteral("This seed has a passphrase (25th word)")));
     hasPassphrase_->setVisible(seeds);
     passphrase_->setVisible(seeds && hasPassphrase_->isChecked());
     nameLabel_->setText(many ? trText(QStringLiteral("Name for lines without one")) : trText(QStringLiteral("Wallet name")));
@@ -677,7 +679,8 @@ void ImportSeedDialog::validateKeys()
 
     QString message;
     Tone tone = Tone::Muted;
-    static const QRegularExpression space(QStringLiteral("\\s+"));
+    // Any kind of space, so a key copied with one still reads as what it is.
+    static const QRegularExpression space(QStringLiteral("\\s+"), QRegularExpression::UseUnicodePropertiesOption);
     const QStringList bitcoin = keys_->toPlainText().split(space, Qt::SkipEmptyParts);
     const QStringList ethereum = ethKey_->text().split(space, Qt::SkipEmptyParts);
     const bool anyXpub = std::any_of(bitcoin.cbegin(), bitcoin.cend(), [](const QString& key) {

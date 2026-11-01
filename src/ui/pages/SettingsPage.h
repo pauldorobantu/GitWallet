@@ -33,7 +33,10 @@ private:
     void rebuildWallet(); // the wallet count, and whether Remove is on offer
     void updateInUse();   // the Electrum server / Ethereum endpoint in use
     void resetToDefaults();
-    void save();          // checks the form, warns when smaller gaps leave addresses out
+    void save();          // checks the form, then askThenApply()
+    // Warns when smaller gaps leave out more than the `accepted` used addresses the
+    // user has already agreed to (-1: nothing yet), or when that is not known yet.
+    void askThenApply(const wallet::ScanSettings& settings, int accepted);
     void apply(const wallet::ScanSettings& settings);
     void confirmRemove();
     void removeWallet();

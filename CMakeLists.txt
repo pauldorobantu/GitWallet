@@ -54,7 +54,7 @@ if(WIN32)
         HINTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}")
     add_custom_command(TARGET GitWallet POST_BUILD
         COMMAND "${GW_WINDEPLOYQT}" --release --no-translations --no-system-d3d-compiler
-            --no-system-dxc-compiler --no-opengl-sw --no-compiler-runtime --verbose 0
+            --no-system-dxc-compiler --no-opengl-sw --no-compiler-runtime
             --plugindir "$<TARGET_FILE_DIR:GitWallet>/lib/plugins" "$<TARGET_FILE:GitWallet>"
         COMMENT "Deploying Qt beside GitWallet.exe"
         VERBATIM)

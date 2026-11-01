@@ -34,23 +34,24 @@ if not exist "%QT_DIR%\bin\windeployqt.exe" (
 
 cmake -S . -B "%GW_BUILD_DIR%" -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_PREFIX_PATH=%QT_DIR% ^
+    "-DCMAKE_PREFIX_PATH=%QT_DIR%" ^
     -DCMAKE_TOOLCHAIN_FILE="%VCPKG_TOOLCHAIN%" ^
     -DVCPKG_TARGET_TRIPLET=x64-windows-release-only ^
     -DVCPKG_OVERLAY_TRIPLETS="%REPO%\cmake\triplets" ^
-    -DVCPKG_INSTALLED_DIR=%GW_VCPKG_INSTALLED% || exit /b 1
+    "-DVCPKG_INSTALLED_DIR=%GW_VCPKG_INSTALLED%" || exit /b 1
 cmake --build "%GW_BUILD_DIR%" || exit /b 1
 
 rem dist\ = the folder to copy elsewhere: the exe, its DLLs and the Qt plugins in
 rem lib\plugins, where the embedded qt.conf (Prefix = lib) looks for them.
-rem Renamed before it is deleted: a rename fails as a whole while GitWallet runs
-rem from it, where rmdir would delete what it can and leave a broken folder.
+rem The exe goes first: while GitWallet runs from the folder that fails, wherever it
+rem was started from, where rmdir would delete what it can and leave a broken folder.
+rem Renamed before it is deleted, as a window with its working folder inside refuses that.
 set "DIST=%REPO%\dist"
 if exist "%DIST%.old" rmdir /s /q "%DIST%.old"
-if exist "%DIST%" (
-    ren "%DIST%" dist.old || (echo [build] dist\ is in use - close GitWallet & exit /b 1)
-    rmdir /s /q "%DIST%.old"
-)
+if exist "%DIST%\GitWallet.exe" del "%DIST%\GitWallet.exe" 2>nul
+if exist "%DIST%\GitWallet.exe" (echo [build] dist\ is in use - close GitWallet & exit /b 1)
+if exist "%DIST%" ren "%DIST%" dist.old || (echo [build] dist\ is in use - close GitWallet & exit /b 1)
+if exist "%DIST%.old" rmdir /s /q "%DIST%.old"
 mkdir "%DIST%" || exit /b 1
 copy /y "%GW_BUILD_DIR%\GitWallet.exe" "%DIST%\" >nul || exit /b 1
 copy /y "%GW_BUILD_DIR%\*.dll" "%DIST%\" >nul || exit /b 1

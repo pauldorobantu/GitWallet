@@ -28,6 +28,8 @@
 #include <QVBoxLayout>
 #include <QtMath>
 
+#include <algorithm>
+
 namespace app::ui {
 
 namespace {
@@ -334,7 +336,9 @@ void SettingsPage::updateInUse()
 
 void SettingsPage::resetToDefaults()
 {
+    const wallet::ScanSettings fromStore = ui_->filled;
     ui_->fill(wallet::ScanSettings());
+    ui_->filled = fromStore; // not from the store: a rename elsewhere leaves them on show
     Feedback::show(this, Feedback::Type::Info,
                    trText(QStringLiteral("Defaults filled in; Save applies them")));
 }
@@ -369,24 +373,48 @@ void SettingsPage::save()
     settings.electrumServers = servers;
     settings.ethEndpoints = endpoints;
 
+    askThenApply(settings, -1);
+}
+
+void SettingsPage::askThenApply(const wallet::ScanSettings& settings, int accepted)
+{
     // Smaller gaps can hide addresses that have history, coins included: the next
-    // scan stops before them, and only the user can say that is what they want.
+    // scan stops before them, and only the user can say that is what they want. The
+    // rows only know what has answered: until all have, what is left out is not known.
     const WalletController::GapImpact left = controller_->gapImpact(settings);
-    if (left.used == 0) {
+    const wallet::ScanSettings& stored = controller_->store().settings;
+    const bool smaller = settings.btcReceiveGap < stored.btcReceiveGap || settings.btcChangeGap < stored.btcChangeGap
+                         || settings.ethGap < stored.ethGap;
+    const bool unknown = smaller && controller_->hasWallet() && !controller_->balancesComplete();
+    if (left.used <= accepted || (left.used == 0 && !unknown)) {
         apply(settings);
         return;
     }
-    auto* box = new QMessageBox(
-        QMessageBox::Warning, QStringLiteral("Smaller gaps"),
-        left.used == 1 ? QStringLiteral("These gaps leave out 1 address that has been used.")
-                       : QStringLiteral("These gaps leave out %1 addresses that have been used.").arg(left.used),
-        QMessageBox::NoButton, this);
-    box->setInformativeText(
-        QStringLiteral("Holding a balance now: %1 of %2. GitWallet would stop showing and watching these "
-                       "addresses, and their balances would leave the totals, until the gaps are raised "
-                       "again. Nothing changes on the blockchain.")
-            .arg(left.funded)
-            .arg(left.used));
+    QString text;
+    QString detail;
+    if (left.used == 0) {
+        text = QStringLiteral("The scan has not finished, so what smaller gaps leave out is not known yet.");
+        detail = QStringLiteral("GitWallet could stop showing and watching addresses it has not reached yet, and "
+                                "their balances would not count in the totals, until the gaps are raised again. "
+                                "Nothing changes on the blockchain. Once the scan has finished, saving again says "
+                                "what these gaps leave out.");
+    } else {
+        text = left.atMost ? QStringLiteral("These gaps can leave out up to %1 addresses that have been used.").arg(left.used)
+               : left.used == 1
+                   ? QStringLiteral("These gaps leave out 1 address that has been used.")
+                   : QStringLiteral("These gaps leave out %1 addresses that have been used.").arg(left.used);
+        detail = QStringLiteral("Holding a balance now: %1 of %2. GitWallet would stop showing and watching these "
+                                "addresses, and their balances would leave the totals, until the gaps are raised "
+                                "again. Nothing changes on the blockchain.")
+                     .arg(left.funded)
+                     .arg(left.used);
+        if (left.atMost)
+            detail += QLatin1Char(' ') + QStringLiteral("A scan follows fewer addresses at smaller gaps.");
+        if (unknown)
+            detail += QLatin1Char(' ') + QStringLiteral("The scan has not finished, so there may be more.");
+    }
+    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Smaller gaps"), text, QMessageBox::NoButton, this);
+    box->setInformativeText(detail);
     QPushButton* saveAnyway = box->addButton(QStringLiteral("Save anyway"), QMessageBox::DestructiveRole);
     saveAnyway->setObjectName(QStringLiteral("dangerButton"));
     QPushButton* cancel = box->addButton(QMessageBox::Cancel);
@@ -394,10 +422,12 @@ void SettingsPage::save()
     box->setEscapeButton(cancel);
     box->setAttribute(Qt::WA_DeleteOnClose);
     applyDialogChrome(box);
-    // open(), not exec(): no nested event loop while the scanners keep running.
-    connect(box, &QDialog::finished, this, [this, box, saveAnyway, settings] {
+    // open(), not exec(): no nested event loop while the scanners keep running. They
+    // can find more behind the box, and that is asked again.
+    const int shown = left.used;
+    connect(box, &QDialog::finished, this, [this, box, saveAnyway, settings, shown] {
         if (box->clickedButton() == saveAnyway)
-            apply(settings);
+            askThenApply(settings, shown);
     });
     box->open();
 }
@@ -423,10 +453,25 @@ void SettingsPage::confirmRemove()
     auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Remove all wallets"),
                                 QStringLiteral("Remove every wallet from this PC?"), QMessageBox::NoButton,
                                 this);
-    box->setInformativeText(
-        QStringLiteral("GitWallet deletes wallet.dat (the saved xpubs and settings) and stops scanning. "
-                       "Seeds were never stored, so nothing changes on the blockchain: adding a seed "
-                       "again shows the same addresses."));
+    QString detail = QStringLiteral("GitWallet deletes wallet.dat (the saved xpubs and settings) and stops scanning. "
+                                    "Seeds were never stored, so nothing changes on the blockchain: adding a seed "
+                                    "again shows the same addresses.");
+    const QList<wallet::WalletEntry>& wallets = controller_->store().wallets;
+    if (std::any_of(wallets.cbegin(), wallets.cend(), [](const wallet::WalletEntry& w) { return w.fromKeys; })) {
+        detail += QLatin1Char(' ')
+                  + QStringLiteral("Wallets added from public keys have no seed on this PC: to add them back you need "
+                                   "those keys, which Public keys on the Wallets page shows now.");
+    }
+    const int aside = controller_->walletFilesKeptAside();
+    if (aside > 0) {
+        detail += QLatin1Char(' ')
+                  + (aside == 1 ? QStringLiteral("It also deletes the older wallet file kept aside, which may hold "
+                                                 "other wallets.")
+                                : QStringLiteral("It also deletes the %1 older wallet files kept aside, which may hold "
+                                                 "other wallets.")
+                                      .arg(aside));
+    }
+    box->setInformativeText(detail);
     QPushButton* remove = box->addButton(QStringLiteral("Remove all wallets"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));
     QPushButton* cancel = box->addButton(QMessageBox::Cancel);

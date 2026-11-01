@@ -89,6 +89,8 @@ struct ActionBar
     QHBoxLayout* right = nullptr;
 };
 ActionBar makeActionBar(QWidget* parent);
+// A count at the end of the left side: on a narrow window it is what gets cut, not a button.
+void addBarCount(const ActionBar& bar, QLabel* count);
 
 // Formular standard: etichete stânga + centrate vertical pe câmp, spațiere
 // kFormHSpacing/kFormVSpacing, câmpurile cresc pe lățime.

@@ -588,11 +588,16 @@ void BtcScanner::track(const QString& scripthash)
     noteProgress();
 }
 
+int BtcScanner::rowLimitFor(qint64 gaps)
+{
+    return static_cast<int>(std::clamp(gaps * kRowsPerGapRow, qint64(kMinWalletRows), qint64(kMaxWalletRows)));
+}
+
 int BtcScanner::rowLimit() const
 {
     qint64 gaps = 0;
     for (const Chain& c : chains_) gaps += c.gap;
-    return static_cast<int>(std::clamp(gaps * kRowsPerGapRow, qint64(kMinWalletRows), qint64(kMaxWalletRows)));
+    return rowLimitFor(gaps);
 }
 
 qint64 BtcScanner::reservedRows() const
@@ -909,12 +914,12 @@ void BtcScanner::reportLimits()
     limitReported_ = true;
     static const QLocale english(QLocale::English, QLocale::UnitedStates); // "15,000", as the UI groups
     const QString count = english.toString(qlonglong(tracked_.size()));
-    // Several wallets share the limit: their addresses add up, whatever a server
-    // says. Another server would stop at the same place.
-    const bool severalWallets = std::any_of(chains_.cbegin(), chains_.cend(), [this](const Chain& c) {
-        return c.wallet != chains_.constFirst().wallet;
-    });
-    if (severalWallets) {
+    // The gaps alone ask for more than one connection follows, whatever a server
+    // says: many wallets, or many keys at large gaps. Another server would stop at
+    // the same place, and only smaller gaps or fewer wallets help.
+    qint64 baseRows = 0;
+    for (const Chain& c : chains_) baseRows += c.base();
+    if (baseRows >= kMaxWalletRows) {
         emit problem(Problem::Limit,
                      QStringLiteral("Bitcoin scan stopped at %1 addresses, the most GitWallet follows on one "
                                     "connection, shared by all wallets. Lower the gaps in Settings or remove "
@@ -923,12 +928,16 @@ void BtcScanner::reportLimits()
                      QString());
         return;
     }
+    const bool severalWallets = std::any_of(chains_.cbegin(), chains_.cend(), [this](const Chain& c) {
+        return c.wallet != chains_.constFirst().wallet;
+    });
     emit problem(Problem::Limit,
                  rowLimit() < kMaxWalletRows
                      ? QStringLiteral("Bitcoin scan stopped at %1 addresses, the limit for these gap settings: the "
-                                      "Electrum server reports addresses that far out as used. If this wallet really "
-                                      "uses that many, raise the gaps in Settings; otherwise choose another server.")
-                           .arg(count)
+                                      "Electrum server reports addresses that far out as used. If %2 that many, "
+                                      "raise the gaps in Settings; otherwise choose another server.")
+                           .arg(count, severalWallets ? QStringLiteral("these wallets really use")
+                                                      : QStringLiteral("this wallet really uses"))
                      : QStringLiteral("Bitcoin scan stopped at %1 addresses, the most GitWallet follows: the "
                                       "Electrum server reports addresses that far out as used. If that is wrong, "
                                       "choose another server in Settings.")

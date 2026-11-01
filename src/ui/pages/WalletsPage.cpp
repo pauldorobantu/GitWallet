@@ -28,6 +28,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSortFilterProxyModel>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -260,7 +261,7 @@ private:
         if (!shown.allRows || counts.rows == 0)
             return scanning_ ? RowState::Scanning : RowState::NotScanned;
         if (counts.checked < counts.rows)
-            return RowState::Checking;
+            return scanning_ ? RowState::Checking : RowState::NotScanned;
         return current_ ? RowState::UpToDate : RowState::LastKnown;
     }
 
@@ -361,7 +362,7 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     ui_->count = new QLabel(bar.widget);
     ui_->count->setObjectName(QStringLiteral("mimCount"));
     bar.left->addWidget(ui_->search);
-    bar.left->addWidget(ui_->count);
+    page::addBarCount(bar, ui_->count);
 
     ui_->keys = new QPushButton(QStringLiteral("Public keys"), bar.widget);
     ui_->rename = new QPushButton(QStringLiteral("Rename"), bar.widget);
@@ -413,11 +414,13 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
         ui_->model->repaintFigures();
         updateState();
     });
+    const auto queueRepaint = [this] {
+        if (!ui_->repaint->isActive())
+            ui_->repaint->start();
+    };
+    // The columns measure the rows on screen: rows scrolled into view are measured too.
+    connect(view->verticalScrollBar(), &QScrollBar::valueChanged, this, queueRepaint);
     if (controller_) {
-        const auto queueRepaint = [this] {
-            if (!ui_->repaint->isActive())
-                ui_->repaint->start();
-        };
         connect(controller_, &WalletController::totalsChanged, this, queueRepaint);
         connect(controller_, &WalletController::statusChanged, this, queueRepaint);
         connect(controller_, &WalletController::walletChanged, this, [this] {

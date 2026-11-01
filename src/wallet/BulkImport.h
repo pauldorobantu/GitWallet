@@ -45,9 +45,9 @@ struct KeyLine {
 
 QList<KeyLine> parseKeyLines(const QString& text);
 
-// A phrase in a place that is not for seeds: six or more BIP39 words on one line. A
-// name cut at the longest a wallet's may be still holds that many, and a real name
-// hardly ever does.
+// A phrase in a place that is not for seeds: the 12 or more BIP39 words of a whole one,
+// or 5 on a line as long as a wallet's name may be, which is where a longer phrase was
+// cut. A real name, even one made of list words, hardly ever has that many.
 bool looksLikeSeedWords(const QString& line);
 
 } // namespace wallet

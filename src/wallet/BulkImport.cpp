@@ -2,6 +2,7 @@
 
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
+#include "wallet/WalletStore.h"
 
 #include <QRegularExpression>
 
@@ -103,7 +104,8 @@ QString trimmedName(const std::string& text, size_t from, size_t to)
         name.remove(0, 1);
     while (name.endsWith(QLatin1Char('"')))
         name.chop(1);
-    return name.trimmed();
+    // The list was read in NFKD for its words; a name goes back to the usual form.
+    return name.trimmed().normalized(QString::NormalizationForm_C);
 }
 
 } // namespace
@@ -174,8 +176,10 @@ std::vector<SeedLine> parseSeedLines(const std::string& text)
 
 QList<KeyLine> parseKeyLines(const QString& text)
 {
-    static const QRegularExpression gap(QStringLiteral("[\\s,;:\"]+"));
-    static const QRegularExpression listNumber(QStringLiteral("^\\d+[.)]\\s+"));
+    // Any kind of space: a key copied from a document or a page can come with one.
+    static const QRegularExpression gap(QStringLiteral("[\\s,;:\"]+"), QRegularExpression::UseUnicodePropertiesOption);
+    static const QRegularExpression listNumber(QStringLiteral("^\\d+[.)]\\s+"),
+                                               QRegularExpression::UseUnicodePropertiesOption);
     QList<KeyLine> out;
     const QStringList lines = text.split(QLatin1Char('\n'));
     for (qsizetype i = 0; i < lines.size(); ++i) {
@@ -203,7 +207,8 @@ QList<KeyLine> parseKeyLines(const QString& text)
             entry.problem = QStringLiteral("it has no zpub, ypub or xpub");
         } else {
             QString name = line.left(firstKey);
-            static const QRegularExpression edges(QStringLiteral("^[\\s,;:\"]+|[\\s,;:\"]+$"));
+            static const QRegularExpression edges(QStringLiteral("^[\\s,;:\"]+|[\\s,;:\"]+$"),
+                                                  QRegularExpression::UseUnicodePropertiesOption);
             name.remove(edges);
             entry.name = name;
         }
@@ -214,11 +219,12 @@ QList<KeyLine> parseKeyLines(const QString& text)
 
 bool looksLikeSeedWords(const QString& line)
 {
-    static const QRegularExpression gap(QStringLiteral("[\\s,;:\"]+"));
+    static const QRegularExpression gap(QStringLiteral("[\\s,;:\"]+"), QRegularExpression::UseUnicodePropertiesOption);
+    const int needed = line.size() >= WalletStore::kMaxLabelChars ? 5 : 12;
     int words = 0;
     const QStringList tokens = line.split(gap, Qt::SkipEmptyParts);
     for (const QString& token : tokens) {
-        if (chain::bip39::isWord(token.toLower().toStdString()) && ++words >= 6)
+        if (chain::bip39::isWord(token.toLower().toStdString()) && ++words >= needed)
             return true;
     }
     return false;

@@ -33,6 +33,8 @@ class BtcScanner : public QObject
 public:
     // Addresses one connection follows at most, all wallets together (BtcScanner.cpp).
     static constexpr int kMaxFollowedRows = 40000;
+    // Rows a scan follows at most, from the sum of its chains' gaps: it falls with them.
+    static int rowLimitFor(qint64 gaps);
 
     BtcScanner(net::ElectrumClient* client, WalletModel* model, QObject* parent = nullptr);
 

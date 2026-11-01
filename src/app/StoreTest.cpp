@@ -286,8 +286,22 @@ StoreTestResult runStoreTest()
 
         check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).left(64)),
               QStringLiteral("a phrase cut at the longest name is still seen as one"));
-        check(!wallet::looksLikeSeedWords(QStringLiteral("Online shop main account")),
+        check(!wallet::looksLikeSeedWords(QStringLiteral("Online shop main account family business")),
               QStringLiteral("a real name made of list words is not"));
+        check(wallet::looksLikeSeedWords(QStringLiteral("1. abandon 2. abandon 3. abandon 4. abandon 5. abandon 6. abando")),
+              QStringLiteral("a numbered phrase cut there is"));
+        check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).replace(QLatin1Char(' '), QChar(0x3000))),
+              QStringLiteral("and so is one with other kinds of space"));
+        check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).replace(QLatin1Char(' '), QStringLiteral(", "))),
+              QStringLiteral("or commas"));
+        const QList<wallet::KeyLine> spaced = wallet::parseKeyLines(QChar(0x3000) + first.at(2).xpub + QChar(0x2003));
+        check(spaced.size() == 1 && spaced.first().keys == QStringList{first.at(2).xpub},
+              QStringLiteral("a key copied with other kinds of space around it is still that key"));
+        const std::vector<wallet::SeedLine> accented = wallet::parseSeedLines(
+            QStringLiteral("Magazin Iași: ").normalized(QString::NormalizationForm_KD).toStdString() + kSecondMnemonic);
+        check(accented.size() == 1 && accented.front().problem.isEmpty()
+                  && accented.front().name == QStringLiteral("Magazin Iași"),
+              QStringLiteral("a name keeps its letters in their usual form"));
 
         // The address model, per wallet.
         wallet::WalletModel model;
@@ -395,6 +409,22 @@ StoreTestResult runStoreTest()
                   QStringLiteral("a gap of 100 leaves it out, with its balance"));
             controller.model()->clear();
 
+            // Ethereum's `used` flag outlives what set it, and a fresh scan starts without it.
+            const auto ethRow = [own](quint32 index, bool used, quint64 nonce) {
+                wallet::AddressRow row = rowOf(own, index, 0);
+                row.type = chain::ScriptType::EthAccount;
+                row.used = used;
+                row.nonce = nonce;
+                return row;
+            };
+            controller.model()->upsert(ethRow(50, true, 0));
+            controller.model()->upsert(ethRow(120, true, 1));
+            settings = controller.store().settings;
+            settings.ethGap = 100;
+            check(controller.gapImpact(settings).used == 1,
+                  QStringLiteral("an Ethereum address only marked used does not keep the next one in reach"));
+            controller.model()->clear();
+
             // Remove all takes the files kept aside too.
             done(controller.removeAllWallets(&error), QStringLiteral("every wallet can be removed"));
             check(!QFile::exists(filePath) && asideFiles().isEmpty(),
@@ -424,6 +454,36 @@ StoreTestResult runStoreTest()
             check(controller.addWallets(&twice, &error) == 0 && error.isEmpty() && !twice.at(0).refused.isEmpty(),
                   QStringLiteral("a batch of what is here already adds nothing, and says why per line"));
             done(controller.removeAllWallets(&error), QStringLiteral("the batch can be removed"));
+
+            // One seed, 12,000 used addresses in a row: no hole for a smaller gap to
+            // leave out, but the row limit falls with the gaps (15,000 at 200/50, 10,000 at 100/50).
+            done(controller.addKeysWallet(first, QStringLiteral("Long run"), &error), QStringLiteral("a long run's wallet"));
+            const quint32 runId = controller.store().wallets.first().id;
+            for (quint32 index = 0; index < 12000; ++index) {
+                wallet::AddressRow row = rowOf(runId, index, index == 11999 ? 700 : 0);
+                row.used = true;
+                controller.model()->upsert(row);
+            }
+            wallet::ScanSettings gapped = controller.store().settings;
+            check(gapped.btcReceiveGap == 200 && gapped.btcChangeGap == 50 && controller.gapImpact(gapped).used == 0,
+                  QStringLiteral("the same gaps leave nothing out"));
+            gapped.btcReceiveGap = 100;
+            const WalletController::GapImpact run = controller.gapImpact(gapped);
+            check(run.atMost && run.used == 2450 && run.funded == 1,
+                  QStringLiteral("smaller ones say how many the row limit can cut"));
+            controller.model()->clear();
+            done(controller.removeAllWallets(&error), QStringLiteral("and it can be removed"));
+
+            // The same text can be two sets of addresses, in one wallet or two.
+            QString why;
+            QList<wallet::AccountKey> twoKinds;
+            check(wallet::WalletStore::accountsFromPublicKeys({first.at(2).xpub}, {first.at(2).xpub}, chain::ScriptType::P2PKH,
+                                                              &twoKinds, &why)
+                      && twoKinds.size() == 2,
+                  QStringLiteral("one xpub reads as a legacy and an Ethereum account"));
+            done(controller.addKeysWallet(twoKinds, QStringLiteral("Two kinds"), &error),
+                 QStringLiteral("and such a wallet saves"));
+            done(controller.removeAllWallets(&error), QStringLiteral("and it can be removed"));
         }
         {
             // A file changed outside this window is not this window's to delete.

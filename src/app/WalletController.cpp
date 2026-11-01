@@ -78,6 +78,12 @@ std::optional<QByteArray> diskDigest()
     return hash.result();
 }
 
+// Older files an add moved aside because they could not be read, by file name.
+QStringList keptAsideFiles()
+{
+    return QDir(wallet::WalletStore::dataDir()).entryList({QStringLiteral("wallet.dat.unread-*")}, QDir::Files);
+}
+
 // Why a write is refused in a second GitWallet on the same data folder.
 QString inUseElsewhere()
 {
@@ -568,7 +574,7 @@ bool WalletController::removeAllWallets(QString* error)
     fileDigest_.clear(); // no file any more
     // "Every wallet": the unread files an add kept aside hold wallets too.
     const QDir folder(wallet::WalletStore::dataDir());
-    const QStringList aside = folder.entryList({QStringLiteral("wallet.dat.unread-*")}, QDir::Files);
+    const QStringList aside = keptAsideFiles();
     for (const QString& name : aside)
         QFile::remove(folder.filePath(name));
     model_->clear();
@@ -577,11 +583,28 @@ bool WalletController::removeAllWallets(QString* error)
     return true;
 }
 
+int WalletController::walletFilesKeptAside() const
+{
+    return int(keptAsideFiles().size());
+}
+
+QString WalletController::unreadFileNote() const
+{
+    return diskDigest()
+               ? QStringLiteral("The file stays as it is. If you add a wallet now, GitWallet keeps it aside under "
+                                "another name and says where.")
+               : QStringLiteral("The file stays as it is. GitWallet cannot open it at all, so it cannot keep it "
+                                "aside either: to add a wallet, first move it out of %1 by hand.")
+                     .arg(QDir::toNativeSeparators(wallet::WalletStore::dataDir()));
+}
+
 WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettings& settings) const
 {
     struct Row {
         quint32 index;
         bool funded;
+        bool found; // a fresh scan reads it as used, which is what moves its window
+        bool bitcoin;
     };
     QHash<QString, QList<Row>> chains;
     QHash<QString, int> gaps;
@@ -592,10 +615,15 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         if (!r.used && !funded)
             continue;
         const QString key = QStringLiteral("%1/%2/%3/%4").arg(r.wallet).arg(int(r.type)).arg(r.account).arg(r.change);
-        chains[key].append({r.index, funded});
+        // Ethereum's `used` is sticky and a fresh scan starts without it: an address
+        // that gave its tokens away by signature reads as unused again.
+        const bool found = funded || (r.isBitcoin() ? r.used : r.nonce > 0);
+        chains[key].append({r.index, funded, found, r.isBitcoin()});
         gaps[key] = !r.isBitcoin() ? s.ethGap : r.change == 0 ? s.btcReceiveGap : s.btcChangeGap;
     }
     GapImpact impact;
+    QList<Row> reached; // Bitcoin rows the gaps still reach
+    qint64 grown = 0;   // what those chains ask for on top of their gaps
     for (auto it = chains.begin(); it != chains.end(); ++it) {
         std::sort(it->begin(), it->end(), [](const Row& a, const Row& b) { return a.index < b.index; });
         const qint64 gap = gaps.value(it.key());
@@ -604,13 +632,44 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         for (const Row& row : std::as_const(*it)) {
             cut = cut || qint64(row.index) > last + gap;
             if (!cut) {
-                last = row.index;
+                if (row.found)
+                    last = row.index;
+                if (row.bitcoin)
+                    reached.append(row);
                 continue;
             }
             ++impact.used;
             if (row.funded)
                 ++impact.funded;
         }
+        if (it->constFirst().bitcoin)
+            grown += last + 1;
+    }
+
+    // A run of used addresses has no hole for the walk above to find, but the row
+    // limit falls with the gaps too, and a scan stops there.
+    qint64 newGaps = 0;
+    qint64 oldGaps = 0;
+    const QList<wallet::AccountKey> accounts = store_.allAccounts();
+    for (const wallet::AccountKey& key : accounts) {
+        if (!chain::isBitcoin(key.type))
+            continue;
+        newGaps += qint64(s.btcReceiveGap) + s.btcChangeGap;
+        oldGaps += qint64(store_.settings.btcReceiveGap) + store_.settings.btcChangeGap;
+    }
+    const int limit = wallet::BtcScanner::rowLimitFor(newGaps);
+    const qint64 over = newGaps + grown - limit;
+    if (limit < wallet::BtcScanner::rowLimitFor(oldGaps) && over > 0) {
+        // Which ones depends on the order the chains grow in: the furthest out, at
+        // most this many, since the ends of the windows go first.
+        std::sort(reached.begin(), reached.end(), [](const Row& a, const Row& b) { return a.index > b.index; });
+        const qsizetype lost = qMin(qsizetype(over), reached.size());
+        for (qsizetype i = 0; i < lost; ++i) {
+            ++impact.used;
+            if (reached.at(i).funded)
+                ++impact.funded;
+        }
+        impact.atMost = lost > 0;
     }
     return impact;
 }
@@ -986,7 +1045,9 @@ QString WalletController::settingsSaveBlocker()
         return inUseElsewhere();
     const std::optional<QByteArray> disk = diskDigest();
     if (!disk)
-        return QStringLiteral("wallet.dat could not be read to check it.");
+        return QStringLiteral("wallet.dat cannot be opened, so it can be neither checked nor kept aside. Move it out "
+                              "of %1 by hand, then try again.")
+            .arg(QDir::toNativeSeparators(wallet::WalletStore::dataDir()));
     if (disk->isEmpty()) {
         // No file: settings alone make one without keys. Keys still shown here
         // came from a file deleted since ("Remove wallet" in another window,
