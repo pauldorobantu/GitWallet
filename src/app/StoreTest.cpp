@@ -300,7 +300,7 @@ StoreTestResult runStoreTest()
             const QByteArray keptBytes = kept.open(QIODevice::ReadOnly) ? kept.readAll() : QByteArray();
             kept.close();
             check(keptBytes == "not a wallet file", QStringLiteral("unchanged"));
-            check(notices.size() == 1 && notices.first().contains(aside.value(0)),
+            check(notices.size() == 1 && !aside.isEmpty() && notices.first().contains(aside.first()),
                   QStringLiteral("the user is told its new name"));
             wallet::WalletStore reread3;
             check(reread3.load(&error) && reread3.wallets.size() == 1, QStringLiteral("the new file holds the new wallet"));

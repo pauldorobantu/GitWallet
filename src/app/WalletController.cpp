@@ -980,8 +980,8 @@ QString WalletController::walletSaveBlocker(QString* movedTo)
 
     // Another Windows user's, damaged, or from a newer GitWallet: kept beside the
     // new one under a name nothing reads.
-    const QString aside = wallet::WalletStore::filePath()
-                          + QDateTime::currentDateTime().toString(QStringLiteral(".unread-yyyyMMdd-HHmmss"));
+    const QString aside = wallet::WalletStore::filePath() + QStringLiteral(".unread-")
+                          + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
     if (!QFile::rename(wallet::WalletStore::filePath(), aside))
         return QStringLiteral("wallet.dat could not be opened, nor moved aside.");
     *movedTo = aside;
