@@ -5,11 +5,14 @@ rem (already built for FlowSuite) are not rebuilt; only secp256k1 compiles.
 setlocal
 cd /d "%~dp0"
 
-if not exist "C:\app-vcpkg\vcpkg.exe" (
-    echo [build] vcpkg not found at C:\app-vcpkg
+rem GW_VCPKG / GW_VCPKG_INSTALLED point elsewhere on the build machine (CI).
+if not defined GW_VCPKG set "GW_VCPKG=C:\app-vcpkg"
+if not defined GW_VCPKG_INSTALLED set "GW_VCPKG_INSTALLED=C:/app-vcpkg-installed"
+if not exist "%GW_VCPKG%\vcpkg.exe" (
+    echo [build] vcpkg not found at %GW_VCPKG%
     exit /b 1
 )
-set "VCPKG_TOOLCHAIN=C:\app-vcpkg\scripts\buildsystems\vcpkg.cmake"
+set "VCPKG_TOOLCHAIN=%GW_VCPKG%\scripts\buildsystems\vcpkg.cmake"
 set "REPO=%CD%"
 
 set "VCVARS="
@@ -33,7 +36,7 @@ cmake -S . -B build -G Ninja ^
     -DCMAKE_TOOLCHAIN_FILE="%VCPKG_TOOLCHAIN%" ^
     -DVCPKG_TARGET_TRIPLET=x64-windows-release-only ^
     -DVCPKG_OVERLAY_TRIPLETS="%REPO%\cmake\triplets" ^
-    -DVCPKG_INSTALLED_DIR=C:/app-vcpkg-installed || exit /b 1
+    -DVCPKG_INSTALLED_DIR=%GW_VCPKG_INSTALLED% || exit /b 1
 cmake --build build || exit /b 1
 
 rem dist\ = a folder that runs on its own: the exe, its DLLs and the Qt plugins
