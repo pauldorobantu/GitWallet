@@ -43,7 +43,7 @@ public:
     bool isScanning() const;
     int checkedCount() const;  // rows whose nonce and every balance have answered
     int derivedCount() const;
-    bool limitReached() const; // some account's window is cut at 100,000 addresses
+    bool limitReached() const; // a window is cut at 100,000 addresses, or all of them at 200,000
     // The endpoint requests go to now was found not to serve Ethereum mainnet
     // (chain id, no Multicall3 contract, token contract missing).
     bool wrongChain() const;
@@ -94,7 +94,9 @@ private:
     qint64 windowEnd(const AccountState& account) const; // the window is [0, windowEnd)
     bool cutAtLimit(const AccountState& account) const;  // the window wants rows past kMaxEthRows
     void extendWindow(int account, bool enqueue);
+    void extendWindowTo(int account, bool enqueue, qint64 upTo); // the part of the window below `upTo`
     void startPass();
+    void deriveWindows(); // the start of a pass, a slice per event-loop turn
     void nextChunk();
     void sendNonces();
     void onNonces(const QList<quint64>& nonces, const QList<bool>& ok, const QList<Issue>& issues);
@@ -128,6 +130,9 @@ private:
     QTimer* retryTimer_ = nullptr;
     QTimer* progressTimer_ = nullptr;
     QList<AccountState> acc_;  // the accounts of the current start()
+    int deriving_ = 0;         // the account deriveWindows() has got to
+    qint64 totalRows_ = 0;     // rows of all accounts' windows
+    bool totalCut_ = false;    // a window was cut at the limit over all accounts
     QList<AssetInfo> tokens_;  // ERC-20s read for every address
     QList<Slot> queue_;        // rows still to check in the current pass
     qsizetype queueHead_ = 0;

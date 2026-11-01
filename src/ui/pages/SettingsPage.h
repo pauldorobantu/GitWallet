@@ -2,6 +2,10 @@
 
 #include <QWidget>
 
+namespace wallet {
+struct ScanSettings;
+}
+
 namespace app {
 class WalletController;
 }
@@ -29,7 +33,8 @@ private:
     void rebuildWallet(); // the wallet count, and whether Remove is on offer
     void updateInUse();   // the Electrum server / Ethereum endpoint in use
     void resetToDefaults();
-    void save();
+    void save();          // checks the form, warns when smaller gaps leave addresses out
+    void apply(const wallet::ScanSettings& settings);
     void confirmRemove();
     void removeWallet();
 

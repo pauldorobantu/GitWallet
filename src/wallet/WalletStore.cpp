@@ -3,6 +3,7 @@
 #include "chain/Hash.h"
 
 #include <QByteArray>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -580,7 +581,7 @@ bool WalletStore::load(QString* error)
     return true;
 }
 
-bool WalletStore::save(QString* error) const
+bool WalletStore::save(QString* error, QByteArray* digest) const
 {
     const QString path = filePath();
     const QString dir = QFileInfo(path).absolutePath();
@@ -619,6 +620,7 @@ bool WalletStore::save(QString* error) const
     if (!file.commit())
         return fail(error, QStringLiteral("Cannot write the wallet file %1: %2")
                                .arg(nativePath(path), file.errorString()));
+    if (digest) *digest = QCryptographicHash::hash(blob, QCryptographicHash::Sha256);
     return true;
 }
 
@@ -685,15 +687,25 @@ QString WalletStore::cleanLabel(const QString& label)
     return line;
 }
 
-bool WalletStore::accountsFromPublicKeys(const QStringList& keys, bool xpubIsEthereum,
-                                         QList<AccountKey>* out, QString* why)
+QByteArray WalletStore::addressSetId(const AccountKey& key)
+{
+    const chain::HdPubKey node = key.node();
+    QByteArray id;
+    id.append(char(static_cast<int>(key.type)));
+    id.append(reinterpret_cast<const char*>(node.publicKey().data()), qsizetype(node.publicKey().size()));
+    id.append(reinterpret_cast<const char*>(node.chainCode().data()), qsizetype(node.chainCode().size()));
+    return id;
+}
+
+bool WalletStore::accountsFromPublicKeys(const QStringList& bitcoinKeys, const QStringList& ethereumKeys,
+                                         chain::ScriptType xpubType, QList<AccountKey>* out, QString* why)
 {
     QList<AccountKey> accounts;
-    for (qsizetype i = 0; i < keys.size(); ++i) {
-        const QString number = QString::number(i + 1);
-        const QString text = keys.at(i).trimmed();
+    QSet<QByteArray> seen;
+    const auto add = [&](const QString& raw, const QString& name, bool ethereum) {
+        const QString text = raw.trimmed();
         if (text.size() > kMaxXpubChars)
-            return fail(why, QStringLiteral("Key %1 is too long to be a public key.").arg(number));
+            return fail(why, QStringLiteral("%1 is too long to be a public key.").arg(name));
 
         chain::HdPubKey node;
         uint32_t version = 0;
@@ -704,29 +716,48 @@ bool WalletStore::accountsFromPublicKeys(const QStringList& keys, bool xpubIsEth
             parsed = false;
         }
         if (!parsed)
-            return fail(why, QStringLiteral("Key %1 is not a valid zpub, ypub or xpub.").arg(number));
+            return fail(why, QStringLiteral("%1 is not a valid %2.")
+                                 .arg(name, ethereum ? QStringLiteral("xpub") : QStringLiteral("zpub, ypub or xpub")));
 
         // Account level is m/purpose'/coin'/account': a key from any other depth
         // would show addresses no wallet of this seed ever handed out.
         constexpr uint32_t kHardened = 0x80000000u;
         if (node.depth() != 3 || (node.childNumber() & kHardened) == 0)
-            return fail(why, QStringLiteral("Key %1 is not an account key (m/purpose'/coin'/account'). "
+            return fail(why, QStringLiteral("%1 is not an account key (m/purpose'/coin'/account'). "
                                             "Export the account's public key from the other wallet.")
-                                 .arg(number));
+                                 .arg(name));
 
         AccountKey key;
         key.account = node.childNumber() & ~kHardened;
-        key.xpub = text;
-        switch (version) {
-        case chain::xpubVersion::kZpub: key.type = chain::ScriptType::P2WPKH; break;
-        case chain::xpubVersion::kYpub: key.type = chain::ScriptType::P2SH_P2WPKH; break;
-        case chain::xpubVersion::kXpub:
-            key.type = xpubIsEthereum ? chain::ScriptType::EthAccount : chain::ScriptType::P2PKH;
-            break;
-        default:
-            return fail(why, QStringLiteral("Key %1 is not a mainnet zpub, ypub or xpub.").arg(number));
+        if (ethereum) {
+            if (version != chain::xpubVersion::kXpub)
+                return fail(why, QStringLiteral("%1 must be an xpub: an Ethereum account has no zpub or ypub.").arg(name));
+            key.type = chain::ScriptType::EthAccount;
+        } else {
+            switch (version) {
+            case chain::xpubVersion::kZpub: key.type = chain::ScriptType::P2WPKH; break;
+            case chain::xpubVersion::kYpub: key.type = chain::ScriptType::P2SH_P2WPKH; break;
+            case chain::xpubVersion::kXpub: key.type = xpubType; break;
+            default:
+                return fail(why, QStringLiteral("%1 is not a mainnet zpub, ypub or xpub.").arg(name));
+            }
         }
+        // The form its type is stored with: an xpub of a SegWit account becomes a
+        // zpub or ypub, so a copy from the Public keys dialog says what it is.
+        key.xpub = QString::fromStdString(node.serialize(chain::xpubVersionFor(key.type)));
+
+        const QByteArray id = addressSetId(key);
+        if (seen.contains(id))
+            return fail(why, QStringLiteral("%1 repeats another key here.").arg(name));
+        seen.insert(id);
         accounts.append(key);
+        return true;
+    };
+    for (qsizetype i = 0; i < bitcoinKeys.size(); ++i) {
+        if (!add(bitcoinKeys.at(i), QStringLiteral("Bitcoin key %1").arg(i + 1), false)) return false;
+    }
+    for (qsizetype i = 0; i < ethereumKeys.size(); ++i) {
+        if (!add(ethereumKeys.at(i), QStringLiteral("Ethereum key %1").arg(i + 1), true)) return false;
     }
     QString problem;
     if (!checkAccounts(accounts, &problem)) {

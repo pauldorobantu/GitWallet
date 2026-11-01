@@ -1,11 +1,13 @@
 #include "ui/dialogs/ImportSeedDialog.h"
 
 #include "app/WalletController.h"
+#include "chain/Address.h"
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
 #include "ui/DialogChrome.h"
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
+#include "ui/XpubField.h"
 #include "ui/design/Style.h"
 #include "wallet/WalletStore.h"
 
@@ -16,6 +18,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMetaObject>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -171,6 +174,28 @@ void wipeTextEdit(QPlainTextEdit* edit)
     edit->clear();
 }
 
+// A recovery phrase in a field that is not the seed field. Six words: a name cut
+// at kMaxLabelChars still holds that many, and a real name hardly ever does.
+bool looksLikeSeedWords(const QString& text)
+{
+    static const QRegularExpression space(QStringLiteral("\\s+"));
+    int words = 0;
+    const QStringList tokens = text.split(space, Qt::SkipEmptyParts);
+    for (const QString& token : tokens) {
+        if (isBip39Word(token.toLower().toStdString()) && ++words >= 6)
+            return true;
+    }
+    return false;
+}
+
+// The address a key starts with, for the user to compare with the other wallet.
+// Throws what the derivation throws.
+QString firstAddress(const wallet::AccountKey& key)
+{
+    const chain::HdPubKey chainNode = key.node().deriveChild(0);
+    return QString::fromStdString(chain::addressFromChainNode(chainNode, key.type, key.account, 0, 0).address);
+}
+
 } // namespace
 
 ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent)
@@ -235,6 +260,7 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     words_->setAccessibleName(QStringLiteral("Seed words"));
     wordsLabel->setBuddy(words_);
     status_ = new QLabel(this);
+    status_->setTextFormat(Qt::PlainText); // it can quote a wallet's name
     status_->setWordWrap(true);
     // The line keeps its room while it is empty, so the words field does not
     // jump when the first status appears.
@@ -264,16 +290,19 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     wordsColumn->addLayout(passphraseBlock);
     pages_->addWidget(wordsPage);
 
-    // Or public keys alone: no secret, so nothing to wipe.
+    // Or public keys alone. Not secret themselves, but seed words pasted here by
+    // mistake are, so these fields keep no undo history either.
     auto* keysPage = new QWidget(pages_);
     auto* keysColumn = new QVBoxLayout(keysPage);
     keysColumn->setContentsMargins(0, 0, 0, 0);
     keysColumn->setSpacing(tokens::layout::kFormVSpacing);
-    auto* keysLabel = new QLabel(QStringLiteral("Public keys"), keysPage);
+    auto* keysLabel = new QLabel(QStringLiteral("Bitcoin public keys"), keysPage);
     keysLabel->setObjectName(QStringLiteral("formSectionLabel"));
     keys_ = new QPlainTextEdit(keysPage);
     keys_->setObjectName(QStringLiteral("publicKeys"));
     keys_->setTabChangesFocus(true);
+    keys_->setUndoRedoEnabled(false);
+    keys_->setInputMethodHints(keys_->inputMethodHints() | kSecretInputHints);
     keys_->setPlaceholderText(QStringLiteral("One account key per line: zpub (native SegWit), ypub (nested "
                                              "SegWit) or xpub"));
     keysLabel->setBuddy(keys_);
@@ -283,14 +312,30 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     auto* xpubLayout = new QHBoxLayout(xpubRow_);
     xpubLayout->setContentsMargins(0, 0, 0, 0);
     xpubLayout->setSpacing(tokens::layout::kFormHSpacing);
-    xpubLayout->addWidget(new QLabel(QStringLiteral("An xpub key is"), xpubRow_));
+    xpubLayout->addWidget(new QLabel(QStringLiteral("An xpub here is"), xpubRow_));
     xpubKind_ = new QComboBox(xpubRow_);
-    xpubKind_->addItems({QStringLiteral("Bitcoin legacy (m/44'/0'/…)"), QStringLiteral("Ethereum (m/44'/60'/…)")});
-    xpubKind_->setToolTip(QStringLiteral("The prefix cannot tell the two apart; a wrong choice shows other addresses."));
+    xpubKind_->setObjectName(QStringLiteral("xpubKind"));
+    xpubKind_->addItem(QStringLiteral("Native SegWit (m/84'/0'/…)"), int(chain::ScriptType::P2WPKH));
+    xpubKind_->addItem(QStringLiteral("Nested SegWit (m/49'/0'/…)"), int(chain::ScriptType::P2SH_P2WPKH));
+    xpubKind_->addItem(QStringLiteral("Legacy (m/44'/0'/…)"), int(chain::ScriptType::P2PKH));
+    xpubKind_->setPlaceholderText(QStringLiteral("Choose"));
+    xpubKind_->setCurrentIndex(-1);
+    xpubKind_->setToolTip(QStringLiteral("Wallets write these accounts with the xpub prefix too, so it does not "
+                                         "say which. The wrong choice shows other addresses: compare the first "
+                                         "address below with the other wallet."));
     xpubLayout->addWidget(xpubKind_);
     xpubLayout->addStretch(1);
     xpubRow_->setVisible(false);
     keysColumn->addWidget(xpubRow_);
+    auto* ethLabel = new QLabel(QStringLiteral("Ethereum public key (optional)"), keysPage);
+    ethLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    ethKey_ = new QLineEdit(keysPage);
+    ethKey_->setObjectName(QStringLiteral("ethereumKey"));
+    ethKey_->setInputMethodHints(ethKey_->inputMethodHints() | kSecretInputHints);
+    ethKey_->setPlaceholderText(QStringLiteral("The xpub of the account at m/44'/60'/0'"));
+    ethLabel->setBuddy(ethKey_);
+    keysColumn->addWidget(ethLabel);
+    keysColumn->addWidget(ethKey_);
     pages_->addWidget(keysPage);
     root->addWidget(pages_, 1);
     root->addWidget(status_);
@@ -316,7 +361,18 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     connect(source_, &QComboBox::currentIndexChanged, this, &ImportSeedDialog::sourceChanged);
     connect(words_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateWords);
     connect(keys_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateKeys);
+    connect(ethKey_, &QLineEdit::textChanged, this, &ImportSeedDialog::validateKeys);
     connect(xpubKind_, &QComboBox::currentIndexChanged, this, &ImportSeedDialog::validateKeys);
+    connect(name_, &QLineEdit::textChanged, this, [this](const QString& text) {
+        if (!looksLikeSeedWords(text))
+            return;
+        setStatus(status_,
+                  trText(QStringLiteral("That looks like seed words, so it was not kept as a name. "
+                                        "Paste them in the Seed words field.")),
+                  Tone::Error);
+        // Queued: not from inside the field's own signal.
+        QMetaObject::invokeMethod(this, [this] { wipeLineEdit(name_); }, Qt::QueuedConnection);
+    });
     connect(hasPassphrase_, &QCheckBox::toggled, this, [this](bool on) {
         // Unticked means "no passphrase": what was typed must not be imported
         // unseen, so it goes at once.
@@ -332,7 +388,8 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     connect(import_, &QPushButton::clicked, this, &ImportSeedDialog::importSeed);
 
     sourceChanged();
-    name_->setFocus();
+    // A phrase pasted straight away lands where it belongs.
+    words_->setFocus();
     page::fitDialog(this, page::DialogSize::Form);
 }
 
@@ -347,8 +404,7 @@ void ImportSeedDialog::done(int result)
     wipeFields();
     // Shown again, the dialog starts blank: no stale status, no passphrase.
     hasPassphrase_->setChecked(false);
-    name_->clear();
-    keys_->clear();
+    xpubKind_->setCurrentIndex(-1);
     source_->setCurrentIndex(0);
     setStatus(status_, QString(), Tone::Muted);
     updateImportEnabled();
@@ -369,33 +425,68 @@ void ImportSeedDialog::sourceChanged()
                                                "The seed itself is never saved."))
                        : trText(QStringLiteral("Public keys show addresses and balances but can never spend. "
                                                "A wallet added this way needs no seed on this PC.")));
-    if (wordsMode())
+    if (wordsMode()) {
         validateWords();
-    else
+        words_->setFocus();
+    } else {
         validateKeys();
+        keys_->setFocus();
+    }
 }
 
 void ImportSeedDialog::validateKeys()
 {
     wordsValid_ = false; // this source does not use them
     parsedKeys_.clear();
+
+    if (looksLikeSeedWords(keys_->toPlainText()) || looksLikeSeedWords(ethKey_->text())) {
+        setStatus(status_,
+                  trText(QStringLiteral("Those look like seed words, not public keys, so they were removed. "
+                                        "Choose Seed words to add a seed.")),
+                  Tone::Error);
+        updateImportEnabled();
+        // Queued: not from inside the fields' own signals.
+        QMetaObject::invokeMethod(this, [this] {
+            wipeTextEdit(keys_);
+            wipeLineEdit(ethKey_);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
     QString message;
     Tone tone = Tone::Muted;
     static const QRegularExpression space(QStringLiteral("\\s+"));
-    const QStringList keys = keys_->toPlainText().split(space, Qt::SkipEmptyParts);
-    const bool anyXpub = std::any_of(keys.cbegin(), keys.cend(), [](const QString& key) {
+    const QStringList bitcoin = keys_->toPlainText().split(space, Qt::SkipEmptyParts);
+    const QStringList ethereum = ethKey_->text().split(space, Qt::SkipEmptyParts);
+    const bool anyXpub = std::any_of(bitcoin.cbegin(), bitcoin.cend(), [](const QString& key) {
         return key.startsWith(QLatin1String("xpub"));
     });
     xpubRow_->setVisible(anyXpub);
-    if (!keys.isEmpty()) {
+    if (anyXpub && xpubKind_->currentIndex() < 0) {
+        message = trText(QStringLiteral("Choose what an xpub here is: its prefix does not say."));
+    } else if (!bitcoin.isEmpty() || !ethereum.isEmpty()) {
+        const auto xpubType = anyXpub ? static_cast<chain::ScriptType>(xpubKind_->currentData().toInt())
+                                      : chain::ScriptType::P2PKH;
         QString why;
         QList<wallet::AccountKey> parsed;
-        if (wallet::WalletStore::accountsFromPublicKeys(keys, xpubKind_->currentIndex() == 1, &parsed, &why)) {
-            parsedKeys_ = parsed;
-            message = trText(parsed.size() == 1 ? QStringLiteral("1 account key · OK")
-                                                : QStringLiteral("%1 account keys · OK"))
-                          .arg(parsed.size());
-            tone = Tone::Success;
+        if (wallet::WalletStore::accountsFromPublicKeys(bitcoin, ethereum, xpubType, &parsed, &why)) {
+            try {
+                QStringList lines;
+                lines << (parsed.size() == 1 ? trText(QStringLiteral("1 account key · OK. Compare its first "
+                                                                     "address with the other wallet:"))
+                                             : trText(QStringLiteral("%1 account keys · OK. Compare their first "
+                                                                     "addresses with the other wallet:"))
+                                                   .arg(parsed.size()));
+                constexpr qsizetype kShownKeys = 4; // room in the dialog; the rest pass the same checks
+                for (qsizetype i = 0; i < parsed.size() && i < kShownKeys; ++i)
+                    lines << QStringLiteral("%1: %2").arg(accountLabel(parsed.at(i)), firstAddress(parsed.at(i)));
+                message = lines.join(QLatin1Char('\n'));
+                parsedKeys_ = parsed;
+                tone = Tone::Success;
+            } catch (const std::exception&) {
+                message = trText(QStringLiteral("A public key could not be used to derive an address."));
+                tone = Tone::Error;
+            }
         } else {
             message = why;
             tone = Tone::Error;
@@ -409,10 +500,15 @@ void ImportSeedDialog::wipeFields()
 {
     wipeTextEdit(words_);
     wipeLineEdit(passphrase_);
+    // Not meant for secrets, but a phrase can land there by mistake.
+    wipeLineEdit(name_);
+    wipeTextEdit(keys_);
+    wipeLineEdit(ethKey_);
     // The live check and the import hold their std::string copies in a
     // SeedCopy that scrubs itself before the slot returns, so the editors are
     // the only place left where the words live.
     wordsValid_ = false;
+    parsedKeys_.clear();
 }
 
 void ImportSeedDialog::validateWords()

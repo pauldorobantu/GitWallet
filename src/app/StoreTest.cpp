@@ -1,5 +1,6 @@
 #include "app/StoreTest.h"
 
+#include "app/WalletController.h"
 #include "chain/Bip32.h"
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
@@ -7,6 +8,8 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QCryptographicHash>
+#include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -23,10 +26,20 @@ namespace {
 // Published BIP39 test vectors; none of them is anyone's wallet.
 const char* kFirstMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const char* kSecondMnemonic = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+const char* kThirdMnemonic = "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
 QList<wallet::AccountKey> accountsOf(const char* mnemonic)
 {
     return wallet::WalletStore::deriveAccounts(chain::bip39::split(mnemonic), {});
+}
+
+// The text of the first `count` keys.
+QStringList accountsText(const QList<wallet::AccountKey>& accounts, qsizetype count)
+{
+    QStringList out;
+    for (qsizetype i = 0; i < count; ++i)
+        out << accounts.at(i).xpub;
+    return out;
 }
 
 wallet::WalletEntry entryOf(quint32 id, const QString& label, QList<wallet::AccountKey> accounts)
@@ -147,26 +160,70 @@ StoreTestResult runStoreTest()
               QStringLiteral("the same key in two wallets is refused"));
 
         // Public keys.
+        const auto keysOf = [&error](const QStringList& bitcoin, const QStringList& ethereum,
+                                     chain::ScriptType xpubType, QList<wallet::AccountKey>* out) {
+            return wallet::WalletStore::accountsFromPublicKeys(bitcoin, ethereum, xpubType, out, &error);
+        };
+        const chain::ScriptType legacy = chain::ScriptType::P2PKH;
         QList<wallet::AccountKey> keys;
-        check(wallet::WalletStore::accountsFromPublicKeys({first.at(0).xpub, first.at(1).xpub}, false, &keys, &error)
-                  && keys.size() == 2 && keys.at(0).account == 0 && keys.at(0).type == chain::ScriptType::P2WPKH
+        check(keysOf({first.at(0).xpub, first.at(1).xpub}, {}, legacy, &keys) && keys.size() == 2
+                  && keys.at(0).account == 0 && keys.at(0).type == chain::ScriptType::P2WPKH
                   && keys.at(1).type == chain::ScriptType::P2SH_P2WPKH,
               QStringLiteral("zpub and ypub are read as native and nested SegWit"));
-        check(wallet::WalletStore::accountsFromPublicKeys({first.at(2).xpub}, false, &keys, &error) && keys.size() == 1
+        check(keysOf({first.at(2).xpub}, {}, legacy, &keys) && keys.size() == 1
                   && keys.first().type == chain::ScriptType::P2PKH,
-              QStringLiteral("an xpub is Bitcoin legacy by default"));
-        check(wallet::WalletStore::accountsFromPublicKeys({first.at(3).xpub}, true, &keys, &error) && keys.size() == 1
+              QStringLiteral("an xpub is read as the Bitcoin type chosen"));
+        check(keysOf({}, {first.at(3).xpub}, legacy, &keys) && keys.size() == 1
                   && keys.first().type == chain::ScriptType::EthAccount,
-              QStringLiteral("an xpub is Ethereum when asked"));
-        check(!wallet::WalletStore::accountsFromPublicKeys({QStringLiteral("not a key")}, false, &keys, &error)
-                  && error.contains(QLatin1Char('1')) && !error.contains(QStringLiteral("not a key")),
+              QStringLiteral("an Ethereum key is an Ethereum account"));
+        check(!keysOf({}, {first.at(0).xpub}, legacy, &keys) && error.contains(QStringLiteral("Ethereum key 1")),
+              QStringLiteral("a zpub is refused as an Ethereum key"));
+        check(keysOf(accountsText(first, 3), {first.at(3).xpub}, legacy, &keys) && keys.size() == 4,
+              QStringLiteral("all four keys the Public keys dialog shows go in as one wallet"));
+
+        // A SegWit account written with the xpub prefix: the same node, kept as its
+        // type is stored, so it shows the same addresses as the zpub of that account.
+        const chain::HdPubKey nativeNode = first.at(0).node();
+        const QString asXpub = QString::fromStdString(nativeNode.serialize(chain::xpubVersion::kXpub));
+        check(keysOf({asXpub}, {}, chain::ScriptType::P2WPKH, &keys) && keys.size() == 1
+                  && keys.first().type == chain::ScriptType::P2WPKH && keys.first().xpub == first.at(0).xpub,
+              QStringLiteral("an xpub chosen as native SegWit becomes that account's zpub"));
+        check(wallet::WalletStore::addressSetId(keys.first()) == wallet::WalletStore::addressSetId(first.at(0)),
+              QStringLiteral("and the two count as the same addresses"));
+        check(keysOf({asXpub}, {}, legacy, &keys) && keys.size() == 1
+                  && wallet::WalletStore::addressSetId(keys.first()) != wallet::WalletStore::addressSetId(first.at(0)),
+              QStringLiteral("the same node read as legacy is another set of addresses"));
+
+        // The same node under other metadata: other text, the same addresses.
+        const chain::HdPubKey parsed = first.at(0).node();
+        const chain::HdPubKey relabelled = chain::HdPubKey::fromParts(parsed.publicKey(), parsed.chainCode(), parsed.depth(),
+                                                                      0, parsed.childNumber());
+        const QString otherText = QString::fromStdString(relabelled.serialize(chain::xpubVersion::kZpub));
+        check(otherText != first.at(0).xpub, QStringLiteral("a key with another parent fingerprint reads differently"));
+        check(keysOf({otherText}, {}, legacy, &keys) && keys.size() == 1
+                  && wallet::WalletStore::addressSetId(keys.first()) == wallet::WalletStore::addressSetId(first.at(0)),
+              QStringLiteral("yet counts as the same addresses"));
+        check(!keysOf({first.at(0).xpub, otherText}, {}, legacy, &keys) && error.contains(QStringLiteral("repeats")),
+              QStringLiteral("so the two are refused together"));
+
+        check(!keysOf({QStringLiteral("not a key")}, {}, legacy, &keys) && error.contains(QStringLiteral("Bitcoin key 1"))
+                  && !error.contains(QStringLiteral("not a key")),
               QStringLiteral("a bad key is named by its number, never quoted"));
         const chain::HdKey master = chain::HdKey::fromSeed(chain::Bytes(32, 7));
         const QString masterKey = QString::fromStdString(master.neuter().serialize(chain::xpubVersion::kXpub));
-        check(!wallet::WalletStore::accountsFromPublicKeys({masterKey}, false, &keys, &error),
-              QStringLiteral("a key from another depth is refused"));
-        check(!wallet::WalletStore::accountsFromPublicKeys({first.at(0).xpub, first.at(0).xpub}, false, &keys, &error),
+        check(!keysOf({masterKey}, {}, legacy, &keys), QStringLiteral("a key from another depth is refused"));
+        check(!keysOf({first.at(0).xpub, first.at(0).xpub}, {}, legacy, &keys),
               QStringLiteral("the same account twice is refused"));
+
+        // What save() reports is what it wrote.
+        QByteArray digest;
+        done(afterRemove.save(&error, &digest), QStringLiteral("a save reports a digest"));
+        QFile written(wallet::WalletStore::filePath());
+        const QByteArray writtenBytes = written.open(QIODevice::ReadOnly) ? written.readAll() : QByteArray();
+        written.close();
+        check(!digest.isEmpty() && digest == QCryptographicHash::hash(writtenBytes, QCryptographicHash::Sha256),
+              QStringLiteral("and it is the digest of the file"));
+        QFile::remove(wallet::WalletStore::filePath());
 
         // The address model, per wallet.
         wallet::WalletModel model;
@@ -192,6 +249,105 @@ StoreTestResult runStoreTest()
         check(model.total(wallet::Asset::BTC) == chain::Amount::fromU64(500) && model.counts(1).rows == 0
                   && model.fundedCount() == 1,
               QStringLiteral("and leaves only its totals and counts"));
+
+        // The controller: what it does to a wallet.dat it did not write. Nothing
+        // here reaches the network: no event loop runs while it is alive.
+        const QList<wallet::AccountKey> third = accountsOf(kThirdMnemonic);
+        const QString filePath = wallet::WalletStore::filePath();
+        const auto asideFiles = [] {
+            return QDir(wallet::WalletStore::dataDir())
+                .entryList({QStringLiteral("wallet.dat.unread-*")}, QDir::Files);
+        };
+        const auto zpubOf = [](const QList<wallet::AccountKey>& accounts) {
+            return QList<wallet::AccountKey>{accounts.first()};
+        };
+        {
+            // A readable file that appears after the start is not moved away.
+            WalletController controller;
+            check(!controller.loadExisting(&error) && error.isEmpty(), QStringLiteral("no file: no wallet, no error"));
+            wallet::WalletStore other;
+            other.wallets.append(entryOf(other.takeWalletId(), QStringLiteral("Restored"), first));
+            done(other.save(&error), QStringLiteral("a file appears after the start"));
+            check(!controller.addKeysWallet(zpubOf(third), QStringLiteral("New"), &error)
+                      && error.contains(QStringLiteral("restart")),
+                  QStringLiteral("adding says to restart instead of moving it"));
+            check(asideFiles().isEmpty(), QStringLiteral("nothing was moved"));
+            wallet::WalletStore reread2;
+            check(reread2.load(&error) && reread2.wallets.size() == 1
+                      && reread2.wallets.first().label == QStringLiteral("Restored"),
+                  QStringLiteral("and the file still holds its wallet"));
+        }
+        QFile::remove(filePath);
+        {
+            // A file that cannot be read is kept, and the user is told where.
+            QFile damaged(filePath);
+            done(damaged.open(QIODevice::WriteOnly) && damaged.write("not a wallet file") > 0,
+                 QStringLiteral("a damaged wallet.dat is in place"));
+            damaged.close();
+            WalletController controller;
+            QStringList notices;
+            QObject::connect(&controller, &WalletController::errorOccurred, &controller,
+                             [&notices](wallet::Problem kind, const QString& message, const QString&) {
+                                 if (kind == wallet::Problem::FileSetAside)
+                                     notices << message;
+                             });
+            check(!controller.loadExisting(&error) && !error.isEmpty(), QStringLiteral("it does not load, and says so"));
+            done(controller.addKeysWallet(zpubOf(third), QStringLiteral("New"), &error),
+                 QStringLiteral("a wallet can still be added"));
+            const QStringList aside = asideFiles();
+            check(aside.size() == 1, QStringLiteral("the damaged file is kept aside"));
+            QFile kept(QDir(wallet::WalletStore::dataDir()).filePath(aside.value(0)));
+            const QByteArray keptBytes = kept.open(QIODevice::ReadOnly) ? kept.readAll() : QByteArray();
+            kept.close();
+            check(keptBytes == "not a wallet file", QStringLiteral("unchanged"));
+            check(notices.size() == 1 && notices.first().contains(aside.value(0)),
+                  QStringLiteral("the user is told its new name"));
+            wallet::WalletStore reread3;
+            check(reread3.load(&error) && reread3.wallets.size() == 1, QStringLiteral("the new file holds the new wallet"));
+
+            // Other text, same addresses: refused as well.
+            const chain::HdPubKey node = third.first().node();
+            wallet::AccountKey relabelled = third.first();
+            relabelled.xpub = QString::fromStdString(
+                chain::HdPubKey::fromParts(node.publicKey(), node.chainCode(), node.depth(), 0, node.childNumber())
+                    .serialize(chain::xpubVersion::kZpub));
+            check(relabelled.xpub != third.first().xpub
+                      && !controller.addKeysWallet({relabelled}, QStringLiteral("Again"), &error)
+                      && error.contains(QStringLiteral("already has these keys")),
+                  QStringLiteral("the same addresses under other key text are refused"));
+
+            // Smaller gaps: what they would leave out.
+            wallet::ScanSettings settings = controller.store().settings;
+            const quint32 own = controller.store().wallets.first().id;
+            wallet::AddressRow lowRow = rowOf(own, 0, 0);
+            lowRow.used = true;
+            controller.model()->upsert(lowRow);
+            controller.model()->upsert(rowOf(own, 150, 700));
+            settings.btcReceiveGap = 200;
+            check(controller.gapImpact(settings).used == 0, QStringLiteral("a gap of 200 reaches an address at index 150"));
+            settings.btcReceiveGap = 100;
+            const WalletController::GapImpact impact = controller.gapImpact(settings);
+            check(impact.used == 1 && impact.funded == 1,
+                  QStringLiteral("a gap of 100 leaves it out, with its balance"));
+            controller.model()->clear();
+
+            // Remove all takes the files kept aside too.
+            done(controller.removeAllWallets(&error), QStringLiteral("every wallet can be removed"));
+            check(!QFile::exists(filePath) && asideFiles().isEmpty(),
+                  QStringLiteral("which leaves neither wallet.dat nor the file kept aside"));
+        }
+        {
+            // A file changed outside this window is not this window's to delete.
+            WalletController controller;
+            done(controller.addKeysWallet(zpubOf(third), QStringLiteral("One"), &error),
+                 QStringLiteral("a wallet is added"));
+            wallet::WalletStore other;
+            other.wallets.append(entryOf(other.takeWalletId(), QStringLiteral("Another window's"), first));
+            done(other.save(&error), QStringLiteral("another window writes the file"));
+            check(!controller.removeAllWallets(&error) && error.contains(QStringLiteral("changed outside")),
+                  QStringLiteral("remove all is refused"));
+            check(QFile::exists(filePath), QStringLiteral("and the file stays"));
+        }
     } catch (const std::exception& e) {
         check(false, QStringLiteral("threw: ") + QString::fromUtf8(e.what()));
     }

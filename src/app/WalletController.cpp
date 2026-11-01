@@ -12,8 +12,10 @@
 #include <QCryptographicHash>
 #include <QDate>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QLocale>
 #include <QLockFile>
 #include <QLoggingCategory>
@@ -359,11 +361,6 @@ bool WalletController::addKeysWallet(const QList<wallet::AccountKey>& keys, cons
 bool WalletController::addWallet(QList<wallet::AccountKey> accounts, const QString& label,
                                  bool fromKeys, const QString& what, QString* error)
 {
-    const QString blocker = walletSaveBlocker();
-    if (!blocker.isEmpty()) {
-        setError(error, what + QStringLiteral(": ") + blocker);
-        return false;
-    }
     if (store_.wallets.size() >= wallet::WalletStore::kMaxWallets) {
         setError(error, QStringLiteral("%1: GitWallet keeps at most %2 wallets.")
                             .arg(what)
@@ -371,16 +368,30 @@ bool WalletController::addWallet(QList<wallet::AccountKey> accounts, const QStri
         return false;
     }
     // One set of addresses has one owner: the scanners and the totals count each
-    // address once.
-    for (const wallet::WalletEntry& other : std::as_const(store_.wallets)) {
-        for (const wallet::AccountKey& theirs : other.accounts) {
-            for (const wallet::AccountKey& ours : std::as_const(accounts)) {
-                if (theirs.xpub == ours.xpub) {
+    // address once. By what decides the addresses, not by the text of the key.
+    try {
+        QSet<QByteArray> ours;
+        for (const wallet::AccountKey& key : std::as_const(accounts))
+            ours.insert(wallet::WalletStore::addressSetId(key));
+        for (const wallet::WalletEntry& other : std::as_const(store_.wallets)) {
+            for (const wallet::AccountKey& theirs : other.accounts) {
+                if (ours.contains(wallet::WalletStore::addressSetId(theirs))) {
                     setError(error, QStringLiteral("%1: wallet “%2” already has these keys.").arg(what, other.label));
                     return false;
                 }
             }
         }
+    } catch (const std::exception&) {
+        setError(error, what + QStringLiteral(": a public key could not be read."));
+        return false;
+    }
+
+    // Last before the save: nothing is moved for an add refused above.
+    QString movedTo;
+    const QString blocker = walletSaveBlocker(&movedTo);
+    if (!blocker.isEmpty()) {
+        setError(error, what + QStringLiteral(": ") + blocker);
+        return false;
     }
 
     wallet::WalletEntry entry;
@@ -397,16 +408,25 @@ bool WalletController::addWallet(QList<wallet::AccountKey> accounts, const QStri
     // keep running as they were.
     store_.wallets.append(entry);
     QString saveError;
-    if (!store_.save(&saveError)) {
+    if (!saveStore(&saveError)) {
         store_.wallets.removeLast();
+        // The file moved aside goes back, so the next start warns about it again.
+        if (!movedTo.isEmpty())
+            QFile::rename(movedTo, wallet::WalletStore::filePath());
         setError(error, storeMessage(saveError, QStringLiteral("The wallet could not be saved.")));
         return false;
     }
-    fileDigest_ = diskDigest().value_or(QByteArray()); // the file just written
 
     restartServices();
     emit walletChanged();
     emit statusChanged();
+    if (!movedTo.isEmpty()) {
+        emit errorOccurred(wallet::Problem::FileSetAside,
+                           QStringLiteral("The old wallet.dat could not be read, so it was kept as %1. "
+                                          "Wallets it holds are not shown here.")
+                               .arg(QDir::toNativeSeparators(movedTo)),
+                           QString());
+    }
     return true;
 }
 
@@ -429,12 +449,11 @@ bool WalletController::removeWallet(quint32 id, QString* error)
     // wallets loads as "no wallet yet").
     const wallet::WalletEntry removed = store_.wallets.takeAt(position);
     QString why;
-    if (!store_.save(&why)) {
+    if (!saveStore(&why)) {
         store_.wallets.insert(position, removed);
         setError(error, storeMessage(why, QStringLiteral("The wallet could not be saved.")));
         return false;
     }
-    fileDigest_ = diskDigest().value_or(QByteArray()); // the file just written
 
     stopServices();
     model_->removeWallet(id);
@@ -461,12 +480,11 @@ bool WalletController::renameWallet(quint32 id, const QString& label, QString* e
         if (w.id != id) continue;
         const QString previous = std::exchange(w.label, clean);
         QString why;
-        if (!store_.save(&why)) {
+        if (!saveStore(&why)) {
             w.label = previous;
             setError(error, storeMessage(why, QStringLiteral("The wallet could not be saved.")));
             return false;
         }
-        fileDigest_ = diskDigest().value_or(QByteArray()); // the file just written
         emit walletChanged(); // no scanner cares about a name
         return true;
     }
@@ -479,6 +497,13 @@ bool WalletController::removeAllWallets(QString* error)
     // Checked first, so a refusal leaves the scan running as it was.
     if (!lockDataDir()) {
         setError(error, QStringLiteral("The wallets were not removed: ") + inUseElsewhere());
+        return false;
+    }
+    // Like every other write: what this window never saw is not its to delete.
+    const std::optional<QByteArray> disk = diskDigest();
+    if (!disk || (!disk->isEmpty() && *disk != fileDigest_)) {
+        setError(error, QStringLiteral("The wallets were not removed: wallet.dat was changed outside this "
+                                       "window; restart GitWallet to load it."));
         return false;
     }
     stopServices();
@@ -502,10 +527,53 @@ bool WalletController::removeAllWallets(QString* error)
     }
 
     fileDigest_.clear(); // no file any more
+    // "Every wallet": the unread files an add kept aside hold wallets too.
+    const QDir folder(wallet::WalletStore::dataDir());
+    const QStringList aside = folder.entryList({QStringLiteral("wallet.dat.unread-*")}, QDir::Files);
+    for (const QString& name : aside)
+        QFile::remove(folder.filePath(name));
     model_->clear();
     emit walletChanged();
     emit statusChanged();
     return true;
+}
+
+WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettings& settings) const
+{
+    struct Row {
+        quint32 index;
+        bool funded;
+    };
+    QHash<QString, QList<Row>> chains;
+    QHash<QString, int> gaps;
+    const wallet::ScanSettings s = sanitized(settings);
+    for (int i = 0; i < model_->size(); ++i) {
+        const wallet::AddressRow& r = model_->at(i);
+        const bool funded = r.state() == wallet::AddressState::Funded;
+        if (!r.used && !funded)
+            continue;
+        const QString key = QStringLiteral("%1/%2/%3/%4").arg(r.wallet).arg(int(r.type)).arg(r.account).arg(r.change);
+        chains[key].append({r.index, funded});
+        gaps[key] = !r.isBitcoin() ? s.ethGap : r.change == 0 ? s.btcReceiveGap : s.btcChangeGap;
+    }
+    GapImpact impact;
+    for (auto it = chains.begin(); it != chains.end(); ++it) {
+        std::sort(it->begin(), it->end(), [](const Row& a, const Row& b) { return a.index < b.index; });
+        const qint64 gap = gaps.value(it.key());
+        qint64 last = -1;
+        bool cut = false;
+        for (const Row& row : std::as_const(*it)) {
+            cut = cut || qint64(row.index) > last + gap;
+            if (!cut) {
+                last = row.index;
+                continue;
+            }
+            ++impact.used;
+            if (row.funded)
+                ++impact.funded;
+        }
+    }
+    return impact;
 }
 
 bool WalletController::applySettings(const wallet::ScanSettings& settings, QString* error)
@@ -525,12 +593,11 @@ bool WalletController::applySettings(const wallet::ScanSettings& settings, QStri
     const QString blocker = settingsSaveBlocker();
     if (blocker.isEmpty()) {
         QString why;
-        if (!store_.save(&why)) {
+        if (!saveStore(&why)) {
             store_.settings = previous;
             setError(error, storeMessage(why, QStringLiteral("The settings could not be saved.")));
             return false;
         }
-        fileDigest_ = diskDigest().value_or(QByteArray()); // the file just written
         saved = true;
     } else {
         // In memory only, used by a wallet added in this session. Shown in a
@@ -541,8 +608,14 @@ bool WalletController::applySettings(const wallet::ScanSettings& settings, QStri
     // The model keeps its rows: the restarted scanners adopt them instead of
     // deriving them again, and their last known state stays on screen
     // meanwhile; the Bitcoin scanner still checks every status again from
-    // index 0.
+    // index 0. Not after a smaller gap: rows past the new windows would stay on
+    // screen unfollowed until the next start drops them, so they go now.
+    const wallet::ScanSettings now = store_.settings;
+    const bool gapsDown = now.btcReceiveGap < previous.btcReceiveGap || now.btcChangeGap < previous.btcChangeGap
+                          || now.ethGap < previous.ethGap;
     stopServices();
+    if (gapsDown)
+        model_->clear();
     startServices();
     emit statusChanged();
     return saved;
@@ -812,14 +885,35 @@ bool WalletController::accountUnscanned() const
     // (problem(), Skipped) and finish without it. Asked only once nothing is
     // scanning, when every chain that can be scanned has its first rows.
     // Index 1 counts as well, for an index 0 that BIP32 skips for having no key.
-    const auto hasRows = [this](const wallet::AccountKey& a, quint32 change) {
+    const QList<wallet::AccountKey> accounts = store_.allAccounts();
+    return std::any_of(accounts.cbegin(), accounts.cend(),
+                       [this](const wallet::AccountKey& a) { return !accountHasRows(a); });
+}
+
+bool WalletController::accountHasRows(const wallet::AccountKey& a) const
+{
+    const auto hasRows = [this, &a](quint32 change) {
         return model_->find(a.wallet, a.type, a.account, change, 0) >= 0
                || model_->find(a.wallet, a.type, a.account, change, 1) >= 0;
     };
-    const QList<wallet::AccountKey> accounts = store_.allAccounts();
-    return std::any_of(accounts.cbegin(), accounts.cend(), [&hasRows](const wallet::AccountKey& a) {
-        return !hasRows(a, 0) || (chain::isBitcoin(a.type) && !hasRows(a, 1));
-    });
+    return hasRows(0) && (!chain::isBitcoin(a.type) || hasRows(1));
+}
+
+bool WalletController::walletHasAllRows(const wallet::WalletEntry& entry) const
+{
+    return std::all_of(entry.accounts.cbegin(), entry.accounts.cend(),
+                       [this](const wallet::AccountKey& a) { return accountHasRows(a); });
+}
+
+bool WalletController::saveStore(QString* why)
+{
+    // What was written, not a read of the file afterwards: a program holding the
+    // file for a moment must not make every later save look like a foreign change.
+    QByteArray digest;
+    if (!store_.save(why, &digest))
+        return false;
+    fileDigest_ = digest;
+    return true;
 }
 
 bool WalletController::lockDataDir()
@@ -868,7 +962,7 @@ QString WalletController::settingsSaveBlocker()
     return QString();
 }
 
-QString WalletController::walletSaveBlocker()
+QString WalletController::walletSaveBlocker(QString* movedTo)
 {
     const QString blocker = settingsSaveBlocker();
     if (blocker.isEmpty() || !fileDigest_.isEmpty() || hasWallet() || !lockDataDir())
@@ -877,12 +971,20 @@ QString WalletController::walletSaveBlocker()
     if (!disk || disk->isEmpty())
         return blocker;
 
-    // A wallet.dat this session never opened (another Windows user's, damaged):
-    // kept beside the new one under a name nothing reads.
+    // A wallet.dat this session never opened. If it opens now (it was only busy
+    // at the start, or a backup was restored since), its wallets are the user's.
+    wallet::WalletStore probe;
+    QString why;
+    if (probe.load(&why))
+        return QStringLiteral("wallet.dat can be read now; restart GitWallet to load it.");
+
+    // Another Windows user's, damaged, or from a newer GitWallet: kept beside the
+    // new one under a name nothing reads.
     const QString aside = wallet::WalletStore::filePath()
                           + QDateTime::currentDateTime().toString(QStringLiteral(".unread-yyyyMMdd-HHmmss"));
     if (!QFile::rename(wallet::WalletStore::filePath(), aside))
         return QStringLiteral("wallet.dat could not be opened, nor moved aside.");
+    *movedTo = aside;
     return QString();
 }
 

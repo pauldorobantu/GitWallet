@@ -19,7 +19,6 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
-#include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -59,35 +58,21 @@ QString totalsText(const WalletController* c)
     return parts.join(QStringLiteral(", "));
 }
 
-// The used addresses a fresh scan finds at these gaps. Walking each chain up from
-// index 0, it stops where more unused addresses than the gap follow the last used
-// one: rows a larger gap found earlier stay in the model but not in the next scan.
-int usedWithinGaps(const WalletController* c)
+// A cell of the Wallets page's table, by wallet name and column title.
+QString walletCell(QTableView* table, const QString& name, const QString& title)
 {
-    const wallet::WalletModel* m = c->model();
-    const wallet::ScanSettings& s = c->store().settings;
-    QHash<QString, QList<quint32>> chains;
-    QHash<QString, int> gaps;
-    for (int i = 0; i < m->size(); ++i) {
-        const wallet::AddressRow& r = m->at(i);
-        if (!r.used)
+    if (!table)
+        return {};
+    const QAbstractItemModel* model = table->model();
+    for (int column = 0; column < model->columnCount(); ++column) {
+        if (model->headerData(column, Qt::Horizontal).toString() != title)
             continue;
-        const QString key = QStringLiteral("%1/%2/%3/%4").arg(r.wallet).arg(int(r.type)).arg(r.account).arg(r.change);
-        chains[key].append(r.index);
-        gaps[key] = !r.isBitcoin() ? s.ethGap : r.change == 0 ? s.btcReceiveGap : s.btcChangeGap;
-    }
-    int found = 0;
-    for (auto it = chains.begin(); it != chains.end(); ++it) {
-        std::sort(it->begin(), it->end());
-        qint64 last = -1;
-        for (const quint32 index : std::as_const(*it)) {
-            if (qint64(index) > last + gaps.value(it.key()))
-                break;
-            ++found;
-            last = index;
+        for (int row = 0; row < model->rowCount(); ++row) {
+            if (model->index(row, 0).data().toString() == name)
+                return model->index(row, column).data().toString();
         }
     }
-    return found;
+    return {};
 }
 
 template <typename T>
@@ -212,6 +197,9 @@ void Walkthrough::buildSteps()
     };
 
     const QString twelveAbandon = QStringLiteral("abandon ").repeated(12).trimmed();
+    // zpub, ypub, xpub (legacy), xpub (Ethereum) of a seed no step adds as words.
+    const QList<wallet::AccountKey> thirdKeys =
+        wallet::WalletStore::deriveAccounts(chain::bip39::split(kThirdTestMnemonic), {});
 
     steps_ = {
         {QStringLiteral("empty-state"), nullptr, nullptr, 5000,
@@ -227,6 +215,17 @@ void Walkthrough::buildSteps()
          [this, importEnabled] {
              expect(true, QStringLiteral("the add-wallet dialog opened"));
              expect(!importEnabled(), QStringLiteral("Add wallet is disabled while the field is empty"));
+             QWidget* focus = window_->findChild<ui::ImportSeedDialog*>()->focusWidget();
+             expect(focus && focus->objectName() == QStringLiteral("seedWords"),
+                    QStringLiteral("a phrase pasted straight away lands in the seed field"));
+         },
+         importDialog},
+        {QStringLiteral("seed-in-name"), [typeName] { typeName(kPublicTestMnemonic); }, nullptr, 3000,
+         [this, importDialog] {
+             auto* name = importDialog()->findChild<QLineEdit*>(QStringLiteral("walletName"));
+             expect(name && name->text().isEmpty(), QStringLiteral("seed words typed as a name are not kept"));
+             expect(visibleText(importDialog()).contains(QStringLiteral("looks like seed words")),
+                    QStringLiteral("and the status says why"));
          },
          importDialog},
         {QStringLiteral("too-few-words"), [typeWords] { typeWords(QStringLiteral("abandon abandon abandon")); },
@@ -335,22 +334,50 @@ void Walkthrough::buildSteps()
         {QStringLiteral("bad-key"), [typeKeys] { typeKeys(QStringLiteral("zpub-not-a-real-key")); }, nullptr, 3000,
          [this, importEnabled, importDialog] {
              expect(!importEnabled(), QStringLiteral("a bad public key: Add wallet stays disabled"));
-             expect(visibleText(importDialog()).contains(QStringLiteral("Key 1 is not")),
+             expect(visibleText(importDialog()).contains(QStringLiteral("Bitcoin key 1 is not")),
                     QStringLiteral("a bad public key: the status names it by number"));
          },
          importDialog},
+        {QStringLiteral("seed-in-keys"), [typeKeys] { typeKeys(kPublicTestMnemonic); }, nullptr, 3000,
+         [this, importEnabled, importDialog] {
+             auto* keys = importDialog()->findChild<QPlainTextEdit*>(QStringLiteral("publicKeys"));
+             expect(keys && keys->toPlainText().isEmpty(), QStringLiteral("seed words in the keys field are not kept"));
+             expect(visibleText(importDialog()).contains(QStringLiteral("look like seed words")),
+                    QStringLiteral("and the status says why"));
+             expect(!importEnabled(), QStringLiteral("and Add wallet stays disabled"));
+         },
+         importDialog},
+        {QStringLiteral("xpub-needs-type"), [typeKeys, thirdKeys] { typeKeys(thirdKeys.value(2).xpub); }, nullptr, 3000,
+         [this, importEnabled, importDialog] {
+             expect(!importEnabled(), QStringLiteral("an xpub alone does not say its type: Add wallet stays disabled"));
+             expect(visibleText(importDialog()).contains(QStringLiteral("Choose what an xpub here is")),
+                    QStringLiteral("the status asks for the type"));
+         },
+         importDialog},
+        {QStringLiteral("xpub-chosen"),
+         [importDialog] {
+             if (auto* kind = importDialog() ? importDialog()->findChild<QComboBox*>(QStringLiteral("xpubKind")) : nullptr)
+                 kind->setCurrentIndex(2); // Legacy
+         },
+         nullptr, 3000,
+         [this, importEnabled, importDialog] {
+             expect(importEnabled(), QStringLiteral("the type chosen enables Add wallet"));
+             const bool shown = visibleText(importDialog()).contains(QStringLiteral("Legacy (P2PKH): 1"));
+             expect(shown, QStringLiteral("and the status shows its first address, a legacy one"));
+         },
+         importDialog},
         {QStringLiteral("keys-typed"),
-         [typeKeys, typeName] {
+         [typeKeys, typeName, thirdKeys] {
              typeName(kKeysName);
-             const QList<wallet::AccountKey> derived =
-                 wallet::WalletStore::deriveAccounts(chain::bip39::split(kThirdTestMnemonic), {});
-             typeKeys(derived.value(0).xpub);
+             typeKeys(thirdKeys.value(0).xpub);
          },
          nullptr, 3000,
          [this, importEnabled, importDialog] {
              expect(importEnabled(), QStringLiteral("a valid zpub enables Add wallet"));
              expect(visibleText(importDialog()).contains(QStringLiteral("1 account key")),
                     QStringLiteral("a valid zpub: the status says so"));
+             expect(visibleText(importDialog()).contains(QStringLiteral(": bc1q")),
+                    QStringLiteral("a valid zpub: the status shows its first address"));
          },
          importDialog},
         {QStringLiteral("keys-added"),
@@ -391,6 +418,28 @@ void Walkthrough::buildSteps()
              }
          },
          nullptr},
+        {QStringLiteral("wallet-states"),
+         [this] {
+             // The page repaints as it comes into view.
+             window_->showPage(QStringLiteral("overview"));
+             window_->showPage(QStringLiteral("wallets"));
+         },
+         nullptr, 3000,
+         [this, walletsTable] {
+             for (const QString& name : {kFirstName, kSecondName, kKeysName}) {
+                 expect(walletCell(walletsTable(), name, QStringLiteral("State")) == QStringLiteral("Up to date"),
+                        QStringLiteral("%1 reads Up to date").arg(name));
+             }
+             expect(walletCell(walletsTable(), kKeysName, QStringLiteral("ETH")) == QStringLiteral("—"),
+                    QStringLiteral("a wallet without an Ethereum key shows no ETH figure, not a zero"));
+             expect(walletCell(walletsTable(), kKeysName, QStringLiteral("USDT")) == QStringLiteral("—"),
+                    QStringLiteral("nor a USDT figure"));
+             expect(walletCell(walletsTable(), kKeysName, QStringLiteral("BTC")) == QStringLiteral("0"),
+                    QStringLiteral("but its checked BTC figure"));
+             expect(walletCell(walletsTable(), kFirstName, QStringLiteral("USDT")) == QStringLiteral("0.00"),
+                    QStringLiteral("a wallet with an Ethereum key shows its checked USDT figure"));
+         },
+         nullptr},
         {QStringLiteral("addresses-of-wallet"),
          [this, selectWallet, walletsPage, clickLater] {
              selectWallet(kSecondName);
@@ -406,22 +455,28 @@ void Walkthrough::buildSteps()
          nullptr},
         {QStringLiteral("export-csv"),
          [this] {
+             // Recorded here: a failed write must not pass on a file left by an earlier run.
              QString error;
-             if (auto* page = window_->findChild<ui::AddressesPage*>())
-                 page->exportCsv(outDir_ + QStringLiteral("/addresses.csv"), &error);
+             auto* page = window_->findChild<ui::AddressesPage*>();
+             expect(page && page->exportCsv(outDir_ + QStringLiteral("/addresses.csv"), &error),
+                    QStringLiteral("the CSV was written") + (error.isEmpty() ? QString() : QStringLiteral(": ") + error));
          },
          nullptr, 3000,
          [this, tableRows] {
              QFile f(outDir_ + QStringLiteral("/addresses.csv"));
              const QByteArray raw = f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
              const QList<QByteArray> lines = raw.trimmed().split('\n');
-             expect(raw.startsWith("\xEF\xBB\xBFwallet,chain,type,path,address,state,BTC,ETH,USDT,USDC,USD"),
+             // The Windows list separator, whichever it is on this PC, follows the first word.
+             const QByteArray start = "\xEF\xBB\xBFwallet";
+             const char separator = raw.size() > start.size() ? raw.at(start.size()) : ',';
+             expect(raw.startsWith(start) && raw.contains("BTC") && raw.contains("USDC"),
                     QStringLiteral("the CSV starts with a BOM and its header"));
              expect(lines.size() == tableRows() + 1,
                     QStringLiteral("the CSV has one line per row shown (%1)").arg(lines.size() - 1));
-             const bool onlyThatWallet = std::all_of(lines.cbegin() + 1, lines.cend(), [](const QByteArray& line) {
-                 return line.startsWith(kSecondName.toUtf8() + ',');
-             });
+             const bool onlyThatWallet =
+                 std::all_of(lines.cbegin() + 1, lines.cend(), [separator](const QByteArray& line) {
+                     return line.startsWith(kSecondName.toUtf8() + separator);
+                 });
              expect(onlyThatWallet, QStringLiteral("and only the wallet the table is narrowed to"));
              auto* page = window_->findChild<ui::AddressesPage*>();
              if (page)
@@ -524,24 +579,46 @@ void Walkthrough::buildSteps()
                     QStringLiteral("Settings offers to remove them all"));
          },
          nullptr},
-        {QStringLiteral("settings-saved"),
+        // The second seed has a used address at index 150 of a chain whose previous
+        // one is index 0: a gap of 100 leaves it out, and that needs a yes.
+        {QStringLiteral("settings-gap-warning"),
          [this, settingsPage] {
              QList<QSpinBox*> spins = settingsPage()->findChildren<QSpinBox*>();
              if (!spins.isEmpty()) spins.first()->setValue(100); // Bitcoin receive gap
              if (QWidget* save = findButton(settingsPage(), QStringLiteral("Save")))
                  static_cast<QAbstractButton*>(save)->click();
          },
-         [controller] { return controller()->store().settings.btcReceiveGap == 100; }, 5000,
+         [confirmBox] { return confirmBox() != nullptr; }, 5000,
+         [this, confirmBox, controller] {
+             expect(confirmBox() && confirmBox()->text().contains(QStringLiteral("leave out")),
+                    QStringLiteral("a smaller gap that leaves used addresses out asks first"));
+             expect(controller()->store().settings.btcReceiveGap == 200, QStringLiteral("and has changed nothing yet"));
+         },
+         [confirmBox]() -> QWidget* { return confirmBox(); }},
+        {QStringLiteral("settings-saved"),
+         [this, confirmBox] {
+             scanFinished_ = false;
+             if (QMessageBox* box = confirmBox())
+                 for (QAbstractButton* b : box->buttons())
+                     if (b->text() == QStringLiteral("Save anyway")) b->click();
+         },
+         [this, controller] {
+             return controller()->store().settings.btcReceiveGap == 100 && scanFinished_
+                    && controller()->balancesComplete();
+         },
+         300000,
          [this, controller] {
              expect(controller()->store().settings.btcReceiveGap == 100,
                     QStringLiteral("Bitcoin receive gap saved as 100"));
+             const quint32 second = controller()->store().wallets.value(1).id;
+             expect(controller()->model()->find(second, chain::ScriptType::P2PKH, 0, 0, 150) < 0,
+                    QStringLiteral("the address it leaves out is gone at once, not at the next start"));
+             expect(controller()->balancesComplete(), QStringLiteral("status: ") + controller()->statusText());
          },
          nullptr},
         {QStringLiteral("reopened"),
          [this, controller] {
-             // Before the gap came down to 100 a second seed's address at index
-             // 150 was found: the reopened window's scan rightly stops short of it.
-             rowsBeforeReopen_ = usedWithinGaps(controller());
+             rowsBeforeReopen_ = controller()->model()->usedCount();
              totalsBeforeReopen_ = totalsText(controller());
              scanFinished_ = false;
              // Close the window like the user would, then start a fresh one:

@@ -909,14 +909,16 @@ void BtcScanner::reportLimits()
     limitReported_ = true;
     static const QLocale english(QLocale::English, QLocale::UnitedStates); // "15,000", as the UI groups
     const QString count = english.toString(qlonglong(tracked_.size()));
-    // Many wallets reach the ceiling on their gaps alone, whatever a server says.
-    qint64 baseRows = 0;
-    for (const Chain& c : std::as_const(chains_)) baseRows += c.base();
-    if (baseRows >= kMaxWalletRows) {
+    // Several wallets share the limit: their addresses add up, whatever a server
+    // says. Another server would stop at the same place.
+    const bool severalWallets = std::any_of(chains_.cbegin(), chains_.cend(), [this](const Chain& c) {
+        return c.wallet != chains_.constFirst().wallet;
+    });
+    if (severalWallets) {
         emit problem(Problem::Limit,
                      QStringLiteral("Bitcoin scan stopped at %1 addresses, the most GitWallet follows on one "
-                                    "connection: these wallets' gaps alone reach it. Lower the gaps in "
-                                    "Settings or remove wallets you do not need here.")
+                                    "connection, shared by all wallets. Lower the gaps in Settings or remove "
+                                    "wallets you do not need here.")
                          .arg(count),
                      QString());
         return;

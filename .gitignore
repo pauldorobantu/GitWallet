@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /dist/
+/dist.old/
 *.user
 .DS_Store
 Thumbs.db

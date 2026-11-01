@@ -374,7 +374,10 @@ void MainWindow::loadWallet()
     if (controller_->loadExisting(&error) || error.isEmpty()) return;
     // The file exists but cannot be read (another Windows user, damaged).
     QMessageBox box(QMessageBox::Warning, QStringLiteral("GitWallet"),
-                    QStringLiteral("The saved wallet could not be opened.\n\n%1").arg(error),
+                    QStringLiteral("The saved wallets could not be opened.\n\n%1\n\nThe file stays as it "
+                                   "is. If you add a wallet now, GitWallet keeps it aside under another "
+                                   "name and says where.")
+                        .arg(error),
                     QMessageBox::Ok, this);
     applyDialogChrome(&box);
     box.exec();
@@ -439,6 +442,11 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
         n.headline = trText(QStringLiteral("Some addresses are not scanned"));
         n.severity = kSeverityIncomplete;
         n.depends = 0; // the wallet's own keys: only another wallet changes that
+        break;
+    case wallet::Problem::FileSetAside:
+        n.key = QStringLiteral("file-set-aside");
+        n.headline = trText(QStringLiteral("The old wallet file was kept aside"));
+        n.depends = 0;
         break;
     }
     return n;

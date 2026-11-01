@@ -35,7 +35,13 @@ after the first gap and miss funds further down.
 All wallets share one Electrum connection, which follows at most 40,000 Bitcoin
 addresses in total: public servers refuse more per client. At the default gaps
 that is about 50 wallets before any is used. GitWallet says so when it stops
-there; lower the gaps in Settings or remove wallets you do not need here.
+there, and every wallet then reads as not whole; lower the gaps in Settings or
+remove wallets you do not need here. Ethereum stops at 200,000 addresses the same
+way.
+
+A plain `xpub` does not say what it is, because wallets write SegWit accounts with
+that prefix too, so GitWallet asks and shows the first address of each key to
+compare with the other wallet.
 
 ## What is stored
 
@@ -48,6 +54,11 @@ spend. A `wallet.dat` from an earlier version loads as one wallet. Starting
 GitWallet again brings the open window to the front instead of opening a second
 one, and only one window at a time writes `wallet.dat`. A CSV export is not
 encrypted: anyone who reads it sees those addresses and balances.
+
+If `wallet.dat` cannot be read (another Windows user's, damaged, from a newer
+GitWallet), it is never overwritten: adding a wallet keeps it beside the new file as
+`wallet.dat.unread-<date>-<time>` and says so. "Remove all wallets" deletes those
+too.
 
 ## Network
 
@@ -117,9 +128,11 @@ build.bat
 ```
 
 This configures with the vcpkg toolchain (Botan, zlib, secp256k1), builds
-`build\GitWallet.exe` and deploys a runnable copy to `dist\` (the exe, Qt and
-the Visual C++ runtime, with the Qt plugins in `dist\lib\plugins`). Start
-`dist\GitWallet.exe`; the `dist` folder can be copied anywhere.
+`build\GitWallet.exe` with Qt beside it and deploys a copy to `dist\` (the exe, Qt
+and the Visual C++ runtime, with the Qt plugins in `dist\lib\plugins`). Start
+`dist\GitWallet.exe`; the `dist` folder can be copied anywhere. Builds are not signed
+yet, so a PC with Smart App Control on blocks them, and Windows Defender may flag a
+new build.
 
 ## Security
 

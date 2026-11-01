@@ -290,6 +290,15 @@ int main(int argc, char** argv)
             return 2;
         }
     }
+    // These two write and delete wallet.dat as part of the test, so a folder that
+    // already holds one (--data-dir can be a second wallet) is not theirs to use.
+    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--store-test")}) {
+        if (args.contains(name) && QFile::exists(wallet::WalletStore::filePath())) {
+            attachParentConsole();
+            std::fprintf(stderr, "%s needs a --data-dir without a wallet.dat\n", qPrintable(name));
+            return 2;
+        }
+    }
 
     // --store-test: the wallet file and the address model without a window or a
     // network, on the separate --data-dir checked above.
@@ -304,7 +313,9 @@ int main(int argc, char** argv)
 
     app::ui::theme::ThemeManager::instance()->loadFromSettings();
     app::ui::theme::ThemeManager::instance()->apply();
-    app::ui::LanguageManager::instance()->loadFromSettings();
+    // The walkthrough finds buttons by their English text, whatever this user chose.
+    if (!args.contains(QStringLiteral("--walkthrough")))
+        app::ui::LanguageManager::instance()->loadFromSettings();
 
     if (!st.ok) {
         QMessageBox::critical(

@@ -4,6 +4,7 @@
 
 #include <QByteArray>
 #include <QLayout>
+#include <QScreen>
 #include <QWidget>
 
 #ifdef Q_OS_WIN
@@ -20,8 +21,11 @@ constexpr int kResizeBorder = 6;
 void initShellWindow(QWidget* window)
 {
     window->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
-    window->resize(page::kWindowSize);
-    window->setMinimumSize(page::kWindowMinSize);
+    // Never larger than the screen: a frameless window has its Close button and
+    // the pages' action bars at its far edges.
+    const QSize room = window->screen()->availableGeometry().size();
+    window->setMinimumSize(page::kWindowMinSize.boundedTo(room));
+    window->resize(page::kWindowSize.boundedTo(room));
 }
 
 ShellPlacement shellPlacement(const QWidget* window)

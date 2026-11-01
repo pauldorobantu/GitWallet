@@ -354,8 +354,11 @@ bool OverviewPage::syncPending()
         moved = true;
     }
     // From the model's size, not a signal's range: a listener that upserts
-    // from inside another one's slot makes appends arrive out of order.
-    rowPending_.reserve(size);
+    // from inside another one's slot makes appends arrive out of order. Reserved
+    // for a burst only: reserve() allocates exactly what it is asked for, and
+    // this runs once per row during a scan, which would copy the list every time.
+    if (size - rowPending_.size() > 1)
+        rowPending_.reserve(size);
     for (qsizetype i = rowPending_.size(); i < size; ++i) {
         const quint32 mask = pendingMask(model->at(int(i)));
         rowPending_.append(mask);
@@ -418,7 +421,10 @@ void OverviewPage::refreshView()
     const QList<wallet::AccountKey> accounts = controller_->store().allAccounts();
     bool btcMissing = false;
     bool ethMissing = false;
+    bool btcWatched = false;
+    bool ethWatched = false;
     for (const wallet::AccountKey& account : accounts) {
+        (chain::isBitcoin(account.type) ? btcWatched : ethWatched) = true;
         if (model && model->find(account.wallet, account.type, account.account, 0, 0) >= 0)
             continue;
         (chain::isBitcoin(account.type) ? btcMissing : ethMissing) = true;
@@ -467,6 +473,13 @@ void OverviewPage::refreshView()
     for (qsizetype i = 0; i < list.size() && i < amountLabels_.size(); ++i) {
         const wallet::AssetInfo& info = list.at(i);
         const bool bitcoin = info.asset == wallet::Asset::BTC;
+        // No wallet has a key on this chain: nothing was looked at, so no zero.
+        if (!(bitcoin ? btcWatched : ethWatched)) {
+            amountLabels_.at(i)->setText(dash());
+            usdLabels_.at(i)->setText(bitcoin ? trText(QStringLiteral("No wallet has a Bitcoin key"))
+                                              : trText(QStringLiteral("No wallet has an Ethereum key")));
+            continue;
+        }
         const double price = prices ? prices->usd(info.symbol) : 0.0;
         const int pending = pendingPerAsset_.value(i);
         const bool unchecked = pending > 0 || (bitcoin ? btcMissing : ethMissing);

@@ -65,9 +65,22 @@ public:
     bool removeWallet(quint32 id, QString* error);
     bool renameWallet(quint32 id, const QString& label, QString* error);
 
-    // Deletes wallet.dat, settings included, stops scanning and clears the
-    // model. Refused while another GitWallet process holds the data folder.
+    // Deletes wallet.dat, settings included, with any unread file an add kept
+    // aside, stops scanning and clears the model. Refused while another GitWallet
+    // process holds the data folder, or when the file changed after this window read it.
     bool removeAllWallets(QString* error);
+
+    // Addresses with history that `settings` would leave out: a fresh scan walks
+    // each chain from index 0 and stops once a gap of unused addresses follows the
+    // last used one.
+    struct GapImpact {
+        int used = 0;   // used addresses past where the scan would stop
+        int funded = 0; // those holding a balance
+    };
+    GapImpact gapImpact(const wallet::ScanSettings& settings) const;
+
+    // Every account of the wallet has rows, on both chains of a Bitcoin account.
+    bool walletHasAllRows(const wallet::WalletEntry& entry) const;
 
     // Saves new scan settings and restarts the scanners / clients with them.
     // When wallet.dat is not this session's to write (another process holds
@@ -146,9 +159,13 @@ private:
     bool addWallet(QList<wallet::AccountKey> accounts, const QString& label, bool fromKeys,
                    const QString& what, QString* error);
     // Empty when the wallet list may be written to wallet.dat now, else why not.
-    // A file that never opened is moved aside first: it may hold other wallets
-    // and still open for the right Windows user, so it is never overwritten.
-    QString walletSaveBlocker();
+    // A wallet.dat that opens after all is left alone (the answer says to restart).
+    // One that still cannot be read is moved aside, its new name in `movedTo`: it
+    // may hold other wallets and open later for the right Windows user or a newer
+    // GitWallet, so it is never overwritten.
+    QString walletSaveBlocker(QString* movedTo);
+    bool saveStore(QString* why); // writes wallet.dat and remembers what it wrote
+    bool accountHasRows(const wallet::AccountKey& account) const;
     void restartServices(); // stop + start, keeping the model's rows
 
     wallet::WalletStore store_;

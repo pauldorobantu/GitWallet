@@ -30,9 +30,10 @@ public:
     static QString filePath(); // dataDir() + "/wallet.dat"
 
     bool exists() const;
-    bool load(QString* error);       // false + error on a damaged / foreign file
-    bool save(QString* error) const; // atomic (QSaveFile)
-    bool remove(QString* error);     // deletes wallet.dat and resets this object
+    bool load(QString* error); // false + error on a damaged / foreign file
+    // Atomic (QSaveFile). `digest`, if given, receives the SHA-256 of what was written.
+    bool save(QString* error, QByteArray* digest = nullptr) const;
+    bool remove(QString* error); // deletes wallet.dat and resets this object
 
     // From a validated mnemonic: derives m/84'/0'/0', m/49'/0'/0', m/44'/0'/0'
     // and m/44'/60'/0' (account 0), keeps only their xpubs and scrubs the seed
@@ -40,12 +41,20 @@ public:
     static QList<AccountKey> deriveAccounts(const std::vector<std::string>& words,
                                             const std::string& passphrase);
 
-    // Account-level public keys as other wallets export them: zpub is native
-    // SegWit, ypub nested SegWit, and an xpub is Bitcoin legacy or, with
-    // `xpubIsEthereum`, an Ethereum account (its prefix cannot tell the two
-    // apart). False + a sentence naming the 1-based key, never quoting it.
-    static bool accountsFromPublicKeys(const QStringList& keys, bool xpubIsEthereum,
-                                       QList<AccountKey>* out, QString* why);
+    // Account-level public keys as other wallets export them. Among `bitcoinKeys`
+    // a zpub is native SegWit and a ypub nested SegWit; an xpub is read as `xpubType`,
+    // since many wallets write SegWit accounts with that prefix too and the prefix
+    // cannot tell. `ethereumKeys` are Ethereum accounts, always xpubs. Each key is
+    // kept in the form its type is stored with. False + a sentence naming the key
+    // by chain and number, never quoting it.
+    static bool accountsFromPublicKeys(const QStringList& bitcoinKeys, const QStringList& ethereumKeys,
+                                       chain::ScriptType xpubType, QList<AccountKey>* out, QString* why);
+
+    // What decides a key's addresses: its type, public key and chain code. Two keys
+    // with the same id show the same addresses, however their text differs (a
+    // parent fingerprint or child number is not part of it). Throws on a key that
+    // does not parse.
+    static QByteArray addressSetId(const AccountKey& key);
 
     // A name as stored: one line, without control characters, at most
     // kMaxLabelChars long. May come back empty.

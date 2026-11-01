@@ -1,6 +1,7 @@
 #include "ui/pages/WalletsPage.h"
 
 #include "app/WalletController.h"
+#include "chain/Address.h"
 #include "net/PriceFeed.h"
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
@@ -19,6 +20,7 @@
 #include <QAbstractTableModel>
 #include <QDialog>
 #include <QFormLayout>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
@@ -31,6 +33,7 @@
 #include <QVBoxLayout>
 
 #include <exception>
+#include <utility>
 
 namespace app::ui {
 
@@ -67,8 +70,19 @@ bool numericColumn(int column)
     return column >= ColAddresses && column <= ColUsd;
 }
 
-// The wallets of the store, read live from the controller. Rows only come and go
-// on walletChanged; between those the figures repaint.
+// What the State column says of a wallet, the most pressing first.
+enum class RowState {
+    Limit,      // the scan was cut at the address limit: any wallet's figures may be low
+    Scanning,   // an account has no rows yet, and a scan is on its way to them
+    NotScanned, // an account has no rows, and nothing is on its way to them
+    Checking,   // rows without an answer yet
+    LastKnown,  // every row has answered once, but the balances are not current now
+    UpToDate,
+};
+
+// The wallets of the store, read from the controller. Rows only come and go on
+// walletChanged; between those the figures repaint. What takes more than a lookup
+// is read once per repaint, so that a table of hundreds of wallets stays cheap.
 class WalletTableModel : public QAbstractTableModel
 {
 public:
@@ -81,13 +95,16 @@ public:
     {
         beginResetModel();
         wallets_ = controller_ ? controller_->store().wallets : QList<wallet::WalletEntry>();
+        takeSnapshot();
         endResetModel();
     }
 
     void repaintFigures()
     {
-        if (!wallets_.isEmpty())
-            emit dataChanged(index(0, ColAddresses), index(int(wallets_.size()) - 1, ColumnCount - 1));
+        if (wallets_.isEmpty())
+            return;
+        takeSnapshot();
+        emit dataChanged(index(0, ColAddresses), index(int(wallets_.size()) - 1, ColumnCount - 1));
     }
 
     int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : int(wallets_.size()); }
@@ -122,8 +139,13 @@ public:
         const wallet::WalletEntry& entry = wallets_.at(index.row());
         const int column = index.column();
         const wallet::WalletCounts counts = model->counts(entry.id);
-        // No row yet, or one without its answer: a zero is no answer.
-        const bool complete = counts.rows > 0 && counts.checked == counts.rows;
+        const Shown shown = shown_.value(entry.id);
+        const RowState state = stateOf(counts, shown);
+        // A figure reads plain only once every balance behind it has answered and
+        // the scan reached all it should: a zero with an address nobody looked at
+        // behind it is no answer. Figures from an earlier moment (LastKnown) stay
+        // plain, and the State column says so, as on the Overview.
+        const bool complete = state == RowState::LastKnown || state == RowState::UpToDate;
 
         // Amounts format through chain::Amount (Botan): nothing may throw out of
         // a model call into Qt's painting or sorting.
@@ -135,11 +157,17 @@ public:
                 return numericColumn(column) ? QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter))
                                              : QVariant();
             case Qt::ForegroundRole:
-                if (column == ColState && !complete)
-                    return toneColor(Tone::Muted);
-                if (column == ColState)
-                    return toneColor(Tone::Success);
-                return {};
+                if (column != ColState)
+                    return {};
+                switch (state) {
+                case RowState::Limit: return toneColor(Tone::Error);
+                case RowState::NotScanned:
+                case RowState::LastKnown: return toneColor(Tone::Warning);
+                case RowState::UpToDate: return toneColor(Tone::Success);
+                case RowState::Scanning:
+                case RowState::Checking: break;
+                }
+                return toneColor(Tone::Muted);
             case kSortRole:
                 if (const wallet::AssetInfo* info = assetOf(column))
                     return model->total(info->asset, entry.id).toDouble(info->decimals);
@@ -149,11 +177,17 @@ public:
                 case ColAddresses: return counts.rows;
                 case ColFunded: return counts.funded;
                 case ColUsd: return controller_->totalUsd(entry.id);
-                case ColState: return complete ? 1 : 0;
+                case ColState: return int(state);
                 default: return {};
                 }
             case Qt::ToolTipRole:
-                return column == ColName ? QVariant(entry.label) : QVariant();
+                if (column == ColName)
+                    return entry.label;
+                if (column == ColState && state != RowState::UpToDate)
+                    return status_; // the whole of it, as the title bar says it
+                if (const wallet::AssetInfo* info = assetOf(column); info && !watches(shown, *info))
+                    return trText(QStringLiteral("This wallet has no key for this chain, so nothing was looked at."));
+                return {};
             case Qt::DisplayRole:
                 break;
             default:
@@ -161,6 +195,8 @@ public:
             }
 
             if (const wallet::AssetInfo* info = assetOf(column)) {
+                if (!watches(shown, *info))
+                    return dash(); // no key on this chain: not a zero
                 const chain::Amount amount = model->total(info->asset, entry.id);
                 if (complete)
                     return formatAmount(amount, *info);
@@ -187,8 +223,14 @@ public:
                 return usd > 0.0 ? atLeast(formatUsd(usd)) : dash();
             }
             case ColState:
-                if (complete)
-                    return trText(QStringLiteral("Up to date"));
+                switch (state) {
+                case RowState::Limit: return trText(QStringLiteral("Address limit reached"));
+                case RowState::Scanning: return trText(QStringLiteral("Scanning"));
+                case RowState::NotScanned: return trText(QStringLiteral("Not fully scanned"));
+                case RowState::LastKnown: return trText(QStringLiteral("Last known"));
+                case RowState::UpToDate: return trText(QStringLiteral("Up to date"));
+                case RowState::Checking: break;
+                }
                 return trText(QStringLiteral("Checking %1 of %2"))
                     .arg(formatCount(counts.checked), formatCount(counts.rows));
             default:
@@ -200,8 +242,53 @@ public:
     }
 
 private:
+    struct Shown {
+        bool allRows = false;  // every account has rows
+        bool bitcoin = false;  // the wallet has a key on that chain
+        bool ethereum = false;
+    };
+
+    static bool watches(const Shown& shown, const wallet::AssetInfo& info)
+    {
+        return info.asset == wallet::Asset::BTC ? shown.bitcoin : shown.ethereum;
+    }
+
+    RowState stateOf(const wallet::WalletCounts& counts, const Shown& shown) const
+    {
+        if (limit_)
+            return RowState::Limit;
+        if (!shown.allRows || counts.rows == 0)
+            return scanning_ ? RowState::Scanning : RowState::NotScanned;
+        if (counts.checked < counts.rows)
+            return RowState::Checking;
+        return current_ ? RowState::UpToDate : RowState::LastKnown;
+    }
+
+    void takeSnapshot()
+    {
+        shown_.clear();
+        if (!controller_)
+            return;
+        limit_ = controller_->addressLimitReached();
+        current_ = controller_->balancesComplete();
+        scanning_ = controller_->isScanning();
+        status_ = controller_->statusText();
+        for (const wallet::WalletEntry& entry : std::as_const(wallets_)) {
+            Shown shown;
+            shown.allRows = controller_->walletHasAllRows(entry);
+            for (const wallet::AccountKey& key : entry.accounts)
+                (chain::isBitcoin(key.type) ? shown.bitcoin : shown.ethereum) = true;
+            shown_.insert(entry.id, shown);
+        }
+    }
+
     WalletController* controller_ = nullptr;
     QList<wallet::WalletEntry> wallets_;
+    QHash<quint32, Shown> shown_;
+    bool limit_ = false;    // the scan is cut at the address limit
+    bool current_ = false;  // every balance is whole and current
+    bool scanning_ = false;
+    QString status_;        // the title bar's line
 };
 
 } // namespace
@@ -257,6 +344,7 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     header->setSortIndicator(-1, Qt::AscendingOrder); // the order they were added in
     header->setSectionResizeMode(QHeaderView::ResizeToContents);
     header->setSectionResizeMode(ColName, QHeaderView::Stretch);
+    header->setResizeContentsPrecision(0); // the rows on screen: hundreds of wallets stay cheap to measure
     root->addWidget(view, 1);
 
     ui_->empty = page::makeEmptyState(
@@ -290,6 +378,8 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     ui_->repaint->setSingleShot(true);
     ui_->repaint->setInterval(kRepaintMs);
     connect(ui_->repaint, &QTimer::timeout, this, [this] {
+        if (!isVisible())
+            return; // showEvent() catches up
         ui_->model->repaintFigures();
         updateState();
     });
@@ -336,6 +426,13 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
         });
     }
     ui_->model->reload();
+    updateState();
+}
+
+void WalletsPage::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    ui_->model->repaintFigures();
     updateState();
 }
 
@@ -422,9 +519,13 @@ void WalletsPage::confirmRemoveSelected()
                                 QMessageBox::NoButton, this);
     box->setTextFormat(Qt::PlainText); // a name is never markup
     box->setInformativeText(
-        QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
-                       "wallets stay as they are. Nothing changes on the blockchain: adding its seed "
-                       "again shows the same addresses."));
+        entry->fromKeys
+            ? QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
+                             "wallets stay as they are. Nothing changes on the blockchain, but this PC has "
+                             "no seed for it: to add it back you need these keys, which Public keys shows now.")
+            : QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
+                             "wallets stay as they are. Nothing changes on the blockchain: adding its seed "
+                             "again shows the same addresses."));
     QPushButton* remove = box->addButton(QStringLiteral("Remove wallet"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));
     QPushButton* cancel = box->addButton(QMessageBox::Cancel);

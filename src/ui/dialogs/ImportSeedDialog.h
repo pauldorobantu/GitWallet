@@ -24,8 +24,10 @@ namespace app::ui {
 // words not in the list, checksum), then goes to
 // WalletController::addMnemonicWallet; the text fields are wiped when the dialog
 // closes, accepted or not, and the seed itself is never written anywhere. Public
-// keys (zpub, ypub, xpub, one per line) need no secret at all: see
-// WalletController::addKeysWallet.
+// keys (zpub, ypub, xpub for Bitcoin, xpub for Ethereum) need no secret at all, and
+// each shows its first address to compare with the other wallet: see
+// WalletController::addKeysWallet. Seed words pasted into the name or a key field
+// are wiped at once, so they cannot become a wallet's name by accident.
 class ImportSeedDialog : public QDialog
 {
     Q_OBJECT
@@ -43,16 +45,17 @@ private:
     void validateKeys();        // the status line + parsedKeys_, on every edit
     void updateImportEnabled();
     void importSeed();
-    void wipeFields();          // overwrites, then empties, both secret editors
+    void wipeFields();          // overwrites, then empties, every text field
 
     WalletController* controller_ = nullptr;
     QLineEdit* name_ = nullptr;
     QComboBox* source_ = nullptr;
     QStackedWidget* pages_ = nullptr;
     QPlainTextEdit* words_ = nullptr;
-    QPlainTextEdit* keys_ = nullptr;
-    QWidget* xpubRow_ = nullptr;   // only while the keys include an xpub
-    QComboBox* xpubKind_ = nullptr;
+    QPlainTextEdit* keys_ = nullptr; // Bitcoin public keys
+    QLineEdit* ethKey_ = nullptr;
+    QWidget* xpubRow_ = nullptr;     // only while the Bitcoin keys include an xpub
+    QComboBox* xpubKind_ = nullptr;  // no default: the wrong type shows other addresses
     QLabel* status_ = nullptr;
     QLabel* info_ = nullptr;
     QCheckBox* hasPassphrase_ = nullptr;

@@ -42,6 +42,12 @@ constexpr int kMaxGap = 100'000;
 // shop seed needs (the controller's largest gap is 5,000), and well below 2^31,
 // where non-hardened BIP32 indices end.
 constexpr qint64 kMaxEthRows = 100'000;
+// Rows derived over all accounts together: wallets add up, and a pass over this
+// many already takes most of an hour at one chunk at a time.
+constexpr qint64 kMaxEthTotalRows = 200'000;
+// Rows derived per event-loop turn when a pass sets up its windows: BtcScanner's
+// slice, so that many wallets or a large gap never freeze the window.
+constexpr qint64 kDeriveSlice = 250;
 // A nonce counts the transactions an address has sent. No mainnet address comes
 // anywhere near 2^32 of them, so a larger one is a malformed reply, not proof
 // that the address was used.
@@ -290,11 +296,17 @@ EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
     // The window assumes its rows exist; after a clear, start over. A stop() or
     // start() the controller issues right after supersedes this restart, since
     // the scan itself only begins on the next event-loop turn. The balances
-    // that balancesAt() dated are gone with the rows, stopped or not.
+    // that balancesAt() dated are gone with the rows, stopped or not, unless other
+    // wallets' rows stayed (one wallet removed): those figures are as old as ever.
     if (model_) {
         connect(model_, &WalletModel::cleared, this, [this] {
-            balancesAt_ = QDateTime();
-            refreshFailing_ = false;
+            bool rowsLeft = false;
+            for (int r = 0; r < model_->size() && !rowsLeft; ++r)
+                rowsLeft = model_->at(r).type == chain::ScriptType::EthAccount;
+            if (!rowsLeft) {
+                balancesAt_ = QDateTime();
+                refreshFailing_ = false;
+            }
             if (running_)
                 start();
         });
@@ -381,6 +393,8 @@ int EthScanner::derivedCount() const
 
 bool EthScanner::limitReached() const
 {
+    if (totalCut_)
+        return true;
     for (const AccountState& a : acc_)
         if (cutAtLimit(a))
             return true;
@@ -431,6 +445,8 @@ void EthScanner::beginScan()
         acc_.append(a);
     }
 
+    totalRows_ = 0;
+    totalCut_ = false;
     const quint64 gen = gen_;
     for (int i = 0; i < acc_.size(); ++i) {
         adoptRows(i);
@@ -514,6 +530,19 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
     const quint64 gen = gen_;
     for (qint64 index = from; index < to; ++index) {
         const quint32 idx = quint32(index);
+        if (totalRows_ >= kMaxEthTotalRows) {
+            // Like the limit per account: what exists stays checked, the rest is
+            // not derived, and the scan stays unfinished instead of looking whole.
+            totalCut_ = true;
+            static const QLocale english(QLocale::English, QLocale::UnitedStates);
+            report({Problem::Limit,
+                    QStringLiteral("Ethereum scan stopped at %1 addresses, the most GitWallet follows, shared by "
+                                   "all wallets. Lower the Ethereum gap in Settings or remove wallets you do not "
+                                   "need here.")
+                        .arg(english.toString(kMaxEthTotalRows)),
+                    QString()});
+            return;
+        }
         if (replace
             || model_->find(acc_.at(i).key.wallet, chain::ScriptType::EthAccount, acc_.at(i).key.account,
                             0, idx) < 0) {
@@ -533,7 +562,10 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
         }
         if (enqueue)
             queue_.append(Slot{i, idx, QString()});
-        acc_[i].end = qMax(acc_.at(i).end, index + 1);
+        if (index + 1 > acc_.at(i).end) {
+            totalRows_ += index + 1 - acc_.at(i).end;
+            acc_[i].end = index + 1;
+        }
     }
 }
 
@@ -554,6 +586,11 @@ bool EthScanner::cutAtLimit(const AccountState& account) const
 // last computed.
 void EthScanner::extendWindow(int i, bool enqueue)
 {
+    extendWindowTo(i, enqueue, windowEnd(acc_.at(i)));
+}
+
+void EthScanner::extendWindowTo(int i, bool enqueue, qint64 upTo)
+{
     AccountState& a = acc_[i];
     if (!a.capReported && cutAtLimit(a)) {
         // Once per account and start(). The passes still check every row up to
@@ -569,9 +606,8 @@ void EthScanner::extendWindow(int i, bool enqueue)
                     .arg(english.toString(kMaxEthRows), where),
                 QString()});
     }
-    const qint64 target = windowEnd(a);
-    if (target > a.end)
-        ensureRows(i, a.end, target, false, enqueue);
+    if (upTo > a.end)
+        ensureRows(i, a.end, upTo, false, enqueue);
 }
 
 // -------------------------------------------------------------- a pass ----
@@ -580,16 +616,36 @@ void EthScanner::extendWindow(int i, bool enqueue)
 // window, checked chunk by chunk, one chunk in flight at a time.
 void EthScanner::startPass()
 {
-    const quint64 gen = gen_;
     passActive_ = true;
     passFailed_ = false;
     passSkipped_ = false;
     queue_.clear();
     queueHead_ = 0;
-    for (int i = 0; i < acc_.size(); ++i) {
-        extendWindow(i, false);
+    deriving_ = 0;
+    deriveWindows();
+}
+
+// Brings every window up to date, kDeriveSlice rows per event-loop turn, then
+// queues the whole pass. A slice that does not finish them comes back next turn.
+void EthScanner::deriveWindows()
+{
+    const quint64 gen = gen_;
+    qint64 budget = kDeriveSlice;
+    while (deriving_ < acc_.size() && budget > 0 && !totalCut_) {
+        const int i = deriving_;
+        const qint64 before = acc_.at(i).end;
+        extendWindowTo(i, false, qMin(windowEnd(acc_.at(i)), before + budget));
         if (gen != gen_)
-            return;
+            return; // a model slot restarted or stopped the scan
+        budget -= acc_.at(i).end - before;
+        // Whole, or ended early at an index that cannot be derived: on to the next.
+        if (acc_.at(i).end >= windowEnd(acc_.at(i)))
+            ++deriving_;
+    }
+    if (deriving_ < acc_.size() && !totalCut_) {
+        noteProgress();
+        defer(&EthScanner::deriveWindows);
+        return;
     }
     for (int i = 0; i < acc_.size(); ++i)
         for (qint64 index = 0; index < acc_.at(i).end; ++index)

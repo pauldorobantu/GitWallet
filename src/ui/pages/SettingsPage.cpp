@@ -173,9 +173,11 @@ struct SettingsPage::Ui : QObject
     QLabel* walletCount = nullptr;
     QWidget* removeRow = nullptr;
     QPushButton* remove = nullptr;
+    wallet::ScanSettings filled; // what the form last showed from the store
 
-    void fill(const wallet::ScanSettings& s) const
+    void fill(const wallet::ScanSettings& s)
     {
+        filled = s;
         receiveGap->setValue(s.btcReceiveGap);
         changeGap->setValue(s.btcChangeGap);
         ethGap->setValue(s.ethGap);
@@ -280,7 +282,19 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     connect(saveButton, &QPushButton::clicked, this, &SettingsPage::save);
     connect(ui_->remove, &QPushButton::clicked, this, &SettingsPage::confirmRemove);
     if (controller_) {
-        connect(controller_, &WalletController::walletChanged, this, &SettingsPage::load);
+        // A wallet added, renamed or removed leaves what is typed here alone, unless
+        // the stored settings themselves changed (a file loaded, everything removed).
+        connect(controller_, &WalletController::walletChanged, this, [this] {
+            const wallet::ScanSettings& s = controller_->store().settings;
+            const wallet::ScanSettings& f = ui_->filled;
+            if (s.btcReceiveGap != f.btcReceiveGap || s.btcChangeGap != f.btcChangeGap || s.ethGap != f.ethGap
+                || s.ethRefreshSeconds != f.ethRefreshSeconds || s.electrumServers != f.electrumServers
+                || s.ethEndpoints != f.ethEndpoints) {
+                ui_->fill(s);
+            }
+            rebuildWallet();
+            updateInUse();
+        });
         connect(controller_, &WalletController::statusChanged, this, &SettingsPage::updateInUse);
     }
     // The captions are runtime text (trText) that the language walk cannot re-template.
@@ -355,6 +369,41 @@ void SettingsPage::save()
     settings.electrumServers = servers;
     settings.ethEndpoints = endpoints;
 
+    // Smaller gaps can hide addresses that have history, coins included: the next
+    // scan stops before them, and only the user can say that is what they want.
+    const WalletController::GapImpact left = controller_->gapImpact(settings);
+    if (left.used == 0) {
+        apply(settings);
+        return;
+    }
+    auto* box = new QMessageBox(
+        QMessageBox::Warning, QStringLiteral("Smaller gaps"),
+        left.used == 1 ? QStringLiteral("These gaps leave out 1 address that has been used.")
+                       : QStringLiteral("These gaps leave out %1 addresses that have been used.").arg(left.used),
+        QMessageBox::NoButton, this);
+    box->setInformativeText(
+        QStringLiteral("Holding a balance now: %1 of %2. GitWallet would stop showing and watching these "
+                       "addresses, and their balances would leave the totals, until the gaps are raised "
+                       "again. Nothing changes on the blockchain.")
+            .arg(left.funded)
+            .arg(left.used));
+    QPushButton* saveAnyway = box->addButton(QStringLiteral("Save anyway"), QMessageBox::DestructiveRole);
+    saveAnyway->setObjectName(QStringLiteral("dangerButton"));
+    QPushButton* cancel = box->addButton(QMessageBox::Cancel);
+    box->setDefaultButton(cancel);
+    box->setEscapeButton(cancel);
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    applyDialogChrome(box);
+    // open(), not exec(): no nested event loop while the scanners keep running.
+    connect(box, &QDialog::finished, this, [this, box, saveAnyway, settings] {
+        if (box->clickedButton() == saveAnyway)
+            apply(settings);
+    });
+    box->open();
+}
+
+void SettingsPage::apply(const wallet::ScanSettings& settings)
+{
     // The controller words its failures as full sentences; shown as they are.
     QString error;
     if (!controller_->applySettings(settings, &error)) {

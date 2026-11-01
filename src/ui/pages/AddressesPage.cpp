@@ -33,6 +33,10 @@
 
 #include <exception>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
+
 namespace app::ui {
 
 namespace {
@@ -121,14 +125,35 @@ private:
     int state_ = StateAll;
 };
 
+// How a spreadsheet on this PC reads a CSV: Excel splits columns on the Windows
+// list separator and reads numbers with its decimal symbol, so an export in any
+// other form lands in one column ("," is ";" on Romanian, German or French formats).
+struct CsvFormat {
+    QChar separator = QLatin1Char(',');
+    QChar decimal = QLatin1Char('.');
+};
+
+CsvFormat csvFormat()
+{
+    CsvFormat format;
+#ifdef Q_OS_WIN
+    wchar_t text[8] = {};
+    if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SLIST, text, 8) >= 2)
+        format.separator = QChar(text[0]);
+    if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SDECIMAL, text, 8) >= 2)
+        format.decimal = QChar(text[0]);
+#endif
+    return format;
+}
+
 // A CSV field: quoted when it has to be. A name opening with what a spreadsheet
 // reads as a formula is defused, so opening the export never runs anything.
-QString csvField(const QString& text)
+QString csvField(const QString& text, const CsvFormat& format)
 {
     QString field = text;
     if (!field.isEmpty() && QStringLiteral("=+-@\t\r").contains(field.at(0)))
         field.prepend(QLatin1Char('\''));
-    if (field.contains(QLatin1Char(',')) || field.contains(QLatin1Char('"')) || field.contains(QLatin1Char('\n'))
+    if (field.contains(format.separator) || field.contains(QLatin1Char('"')) || field.contains(QLatin1Char('\n'))
         || field.contains(QLatin1Char('\r'))) {
         field.replace(QLatin1Char('"'), QStringLiteral("\"\""));
         field = QLatin1Char('"') + field + QLatin1Char('"');
@@ -136,16 +161,23 @@ QString csvField(const QString& text)
     return field;
 }
 
+// A number as this PC's spreadsheet reads it; `plain` has a '.' for a decimal point.
+QString csvNumber(QString plain, const CsvFormat& format)
+{
+    plain.replace(QLatin1Char('.'), format.decimal);
+    return csvField(plain, format);
+}
+
 // The row's amount of `info` in whole units, every digit kept; empty for an asset
 // of the other chain, and for a zero that may only mean "no answer yet".
-QString csvAmount(const wallet::AddressRow& row, const wallet::AssetInfo& info)
+QString csvAmount(const wallet::AddressRow& row, const wallet::AssetInfo& info, const CsvFormat& format)
 {
     if ((info.asset == wallet::Asset::BTC) != row.isBitcoin())
         return QString();
     const chain::Amount amount = row.amount(info.asset);
     if (amount.isZero() && !row.checked)
         return QString();
-    return QString::fromStdString(amount.format(info.decimals, info.decimals));
+    return csvNumber(QString::fromStdString(amount.format(info.decimals, info.decimals)), format);
 }
 
 // "500 addresses · 3 funded", or "12 of 500 addresses · 1 funded" while a
@@ -359,6 +391,9 @@ void AddressesPage::rebuildWalletFilter()
             ui_->wallet->addItem(w.label, w.id);
         const int keep = ui_->wallet->findData(chosen);
         ui_->wallet->setCurrentIndex(keep >= 0 ? keep : 0); // a wallet removed: back to all
+        // LanguageManager keeps a combo's first texts and writes them back by
+        // position; these are new, and it reads them afresh.
+        ui_->wallet->setProperty("i18nOrig_items", QVariant());
     }
     ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
     ui_->wallet->setVisible(wallets.size() > 1);
@@ -389,8 +424,13 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
 {
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
     const net::PriceFeed* prices = controller_ ? controller_->prices() : nullptr;
+    const CsvFormat format = csvFormat();
     QStringList lines;
-    lines << QStringLiteral("wallet,chain,type,path,address,state,BTC,ETH,USDT,USDC,USD");
+    lines << QStringList{QStringLiteral("wallet"), QStringLiteral("chain"), QStringLiteral("type"),
+                         QStringLiteral("path"), QStringLiteral("address"), QStringLiteral("state"),
+                         QStringLiteral("BTC"), QStringLiteral("ETH"), QStringLiteral("USDT"),
+                         QStringLiteral("USDC"), QStringLiteral("USD")}
+                 .join(format.separator);
     for (int row = 0; model && row < ui_->filter->rowCount(); ++row) {
         const QModelIndex first = ui_->filter->mapToSource(ui_->filter->index(row, 0));
         if (first.row() >= model->size())
@@ -398,17 +438,19 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
         const wallet::AddressRow& r = model->at(first.row());
         const auto cell = [&](int column) { return first.siblingAtColumn(column).data().toString(); };
         QStringList fields;
-        fields << csvField(cell(AddressTableModel::ColWallet))
-               << csvField(cell(AddressTableModel::ColChain))
-               << csvField(cell(AddressTableModel::ColType))
-               << csvField(r.path)
-               << csvField(r.address)
-               << csvField(cell(AddressTableModel::ColState));
+        fields << csvField(cell(AddressTableModel::ColWallet), format)
+               << csvField(cell(AddressTableModel::ColChain), format)
+               << csvField(cell(AddressTableModel::ColType), format)
+               << csvField(r.path, format)
+               << csvField(r.address, format)
+               << csvField(cell(AddressTableModel::ColState), format);
         double usd = 0.0;
-        bool priced = r.checked || r.state() == wallet::AddressState::Funded;
+        // Only once every balance of the row has answered: a sum of this column
+        // must not silently leave out an amount still unknown.
+        bool priced = r.checked;
         try {
             for (const wallet::AssetInfo& info : wallet::assets()) {
-                fields << csvAmount(r, info);
+                fields << csvAmount(r, info, format);
                 const chain::Amount amount = r.amount(info.asset);
                 if (amount.isZero())
                     continue;
@@ -420,8 +462,8 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
             *error = trText(QStringLiteral("An amount could not be read; nothing was exported."));
             return false;
         }
-        fields << (priced ? QString::number(usd, 'f', 2) : QString());
-        lines << fields.join(QLatin1Char(','));
+        fields << (priced ? csvNumber(QString::number(usd, 'f', 2), format) : QString());
+        lines << fields.join(format.separator);
     }
 
     QSaveFile file(path);

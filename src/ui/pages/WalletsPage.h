@@ -11,9 +11,10 @@ namespace app::ui {
 // The Wallets page: one row per wallet with its source, addresses, funded
 // addresses, balances and USD value, so a business with many seeds sees at a
 // glance what each one holds. A figure reads plain only once every balance behind
-// it has answered, as on the Overview page. From here a wallet is added, renamed,
-// removed, opened on the Addresses page (also by double-clicking it) and its public
-// keys shown.
+// it has answered and the scan reached all it should, as on the Overview page; a
+// chain the wallet has no key for reads "—", and the State column says how current
+// the row is. From here a wallet is added, renamed, removed, opened on the Addresses
+// page (also by double-clicking it) and its public keys shown.
 class WalletsPage : public QWidget
 {
     Q_OBJECT
@@ -23,6 +24,9 @@ public:
 signals:
     void addRequested();
     void showAddressesRequested(quint32 wallet);
+
+protected:
+    void showEvent(QShowEvent* event) override; // the figures repaint only while this page shows
 
 private:
     WalletController* controller_ = nullptr;

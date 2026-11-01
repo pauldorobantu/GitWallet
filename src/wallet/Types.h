@@ -56,6 +56,7 @@ enum class Problem {
     WrongChain,     // the Ethereum endpoint does not answer for mainnet (chain id, no Multicall3, ...)
     BuiltInServers, // none of the Electrum servers in Settings works; the built-in list is in use
     Skipped,        // an account or chain cannot be scanned at all
+    FileSetAside,   // a wallet.dat that could not be read was kept under another name
 };
 
 struct AddressRow {

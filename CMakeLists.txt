@@ -48,6 +48,17 @@ target_link_libraries(GitWallet PRIVATE
 )
 
 if(WIN32)
+    # The exe starts from whichever folder it is built in: its Qt DLLs beside it and
+    # the plugins in lib/plugins, where the embedded qt.conf (Prefix = lib) looks.
+    find_program(GW_WINDEPLOYQT windeployqt REQUIRED
+        HINTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}")
+    add_custom_command(TARGET GitWallet POST_BUILD
+        COMMAND "${GW_WINDEPLOYQT}" --release --no-translations --no-system-d3d-compiler
+            --no-system-dxc-compiler --no-opengl-sw --no-compiler-runtime --verbose 0
+            --plugindir "$<TARGET_FILE_DIR:GitWallet>/lib/plugins" "$<TARGET_FILE:GitWallet>"
+        COMMENT "Deploying Qt beside GitWallet.exe"
+        VERBATIM)
+
     # LEAN_AND_MEAN keeps rpcndr.h out (it #defines `small`, which breaks
     # tokens::Radii::small in the reused ThemeManager); NOMINMAX keeps
     # std::min/max usable.
