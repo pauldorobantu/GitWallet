@@ -79,6 +79,9 @@ private:
     // --- implementation (WalletController.cpp may add private members) ---
     void startServices();
     void stopServices();
+    void queueStatus();                   // throttled statusChanged() for progress and balances
+    void onScanFinished(bool* chainDone); // a scanner finished its initial scan
+    void onScannerError(const QString& message);
 
     wallet::WalletStore store_;
     wallet::WalletModel* model_ = nullptr;
@@ -88,8 +91,14 @@ private:
     wallet::BtcScanner* btcScanner_ = nullptr;
     wallet::EthScanner* ethScanner_ = nullptr;
     QTimer* priceTimer_ = nullptr;
+    QTimer* statusTimer_ = nullptr; // single-shot throttle behind queueStatus()
     bool btcDone_ = false;
     bool ethDone_ = false;
+    bool running_ = false;          // between startServices() and stopServices()
+    bool scanFinishedSent_ = false; // scanFinished() already emitted for this start
+    // wallet.dat is the file this session last loaded or wrote; only then may
+    // settings alone be written over an existing one.
+    bool fileLoaded_ = false;
 };
 
 } // namespace app

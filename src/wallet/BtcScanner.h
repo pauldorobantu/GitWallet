@@ -44,12 +44,107 @@ signals:
 
 private:
     // --- implementation (BtcScanner.cpp may add private members) ---
+
+    // One chain of one account: receive (change 0) or change (change 1).
+    struct Chain {
+        chain::ScriptType type = chain::ScriptType::P2WPKH;
+        quint32 account = 0;
+        quint32 change = 0;
+        chain::HdPubKey node; // the account node's child `change`, derived once per start()
+        int gap = 0;
+        int floor = 0;        // rows [0, floor) were already in the model at start()
+        int next = 0;         // next index to derive (or adopt from the model)
+        int lastUsed = -1;
+        bool reuse = true;    // the rows already in the model came from this xpub
+        bool limited = false; // the window outgrew the row limit (reported once per start())
+
+        int window() const;   // max(floor, lastUsed + 1 + gap); may exceed the row limit
+        int target() const;   // end of the window actually derived: window() capped at the limit
+    };
+
+    enum class SubState : quint8 {
+        Queued, // waiting in subQueue_
+        Sent,   // handed to the client, reply pending
+        Retry,  // refused; waits in retry_ for the next ready() or retry round
+        Live,   // subscribed; changes arrive as notifications
+    };
+
+    // One address this run follows, keyed by its lowercase scripthash.
+    struct Tracked {
+        SubState sub = SubState::Queued;
+        bool confirmed = false; // status known since the last start()
+        bool notified = false;  // a notification arrived while the subscribe reply was pending
+    };
+
+    void adoptModelRows();
+    void onClientReady();
+    void onScripthashChanged(const QString& scripthash, const QString& status);
+    void onModelCleared();
+    void onSubscribeReply(quint64 generation, const QString& scripthash, int status,
+                          const QString& error);
+    void onBalanceReply(quint64 generation, quint64 seq, const QString& scripthash, bool ok,
+                        qint64 confirmed, qint64 unconfirmed, const QString& error);
+
+    void scheduleDerive();
+    void deriveSlice();
+    int adoptOrDerive(int chainIndex, int index); // 1 if it derived, 0 if it adopted a model row
+    void track(const QString& scripthash);
+
+    void schedulePump();
+    void pumpRequests();
+    void sendSubscribe(const QString& scripthash);
+    void queueBalance(const QString& scripthash);
+    void sendBalance(const QString& scripthash);
+
+    void armRetry();
+    void requeueFailed();
+
+    void applyStatus(const QString& scripthash, bool used);
+    void applyBalance(const QString& scripthash, qint64 confirmed, qint64 unconfirmed);
+    void noteUsed(int chainIndex, int index);
+    void reportLimits();
+    void markConfirmed(const QString& scripthash);
+    int findChain(chain::ScriptType type, quint32 account, quint32 change) const;
+
+    bool busy() const;
+    void checkIdle();
+    void noteProgress();
+    void emitProgress();
+    void reportError(const QString& message);
+
     net::ElectrumClient* client_ = nullptr;
     WalletModel* model_ = nullptr;
     QList<AccountKey> accounts_;
     int receiveGap_ = 200;
     int changeGap_ = 50;
     bool running_ = false;
+
+    QList<Chain> chains_;
+    QHash<QString, Tracked> tracked_;    // every row followed since the last start()
+    QStringList subQueue_;               // scripthashes to subscribe, in derivation order
+    QStringList balanceQueue_;           // scripthashes whose balance to fetch (sent first)
+    QSet<QString> balanceQueued_;        // what balanceQueue_ holds
+    QHash<QString, quint64> balanceSeq_; // newest get_balance per scripthash
+    QStringList retry_;                  // refused subscriptions, queued again on ready() / retry round
+    QSet<QString> balanceRetry_;         // failed balance fetches, queued again on ready() / retry round
+    QSet<QString> reportedErrors_;       // normalized texts already emitted this run
+    quint64 generation_ = 0;             // bumped by start() / stop(); older replies are dropped
+    quint64 nextBalanceSeq_ = 0;
+    qint64 lastProgressMs_ = 0;
+    qint64 lastRetryMs_ = 0;             // when the last retry round ran
+    int retryDelayMs_ = 0;               // delay of the next retry round; 0 = the first delay
+    int outstanding_ = 0;                // requests of any run the client has not answered yet
+    int subSent_ = 0;                    // this run's subscriptions awaiting a reply
+    int balanceSent_ = 0;                // this run's balance requests awaiting a reply
+    int checked_ = 0;
+    bool resubscribeAll_ = false;        // the client was stopped under us: subscriptions are gone
+    bool deriveScheduled_ = false;
+    bool pumpScheduled_ = false;
+    bool retryArmed_ = false;            // a retry round of this generation is posted
+    bool progressArmed_ = false;         // a throttled progress() is posted
+    bool progressDirty_ = false;
+    bool idleReported_ = false;          // the final progress() of this busy spell is out
+    bool finished_ = false;              // scanFinished() already emitted for this start()
 };
 
 } // namespace wallet

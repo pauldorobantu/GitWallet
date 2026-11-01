@@ -21,6 +21,19 @@ public:
 
 private:
     WalletController* controller_ = nullptr;
+
+    // --- implementation (SettingsPage.cpp) ---
+    struct Ui; // the page's widgets
+
+    void load();          // the form from the stored settings, plus the xpubs
+    void rebuildWallet(); // one row per stored account
+    void updateInUse();   // the Electrum server / Ethereum endpoint in use
+    void resetToDefaults();
+    void save();
+    void confirmRemove();
+    void removeWallet();
+
+    Ui* ui_ = nullptr;
 };
 
 } // namespace app::ui

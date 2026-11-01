@@ -2,6 +2,12 @@
 
 #include <QDialog>
 
+class QCheckBox;
+class QLabel;
+class QLineEdit;
+class QPlainTextEdit;
+class QPushButton;
+
 namespace app {
 class WalletController;
 }
@@ -23,7 +29,18 @@ protected:
     void done(int result) override; // wipes the fields, then closes
 
 private:
+    void validateWords();       // the status line + wordsValid_, on every edit
+    void updateImportEnabled();
+    void importSeed();
+    void wipeFields();          // overwrites, then empties, both editors
+
     WalletController* controller_ = nullptr;
+    QPlainTextEdit* words_ = nullptr;
+    QLabel* status_ = nullptr;
+    QCheckBox* hasPassphrase_ = nullptr;
+    QLineEdit* passphrase_ = nullptr;
+    QPushButton* import_ = nullptr;
+    bool wordsValid_ = false; // count, words and checksum all check out
 };
 
 } // namespace app::ui

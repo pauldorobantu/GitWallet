@@ -42,10 +42,24 @@ signals:
 
 private:
     // --- implementation (WalletModel.cpp may add private members) ---
+    void addLookups(const AddressRow& row, int index);
+    void dropLookups(const AddressRow& row, int index);
+    void countRow(const AddressRow& row, int sign);
+    // Drops the cached total of every asset whose balance differs between the
+    // two versions of a row; true if any did.
+    bool dropChangedTotals(const AddressRow& before, const AddressRow& after);
+
     QVector<AddressRow> rows_;
     QHash<QString, int> byScripthash_;
     QHash<QString, int> byAddress_; // lowercase address -> row
     QHash<QString, int> byKey_;     // "type/account/change/index" -> row
+    // Sums computed by total(); an asset is missing until it is asked for
+    // again after one of its balances changed. Amount cannot subtract, so a
+    // changed row invalidates instead of adjusting.
+    mutable QMap<Asset, chain::Amount> totals_;
+    int usedCount_ = 0;
+    int fundedCount_ = 0;
+    int checkedCount_ = 0;
 };
 
 } // namespace wallet

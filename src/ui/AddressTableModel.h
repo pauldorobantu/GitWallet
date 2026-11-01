@@ -31,6 +31,15 @@ public:
 
 private:
     WalletController* controller_ = nullptr;
+
+    // --- implementation (AddressTableModel.cpp) ---
+    void appendRows();      // announces the rows the wallet model added since the last call
+    void changeRow(int row);
+    void resetRows();
+    void refreshPrices();   // repaints Balance / USD when a price changed
+
+    int rows_ = 0;          // the row count the views know (moves only inside begin/endInsertRows)
+    QList<double> prices_;  // the last prices seen, in wallet::assets() order
 };
 
 } // namespace app::ui

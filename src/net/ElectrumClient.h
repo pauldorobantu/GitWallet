@@ -80,6 +80,8 @@ private:
         QString method;
         QJsonArray params;
         Reply reply;
+        qint64 sentAtMs = 0; // monotonic time it was written (meaningful while in flight)
+        bool internal = false; // a re-subscription of the client's own: nobody waits for its reply
     };
 
     // --- implementation (ElectrumClient.cpp may add private members) ---
@@ -88,6 +90,25 @@ private:
     void pump();
     void handleMessage(const QJsonObject& message);
     void failConnection(const QString& reason);
+
+    int takeId();
+    void onEncrypted();
+    void onReadyRead();
+    void handleLine(const QByteArray& line);
+    void handleNotification(const QString& method, const QJsonArray& params);
+    void handleVersionReply(const QJsonValue& result, const QString& error);
+    void handleHeadersReply(const QJsonValue& result, const QString& error);
+    void becomeReady(int height);
+    void restoreSubscriptions();
+    void sendPing();
+    void checkTimeouts();
+    void dropSocket();
+    void resetConnectionState();
+    QList<Pending> takeInFlight(); // empties inFlight_, in the order the requests were sent
+    QHash<QString, int> pendingSubscribes() const; // scripthash -> subscribes queued or in flight
+    void queueRestore(const QString& scripthash);   // internal blockchain.scripthash.subscribe
+    int noteRefused(const QString& scripthash, const QString& error); // -> refusals of it on this connection
+    void retryRefused(); // on the ping tick
 
     QList<ElectrumServer> servers_;
     int serverIndex_ = -1;
@@ -102,7 +123,23 @@ private:
     int tip_ = 0;
     QQueue<Pending> queue_;                 // not yet sent
     QHash<int, Pending> inFlight_;          // sent, awaiting a reply
-    QHash<QString, QString> subscriptions_; // scripthash -> last known status ("" = null)
+    QHash<QString, QString> subscriptions_; // lowercase scripthash -> last known status ("" = null)
+
+    QTimer* watchdogTimer_ = nullptr; // request + ping timeouts, every 5 s while ready
+    ElectrumServer current_;          // the server socket_ talks to
+    QString serverSoftware_;          // from the server.version reply, for the log
+    qsizetype scanFrom_ = 0;          // bytes of buffer_ already searched for a newline
+    quint64 generation_ = 0;          // bumped whenever the connection is torn down or replaced
+    int backoffMs_ = 1000;            // delay before the next reconnect
+    int goodIndex_ = -1;              // last server that completed a handshake
+    int versionId_ = 0;               // ids of the internal requests in flight; 0 = none
+    int headersId_ = 0;
+    int pingId_ = 0;
+    qint64 pingSentAtMs_ = 0;
+    QHash<QString, int> refused_; // scripthash -> subscribes this server refused; asked again on the ping tick
+    QString lastRefusal_;         // the newest refusal text, for the log
+    int refusalSwitches_ = 0;     // server switches forced by refusals since a server last watched everything
+    bool refusalLogged_ = false;  // "still refused, staying" already logged on this connection
 };
 
 } // namespace net

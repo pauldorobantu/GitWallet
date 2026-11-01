@@ -15,8 +15,11 @@ namespace chain::bip39 {
 std::vector<std::string> split(const std::string& sentence);
 
 // True if every word is in the list and the BIP39 checksum matches.
-// Accepts 12/15/18/21/24-word mnemonics.
+// Accepts 12/15/18/21/24-word mnemonics. The error text never quotes a word.
 bool validate(const std::vector<std::string>& words, std::string* errorOut = nullptr);
+
+// True if `word` (lowercase) is in the English BIP39 list.
+bool isWord(const std::string& word);
 
 // Mnemonic -> 64-byte seed (PBKDF2-HMAC-SHA512, 2048 rounds, salt
 // "mnemonic"+passphrase). Does not validate the checksum; call validate first.

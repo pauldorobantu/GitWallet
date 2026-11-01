@@ -21,6 +21,16 @@ public:
 
 private:
     WalletController* controller_ = nullptr;
+
+    // --- implementation (AddressesPage.cpp) ---
+    struct Ui; // the page's widgets and models
+
+    void applyColumnWidths();
+    void keepTopRow(int first, int last);
+    void scheduleUpdate();
+    void updateState(); // count, enabled controls, table / empty / no-results
+
+    Ui* ui_ = nullptr;
 };
 
 } // namespace app::ui
