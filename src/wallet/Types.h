@@ -51,6 +51,7 @@ struct WalletEntry {
 struct WalletRequest {
     QList<AccountKey> accounts;
     QString label;         // empty: "Wallet N"
+    bool numbered = false; // `label` is what the name starts with: the next free number follows
     bool fromKeys = false;
     int line = 0;          // the caller's: which line of its list this came from
     QString refused;

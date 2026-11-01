@@ -22,9 +22,12 @@ after the first gap and miss funds further down.
    never touch this PC. **One at a time or a whole list:** *Add many* takes one seed
    or one set of public keys per line, pasted or from a text or CSV file, each with
    a name if you want (`Shop 1: word word ...`, `"Shop 2","word word ..."`, a
-   numbered list). The good lines go in together; a line with a problem stays in
-   the field, named by its number and never quoted, and a seed already here is
-   refused. GitWallet derives the account public keys and scans every
+   numbered list). The good lines go in together; what did not go in stays in the
+   field, each line named by its number with the reason and never quoted. A seed
+   already here, a name in use and a line that can be read two ways are refused,
+   and seed words or a private key are never taken as a name. A line of public keys
+   can hold a whole wallet: its second xpub is read as the Ethereum account. GitWallet
+   derives the account public keys and scans every
    Bitcoin address type (native SegWit, nested SegWit, legacy — receive and
    change) and Ethereum (ETH, USDT, USDC) far past the last used address (gap
    limits are configurable, default 200 / 50 / 100). The Wallets page lists what

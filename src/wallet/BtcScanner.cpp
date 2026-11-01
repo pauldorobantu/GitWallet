@@ -931,6 +931,18 @@ void BtcScanner::reportLimits()
     const bool severalWallets = std::any_of(chains_.cbegin(), chains_.cend(), [this](const Chain& c) {
         return c.wallet != chains_.constFirst().wallet;
     });
+    // At the ceiling, several wallets' real use adds up: smaller gaps leave them room,
+    // as the limit does not fall until the gaps are small. Below it they would not.
+    if (severalWallets && rowLimit() >= kMaxWalletRows) {
+        emit problem(Problem::Limit,
+                     QStringLiteral("Bitcoin scan stopped at %1 addresses, the most GitWallet follows on one "
+                                    "connection, shared by all wallets. Lower the gaps in Settings or remove "
+                                    "wallets you do not need here. If these wallets do not use that many, choose "
+                                    "another server.")
+                         .arg(count),
+                     QString());
+        return;
+    }
     emit problem(Problem::Limit,
                  rowLimit() < kMaxWalletRows
                      ? QStringLiteral("Bitcoin scan stopped at %1 addresses, the limit for these gap settings: the "

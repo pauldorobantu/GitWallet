@@ -295,13 +295,12 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->state->addItems({QStringLiteral("All states"), QStringLiteral("Funded"), QStringLiteral("Used")});
     ui_->state->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->state->setToolTip(QStringLiteral("Funded: holds a balance now. Used: has transactions or a balance."));
-    ui_->count = new QLabel(bar.widget);
-    ui_->count->setObjectName(QStringLiteral("mimCount"));
+    ui_->count = page::makeBarCount(bar.widget);
     bar.left->addWidget(ui_->search);
     bar.left->addWidget(ui_->wallet);
     bar.left->addWidget(ui_->chain);
     bar.left->addWidget(ui_->state);
-    page::addBarCount(bar, ui_->count);
+    page::finishBarLeft(bar, ui_->search, ui_->count);
 
     ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
     ui_->exportCsv->setToolTip(QStringLiteral("Save the rows shown to a spreadsheet file. It is not encrypted: "

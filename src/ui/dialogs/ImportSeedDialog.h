@@ -36,9 +36,9 @@ namespace app::ui {
 // or not, and a seed itself is never written anywhere.
 //
 // Public keys (zpub, ypub, xpub for Bitcoin, xpub for Ethereum) need no secret at all,
-// and each shows its first address to compare with the other wallet: see
-// WalletController::addKeysWallet. Seed words pasted into the name or a key field are
-// wiped at once, so they cannot become a wallet's name by accident.
+// and an xpub shows its first address to compare with the other wallet: see
+// WalletController::addKeysWallet. Seed words or a private key pasted into the name or
+// a key field are wiped at once, so they cannot become a wallet's name by accident.
 class ImportSeedDialog : public QDialog
 {
     Q_OBJECT
@@ -76,7 +76,9 @@ private:
     void stopList();            // scrubs what a list in progress holds
     void setBusy(bool busy);
     void chooseListFile();
-    QString labelFor(const QString& name); // a line's own name, or the field's numbered
+    // A line's own name, or the field's with the next free number after it.
+    void nameRequest(wallet::WalletRequest* request, const QString& name) const;
+    void noteAdded(int count);  // what the dialog has added so far, and the Close button
     void wipeFields();          // overwrites, then empties, every text field
 
     WalletController* controller_ = nullptr;
@@ -111,7 +113,6 @@ private:
     std::string listPassphrase_;
     QMap<int, QString> listToFix_;
     QList<wallet::WalletRequest> listRequests_;
-    int unnamed_ = 0;         // lines given a number after the field's name
     int addedTotal_ = 0;
     QString result_;
 };

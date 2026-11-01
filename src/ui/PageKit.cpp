@@ -23,6 +23,7 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QScreen>
+#include <QStyle>
 #include <QTableView>
 #include <QToolButton>
 #include <QTreeView>
@@ -99,12 +100,43 @@ ActionBar makeActionBar(QWidget* parent)
     return bar;
 }
 
-void addBarCount(const ActionBar& bar, QLabel* count)
+namespace {
+
+// A number cut off would read as a smaller number: it ends in "…" instead.
+class BarCount : public QLabel
 {
-    count->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    bar.left->addWidget(count, 1);
-    // The left side takes the room the bar has to spare, so the count reads whole
-    // whenever it fits; the stretch that held it apart has nothing left to do.
+public:
+    using QLabel::QLabel;
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        const QRect room = contentsRect();
+        style()->drawItemText(&painter, room, int(alignment()), palette(), isEnabled(),
+                              fontMetrics().elidedText(text(), Qt::ElideRight, room.width()), foregroundRole());
+    }
+};
+
+} // namespace
+
+QLabel* makeBarCount(QWidget* parent)
+{
+    auto* count = new BarCount(parent);
+    count->setObjectName(QStringLiteral("mimCount"));
+    // At most its text; less only once nothing else can give.
+    count->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+    count->setMinimumWidth(1);
+    return count;
+}
+
+void finishBarLeft(const ActionBar& bar, QLineEdit* search, QLabel* count)
+{
+    bar.left->addWidget(count);
+    bar.left->addStretch(1);
+    // What the bar has to spare goes to the search up to its usual width, and only
+    // then past the count: the left side now holds the stretch that parted the two sides.
+    bar.left->setStretchFactor(search, 1000);
     auto* row = static_cast<QHBoxLayout*>(bar.widget->layout());
     row->setStretch(0, 1);
     row->setStretch(1, 0);
@@ -190,27 +222,14 @@ void finishForms(const QList<QFormLayout*>& forms)
     }
 }
 
-namespace {
-
-// Its usual width as a hint, not a floor: on a narrow window the search gives way
-// before the buttons beside it.
-class SearchEdit : public QLineEdit
-{
-public:
-    using QLineEdit::QLineEdit;
-    QSize sizeHint() const override { return {kSearchMin, QLineEdit::sizeHint().height()}; }
-};
-
-} // namespace
-
 QLineEdit* makeSearch(QWidget* parent, const QString& placeholder)
 {
-    auto* edit = new SearchEdit(parent);
+    auto* edit = new QLineEdit(parent);
     edit->setObjectName(QStringLiteral("mimSearch"));
     edit->setPlaceholderText(placeholder);
     edit->setClearButtonEnabled(true);
-    edit->setMinimumWidth(tokens::layout::kSearchShrunk);
-    edit->setMaximumWidth(kSearchMax);
+    edit->setMinimumWidth(kSearchMinW);
+    edit->setMaximumWidth(kSearchW);
     QAction* lupa = edit->addAction(makeIcon(icon::Kind::Search, muted(), 15),
                                     QLineEdit::LeadingPosition);
     // Re-tintare la schimbarea temei (icon-ul e un pixmap fix).

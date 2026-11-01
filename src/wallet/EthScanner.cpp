@@ -44,7 +44,7 @@ constexpr int kMaxGap = 100'000;
 constexpr qint64 kMaxEthRows = 100'000;
 // Rows derived over all accounts together: wallets add up, and a pass over this
 // many already takes most of an hour at one chunk at a time.
-constexpr qint64 kMaxEthTotalRows = 200'000;
+constexpr qint64 kMaxEthTotalRows = EthScanner::kMaxFollowedRows;
 // Rows derived per event-loop turn when a pass sets up its windows: BtcScanner's
 // slice, so that many wallets or a large gap never freeze the window.
 constexpr qint64 kDeriveSlice = 250;

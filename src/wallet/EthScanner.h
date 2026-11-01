@@ -31,6 +31,9 @@ class EthScanner : public QObject
 {
     Q_OBJECT
 public:
+    // Rows derived at most over all accounts together (EthScanner.cpp).
+    static constexpr qint64 kMaxFollowedRows = 200'000;
+
     EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent = nullptr);
 
     void setAccounts(const QList<AccountKey>& accounts); // non-Ethereum accounts are ignored

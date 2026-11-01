@@ -44,8 +44,8 @@ using tokens::layout::kPageMarginTop;
 using tokens::layout::kPageMarginX;
 using tokens::layout::kPageSpacing;
 using tokens::layout::kRowHeight;
-using tokens::layout::kSearchMax;
-using tokens::layout::kSearchMin;
+using tokens::layout::kSearchMinW;
+using tokens::layout::kSearchW;
 using tokens::layout::kSectionPadX;
 using tokens::layout::kSectionPadY;
 using tokens::layout::kToolbarSpacing;
@@ -89,8 +89,11 @@ struct ActionBar
     QHBoxLayout* right = nullptr;
 };
 ActionBar makeActionBar(QWidget* parent);
-// A count at the end of the left side: on a narrow window it is what gets cut, not a button.
-void addBarCount(const ActionBar& bar, QLabel* count);
+// The count of a bar with a search: its text ends in "…" when it does not fit.
+QLabel* makeBarCount(QWidget* parent);
+// The end of the left side of such a bar, once the search and any filters are in it. On
+// a narrow window the search gives way first, then the count, and never a button.
+void finishBarLeft(const ActionBar& bar, QLineEdit* search, QLabel* count);
 
 // Formular standard: etichete stânga + centrate vertical pe câmp, spațiere
 // kFormHSpacing/kFormVSpacing, câmpurile cresc pe lățime.

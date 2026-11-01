@@ -43,14 +43,13 @@ cmake --build "%GW_BUILD_DIR%" || exit /b 1
 
 rem dist\ = the folder to copy elsewhere: the exe, its DLLs and the Qt plugins in
 rem lib\plugins, where the embedded qt.conf (Prefix = lib) looks for them.
-rem The exe goes first: while GitWallet runs from the folder that fails, wherever it
-rem was started from, where rmdir would delete what it can and leave a broken folder.
-rem Renamed before it is deleted, as a window with its working folder inside refuses that.
+rem A running exe cannot be opened for writing, wherever it was started from: that is
+rem asked first, as rmdir would delete what it can and leave a broken folder. Renamed
+rem before it is deleted, as a window with its working folder inside refuses that.
 set "DIST=%REPO%\dist"
 if exist "%DIST%.old" rmdir /s /q "%DIST%.old"
-if exist "%DIST%\GitWallet.exe" del "%DIST%\GitWallet.exe" 2>nul
-if exist "%DIST%\GitWallet.exe" (echo [build] dist\ is in use - close GitWallet & exit /b 1)
-if exist "%DIST%" ren "%DIST%" dist.old || (echo [build] dist\ is in use - close GitWallet & exit /b 1)
+if exist "%DIST%\GitWallet.exe" 2>nul (>>"%DIST%\GitWallet.exe" (call )) || (echo [build] GitWallet is running from dist\ - close it & exit /b 1)
+if exist "%DIST%" ren "%DIST%" dist.old || (echo [build] another program or window is using dist\ - close it & exit /b 1)
 if exist "%DIST%.old" rmdir /s /q "%DIST%.old"
 mkdir "%DIST%" || exit /b 1
 copy /y "%GW_BUILD_DIR%\GitWallet.exe" "%DIST%\" >nul || exit /b 1

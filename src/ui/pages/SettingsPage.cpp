@@ -382,38 +382,40 @@ void SettingsPage::askThenApply(const wallet::ScanSettings& settings, int accept
     // scan stops before them, and only the user can say that is what they want. The
     // rows only know what has answered: until all have, what is left out is not known.
     const WalletController::GapImpact left = controller_->gapImpact(settings);
-    const wallet::ScanSettings& stored = controller_->store().settings;
-    const bool smaller = settings.btcReceiveGap < stored.btcReceiveGap || settings.btcChangeGap < stored.btcChangeGap
-                         || settings.ethGap < stored.ethGap;
+    const bool smaller = WalletController::gapsFall(controller_->store().settings, settings);
     const bool unknown = smaller && controller_->hasWallet() && !controller_->balancesComplete();
-    if (left.used <= accepted || (left.used == 0 && !unknown)) {
+    const bool agreed = accepted >= 0 && left.used <= accepted;
+    if (agreed || (left.used == 0 && left.overLimit == 0 && !unknown)) {
         apply(settings);
         return;
     }
     QString text;
     QString detail;
-    if (left.used == 0) {
-        text = QStringLiteral("The scan has not finished, so what smaller gaps leave out is not known yet.");
-        detail = QStringLiteral("GitWallet could stop showing and watching addresses it has not reached yet, and "
-                                "their balances would not count in the totals, until the gaps are raised again. "
-                                "Nothing changes on the blockchain. Once the scan has finished, saving again says "
-                                "what these gaps leave out.");
-    } else {
+    if (left.used > 0) {
         text = left.atMost ? QStringLiteral("These gaps can leave out up to %1 addresses that have been used.").arg(left.used)
                : left.used == 1
                    ? QStringLiteral("These gaps leave out 1 address that has been used.")
                    : QStringLiteral("These gaps leave out %1 addresses that have been used.").arg(left.used);
         detail = QStringLiteral("Holding a balance now: %1 of %2. GitWallet would stop showing and watching these "
-                                "addresses, and their balances would leave the totals, until the gaps are raised "
+                                "addresses, and their balances would leave the totals, until the gaps change "
                                 "again. Nothing changes on the blockchain.")
                      .arg(left.funded)
                      .arg(left.used);
-        if (left.atMost)
-            detail += QLatin1Char(' ') + QStringLiteral("A scan follows fewer addresses at smaller gaps.");
-        if (unknown)
-            detail += QLatin1Char(' ') + QStringLiteral("The scan has not finished, so there may be more.");
+    } else if (left.overLimit > 0) {
+        text = QStringLiteral("These gaps ask for about %1 more addresses than GitWallet follows.").arg(left.overLimit);
+        detail = QStringLiteral("The scan would stop at the limit, so no total would read as whole, until the gaps are "
+                                "lowered or wallets removed. Nothing changes on the blockchain.");
+    } else {
+        text = QStringLiteral("Not every address has answered, so what smaller gaps leave out is not known.");
+        detail = QStringLiteral("GitWallet could stop showing and watching addresses it has not read, and their "
+                                "balances would not count in the totals, until the gaps are raised again. Nothing "
+                                "changes on the blockchain.");
     }
-    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Smaller gaps"), text, QMessageBox::NoButton, this);
+    if (left.atMost)
+        detail += QLatin1Char(' ') + QStringLiteral("A scan stops at a limit that these gaps go past.");
+    if (left.used > 0 && unknown)
+        detail += QLatin1Char(' ') + QStringLiteral("Not every address has answered, so there may be more.");
+    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Changing the gaps"), text, QMessageBox::NoButton, this);
     box->setInformativeText(detail);
     QPushButton* saveAnyway = box->addButton(QStringLiteral("Save anyway"), QMessageBox::DestructiveRole);
     saveAnyway->setObjectName(QStringLiteral("dangerButton"));

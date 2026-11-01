@@ -13,6 +13,7 @@
 #include "ui/ThemeManager.h"
 #include "ui/XpubField.h"
 #include "ui/design/Style.h"
+#include "wallet/BulkImport.h"
 #include "wallet/Types.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
@@ -359,10 +360,9 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
 
     const page::ActionBar bar = page::makeActionBar(this);
     ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search wallet name"));
-    ui_->count = new QLabel(bar.widget);
-    ui_->count->setObjectName(QStringLiteral("mimCount"));
+    ui_->count = page::makeBarCount(bar.widget);
     bar.left->addWidget(ui_->search);
-    page::addBarCount(bar, ui_->count);
+    page::finishBarLeft(bar, ui_->search, ui_->count);
 
     ui_->keys = new QPushButton(QStringLiteral("Public keys"), bar.widget);
     ui_->rename = new QPushButton(QStringLiteral("Rename"), bar.widget);
@@ -506,10 +506,17 @@ void WalletsPage::renameSelected()
     connect(cancel, &QPushButton::clicked, dialog, &QDialog::reject);
     connect(save, &QPushButton::clicked, dialog, [this, dialog, name, status, id] {
         QString error;
-        if (controller_->renameWallet(id, name->text(), &error))
+        const bool renamed = controller_->renameWallet(id, name->text(), &error);
+        if (renamed) {
             dialog->accept();
-        else
-            setStatus(status, error, Tone::Error);
+            return;
+        }
+        setStatus(status, error, Tone::Error);
+        // Not kept on screen either, if that is why it was refused.
+        if (wallet::looksLikeSecret(name->text(), wallet::WalletStore::kMaxLabelChars)) {
+            name->setText(QString(name->text().size(), QLatin1Char(' ')));
+            name->clear();
+        }
     });
     page::fitDialog(dialog, page::DialogSize::Compact);
     // open(), not exec(): no nested event loop while the scanners keep running.

@@ -3,15 +3,21 @@
 #include <QList>
 #include <QString>
 #include <QStringList>
+#include <QStringView>
 
 #include <string>
 #include <vector>
 
 // Reads what a person pastes or loads to add many wallets at once: one wallet per
-// line, with an optional name in front ("Shop 1: word word ..."). A separator of
-// ':', ';', ',' or a tab follows the name, so a two-column CSV reads as it is; a line
+// line, with an optional name ("Shop 1: word word ...", "word word ..., Shop 1"). A
+// name ends at a ':' or a tab, else at the first ',' or ';', and a first field in
+// quotes is that field whatever it holds, so a two-column CSV reads as it is. A line
 // numbered "12." or "12)" is the same line without the number; blank lines and lines
-// starting with '#' are skipped.
+// starting with '#' are skipped, unless what follows the '#' is a phrase.
+//
+// A line that can be read two ways is refused, not guessed at: taking a name for part
+// of a phrase, or the end of a phrase for a seed of its own, would show another seed's
+// balances and write seed words to disk as a name.
 namespace wallet {
 
 // One line of seeds. The words are secret: they are scrubbed when the line goes, and
@@ -29,10 +35,12 @@ struct SeedLine {
     SeedLine& operator=(SeedLine&&) = delete;
     ~SeedLine() { wipe(); }
 
-    void wipe(); // scrubs and drops the words
+    void wipe(); // scrubs and drops the words and the name
 };
 
-// `text` holds its lines separated by '\n'. It may hold tabs, not other control characters.
+// `text` holds its lines separated by '\n'. It may hold tabs, not other control
+// characters. Words in compatibility forms (full-width letters, a ligature) read as
+// BIP39's NFKD makes them; a name stays as typed.
 std::vector<SeedLine> parseSeedLines(const std::string& text);
 
 // One line of public keys: one wallet.
@@ -45,9 +53,15 @@ struct KeyLine {
 
 QList<KeyLine> parseKeyLines(const QString& text);
 
-// A phrase in a place that is not for seeds: the 12 or more BIP39 words of a whole one,
-// or 5 on a line as long as a wallet's name may be, which is where a longer phrase was
-// cut. A real name, even one made of list words, hardly ever has that many.
-bool looksLikeSeedWords(const QString& line);
+// A phrase in a place that is not for seeds: a run of 12 BIP39 words on a line, whatever
+// parts them, read the way the seed fields read them. With `cutAt`, the length the text
+// was cut to if it was: at that length a run of 5 is enough, which is what is left of a
+// longer phrase. A real name or a sentence is hardly ever such a run.
+bool looksLikeSeedWords(QStringView text, int cutAt = 0);
+// An extended private key, a WIF or a raw key in hex anywhere on the line.
+bool looksLikePrivateKey(QStringView text);
+bool looksLikeSecret(QStringView text, int cutAt = 0);
+// Any line of a list of public keys holds one, comments included.
+bool keyListHoldsSecret(const QString& text);
 
 } // namespace wallet

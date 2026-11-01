@@ -81,16 +81,19 @@ public:
     // kept aside at the next add, or moved by hand if it cannot even be opened.
     QString unreadFileNote() const;
 
-    // Addresses with history that `settings` would leave out: a fresh scan walks
-    // each chain from index 0 and stops once a gap of unused addresses follows the
-    // last used one, or at the Bitcoin row limit, which falls with the gaps. What
-    // this session's rows say: only the addresses that have answered so far.
+    // Addresses with history that `settings` would leave out. When a gap falls the rows
+    // go and a fresh scan walks each chain from index 0, stopping once a gap of unused
+    // addresses follows the last used one; any scan also stops at the limit over all
+    // accounts. What this session's rows say: only the addresses answered so far.
     struct GapImpact {
-        int used = 0;       // used addresses past where the scan would stop
-        int funded = 0;     // those holding a balance
-        bool atMost = false; // the row limit cuts some: which ones depends on the scan
+        int used = 0;         // used addresses past where the scan would stop
+        int funded = 0;       // those holding a balance
+        bool atMost = false;  // the limit cuts some of them: which ones depends on the scan
+        qint64 overLimit = 0; // addresses wanted past the limit, beyond those of the settings in use
     };
     GapImpact gapImpact(const wallet::ScanSettings& settings) const;
+    // A gap that falls takes the rows with it (applySettings).
+    static bool gapsFall(const wallet::ScanSettings& from, const wallet::ScanSettings& to);
 
     // Every account of the wallet has rows, on both chains of a Bitcoin account.
     bool walletHasAllRows(const wallet::WalletEntry& entry) const;

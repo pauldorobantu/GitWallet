@@ -545,8 +545,11 @@ bool MainWindow::pruneNotices()
     if (notices_.isEmpty())
         return false;
     const Inputs now = currentInputs();
-    const qsizetype dropped = notices_.removeIf([&now](const Notice& n) {
+    const qsizetype dropped = notices_.removeIf([this, &now](const Notice& n) {
         const Inputs& was = n.inputs;
+        // The only line that names the file kept aside: it stays as long as the file does.
+        if (n.key == QLatin1String("file-set-aside"))
+            return controller_->walletFilesKeptAside() == 0;
         if (was.wallet != now.wallet)
             return true; // another wallet, or none
         const bool btcGaps = was.receiveGap != now.receiveGap || was.changeGap != now.changeGap;
