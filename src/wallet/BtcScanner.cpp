@@ -3,6 +3,7 @@
 #include "net/ElectrumClient.h"
 #include "wallet/WalletModel.h"
 
+#include <QDebug>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -24,7 +25,8 @@ namespace {
 // Requests this scanner keeps handed to the client at once. The client sends
 // kMaxInFlight (64) and queues the rest; feeding it in slices as replies come
 // back keeps that queue short, so a reconnect re-sends little and a balance
-// fetch never waits behind thousands of subscriptions.
+// fetch never waits behind thousands of subscriptions. (onClientReady() alone
+// goes past it: see there.)
 constexpr int kMaxOutstanding = 100;
 
 // Addresses derived per event-loop turn. Each costs a CKDpub, the script
@@ -37,11 +39,24 @@ constexpr qint64 kProgressIntervalMs = 250;
 // The controller clamps gaps itself; this only guards another caller.
 constexpr int kMaxGap = 100000;
 
-// Addresses derived per chain at most. Every used status pushes the window
-// `gap` rows further, and the model never drops a row, so a buggy or hostile
-// server that calls every address used would otherwise grow the wallet until
-// memory runs out. Far above what a shop seed needs (the controller's largest
-// gap is 5,000), and well below 2^31, where non-hardened BIP32 indices end.
+// Bitcoin rows one scan follows at most, all chains together: kRowsPerGapRow
+// times the sum of the chains' gaps, within [kMinWalletRows, kMaxWalletRows].
+// Every used status pushes a window `gap` rows further and the model never
+// drops a row, so a buggy or hostile server that calls every address used
+// would otherwise grow the wallet, its subscriptions and its balance requests
+// without end (a limit per chain still let six chains reach six times as
+// much). Each chain's own gap window is always derived, inside the limit; the
+// rest leaves room for close to 10,000 used addresses or more at any gap the
+// controller allows (20 to 5,000). The ceiling stays below what public servers
+// let one client subscribe (ElectrumX: 50,000 per session by default; Fulcrum:
+// 75,000 per IP), so an honest server never refuses part of a full wallet.
+constexpr qint64 kRowsPerGapRow = 20;
+constexpr int kMinWalletRows = 10000;
+constexpr int kMaxWalletRows = 40000;
+
+// The end of a chain's indices. Only a gap window larger than the row limit (a
+// caller other than the controller) gets near it; well below 2^31, where
+// non-hardened BIP32 indices end.
 constexpr int kMaxChainRows = 100000;
 
 // Failed requests (a refused subscription, a failed balance) go out again
@@ -53,17 +68,18 @@ constexpr int kRetryMaxMs = 5 * 60 * 1000;
 // 21 million BTC in satoshis: a reply above it is garbage, not a balance.
 constexpr qint64 kMaxSats = 2100000000000000LL;
 
-// Distinct error texts emitted per start(). Past that a misbehaving server
+// Distinct problems reported per start(). Past that a misbehaving server
 // would only bury the user in toasts.
 constexpr int kMaxErrorsPerRun = 8;
 
-// The text ElectrumClient gives pending replies when it is stopped. It is a
-// local event, not a server message, and it means the client dropped every
-// subscription.
-bool isStopped(const QString& error)
-{
-    return error == QLatin1String("stopped");
-}
+// Characters of a server's own error text that problem() passes on.
+constexpr qsizetype kMaxDetailChars = 200;
+
+// The status of a scripthash is the SHA-256 of its history (64 hex digits), or
+// null when it has none. This is the SHA-256 of nothing: a server that hashes
+// an empty history instead of answering null still says "no history". Read as
+// used, it would push every window further, address after address.
+constexpr QLatin1String kEmptyHistoryStatus("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
 qint64 nowMs()
 {
@@ -71,13 +87,31 @@ qint64 nowMs()
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// blockchain.scripthash.subscribe result: null = no history, otherwise the
-// status hash. 0 unused, 1 used, -1 neither (a malformed reply).
-int parseStatus(const QJsonValue& v)
+// A status as text: "" (no history) or 64 hex digits. 0 unused, 1 used, -1
+// neither (malformed). `normalized` receives "" or the lowercase hash, so a
+// status compares equal however a server spells it.
+int parseStatusText(const QString& text, QString* normalized)
 {
-    if (v.isNull()) return 0;
-    if (v.isString()) return v.toString().isEmpty() ? 0 : 1;
-    return -1;
+    normalized->clear();
+    if (text.isEmpty()) return 0;
+    const bool hex = text.size() == 64 && std::all_of(text.cbegin(), text.cend(), [](QChar ch) {
+                         const char16_t u = ch.unicode();
+                         return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'f') || (u >= u'A' && u <= u'F');
+                     });
+    if (!hex) return -1;
+    const QString lower = text.toLower();
+    if (lower == kEmptyHistoryStatus) return 0;
+    *normalized = lower;
+    return 1;
+}
+
+// blockchain.scripthash.subscribe result: null = no history, otherwise the
+// status hash. As parseStatusText(); any other JSON type is malformed.
+int parseStatus(const QJsonValue& v, QString* normalized)
+{
+    if (v.isString()) return parseStatusText(v.toString(), normalized);
+    normalized->clear();
+    return v.isNull() ? 0 : -1;
 }
 
 // blockchain.scripthash.get_balance result: {"confirmed": sats, "unconfirmed":
@@ -99,12 +133,36 @@ bool parseBalance(const QJsonValue& v, qint64* confirmed, qint64* unconfirmed)
     return true;
 }
 
+// What an Electrum server wrote (a JSON-RPC error text, a bad status), fit to
+// pass on as problem()'s serverDetail: one line, without control or bidi
+// characters, at most kMaxDetailChars long. Whatever it says, it stays apart
+// from GitWallet's own message; only the UI decides what of it to show.
+QString serverDetail(const QString& text)
+{
+    QString line;
+    line.reserve(text.size());
+    for (const QChar c : text) {
+        if (c.isSpace())
+            line.append(QLatin1Char(' '));
+        else if (c.category() != QChar::Other_Control && c.category() != QChar::Other_Format)
+            line.append(c);
+    }
+    line = line.simplified();
+    if (line.size() > kMaxDetailChars) {
+        qsizetype cut = kMaxDetailChars - 1; // room for the ellipsis
+        if (line.at(cut - 1).isHighSurrogate()) --cut; // never half a character
+        line.truncate(cut);
+        line.append(QChar(u'…'));
+    }
+    return line;
+}
+
 // Some servers quote the scripthash in their error text ("<hash> is not a valid
-// script hash"); with it masked, one failure on 500 addresses is one message.
-QString errorKey(const QString& message)
+// script hash"); with it masked, one failure on 500 addresses is one report.
+QString errorKey(const QString& text)
 {
     static const QRegularExpression hex(QStringLiteral("[0-9A-Fa-f]{32,}"));
-    QString key = message.trimmed();
+    QString key = text.trimmed();
     key.replace(hex, QStringLiteral("#"));
     return key;
 }
@@ -121,6 +179,13 @@ int BtcScanner::Chain::window() const
 int BtcScanner::Chain::target() const
 {
     return std::min(window(), kMaxChainRows);
+}
+
+int BtcScanner::Chain::base() const
+{
+    // The window as it stands with nothing used: what the gap alone asks for,
+    // plus the rows of another wallet to replace.
+    return std::min(std::max(floor, gap), kMaxChainRows);
 }
 
 BtcScanner::BtcScanner(net::ElectrumClient* client, WalletModel* model, QObject* parent)
@@ -158,11 +223,11 @@ void BtcScanner::setGaps(int receiveGap, int changeGap)
     receiveGap_ = std::clamp(receiveGap, 1, kMaxGap);
     changeGap_ = std::clamp(changeGap, 1, kMaxGap);
     // A running scan follows at once. Rows already derived stay (the model
-    // never drops rows), so a smaller gap only stops further growth.
+    // never drops rows), so a smaller gap only stops further growth. The row
+    // limit moves with the gaps; deriveSlice() reports a window it cuts short.
     for (Chain& c : chains_) c.gap = c.change == 0 ? receiveGap_ : changeGap_;
     if (!running_) return;
     scheduleDerive();
-    reportLimits();
 }
 
 void BtcScanner::start()
@@ -183,24 +248,25 @@ void BtcScanner::start()
     checked_ = 0;
     retryDelayMs_ = 0;
     retryArmed_ = false; // a round still posted by the previous run sees the old generation
-    resubscribeAll_ = false;
     idleReported_ = false;
     finished_ = false;
+    limitReported_ = false;
     if (!client_ || !model_) {
         running_ = false;
         return;
     }
 
     // Reported once the state below is complete: a listener may react by
-    // restarting the scan.
-    QStringList problems;
+    // restarting the scan. The reasons are the wallet's own (its stored keys),
+    // never a server's.
+    QStringList skipped;
     for (const AccountKey& acct : accounts_) {
         const QString where = QString::fromStdString(chain::accountRootPath(acct.type, acct.account));
         chain::HdPubKey accountNode;
         try {
             accountNode = acct.node();
         } catch (const std::exception& e) {
-            problems.append(QStringLiteral("Bitcoin account %1 skipped: %2").arg(where, QString::fromUtf8(e.what())));
+            skipped.append(QStringLiteral("Bitcoin account %1 skipped: %2").arg(where, QString::fromUtf8(e.what())));
             continue;
         }
         for (quint32 change = 0; change <= 1; ++change) {
@@ -212,8 +278,8 @@ void BtcScanner::start()
             try {
                 c.node = accountNode.deriveChild(change);
             } catch (const std::exception& e) {
-                problems.append(QStringLiteral("Bitcoin chain %1/%2 skipped: %3")
-                                    .arg(where, QString::number(change), QString::fromUtf8(e.what())));
+                skipped.append(QStringLiteral("Bitcoin chain %1/%2 skipped: %3")
+                                   .arg(where, QString::number(change), QString::fromUtf8(e.what())));
                 continue;
             }
             chains_.append(c);
@@ -227,38 +293,47 @@ void BtcScanner::start()
     scheduleDerive();
     noteProgress();
     const quint64 gen = generation_;
-    for (const QString& p : problems) {
-        reportError(p);
+    for (const QString& s : std::as_const(skipped)) {
+        report(Problem::Skipped, s);
         if (gen != generation_) return;
     }
-    reportLimits(); // rows adopted from a run that already reached the limit
 }
 
 void BtcScanner::adoptModelRows()
 {
     // Rows already in the model (an earlier start(), e.g. after a settings
-    // change) are adopted instead of derived again: no duplicates, their last
-    // known state stays on screen, and lastUsed is known before any reply.
+    // change) are adopted instead of derived again once the window reaches
+    // them: no duplicates, and their last known state stays on screen
+    // meanwhile. Their flags do not set the window, though: they came from the
+    // previous server and gaps, and that server may be the very reason for the
+    // change (a buggy or hostile one calls every address used). The window is
+    // found again from this run's statuses, so another server or a smaller gap
+    // really undoes a window an earlier server inflated, and the rows past it
+    // are no longer subscribed. Rows that hold coins are followed from the
+    // start wherever they are, so no balance on screen goes stale: the server
+    // confirms them (a used one then moves the window past it) or clears them.
     QList<int> probeIndex(chains_.size(), -1);
     QList<QString> probeHash(chains_.size());
+    QList<int> rowsEnd(chains_.size(), 0); // highest index in the model + 1
+    QList<QStringList> funded(chains_.size());
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
         if (!row.isBitcoin() || row.index >= quint32(kMaxChainRows)) continue; // never derived
         const int ci = findChain(row.type, row.account, row.change);
         if (ci < 0) continue;
-        Chain& c = chains_[ci];
         const int index = static_cast<int>(row.index);
-        c.floor = std::max(c.floor, index + 1);
-        if (row.used) c.lastUsed = std::max(c.lastUsed, index);
+        const QString sh = row.scripthash.toLower();
+        rowsEnd[ci] = std::max(rowsEnd[ci], index + 1);
+        if ((row.btcConfirmed != 0 || row.btcUnconfirmed != 0) && !sh.isEmpty()) funded[ci].append(sh);
         if (probeIndex[ci] < 0 || index < probeIndex[ci]) {
             probeIndex[ci] = index;
-            probeHash[ci] = row.scripthash.toLower();
+            probeHash[ci] = sh;
         }
     }
 
     // One derivation per chain proves the rows came from this xpub. Rows left
-    // over from another wallet are derived again instead, with none of their
-    // flags trusted, so no foreign address survives on screen.
+    // over from another wallet are all derived again instead (floor), with none
+    // of their flags trusted, so no foreign address survives on screen.
     for (int ci = 0; ci < chains_.size(); ++ci) {
         if (probeIndex[ci] < 0) continue;
         Chain& c = chains_[ci];
@@ -269,7 +344,16 @@ void BtcScanner::adoptModelRows()
         } catch (const std::exception&) {
             c.reuse = false;
         }
-        if (!c.reuse) c.lastUsed = -1;
+        if (!c.reuse) {
+            c.floor = rowsEnd[ci];
+            continue;
+        }
+        // Not through track(): no progress() while start() is half done.
+        for (const QString& sh : std::as_const(funded[ci])) {
+            if (tracked_.contains(sh)) continue;
+            tracked_.insert(sh, Tracked());
+            subQueue_.append(sh);
+        }
     }
 }
 
@@ -284,7 +368,6 @@ void BtcScanner::stop()
     retry_.clear();
     balanceRetry_.clear();
     retryArmed_ = false; // the posted round sees the old generation and does nothing
-    resubscribeAll_ = false;
     subSent_ = 0;
     balanceSent_ = 0;
     // tracked_ and checked_ stay, so checkedCount() / derivedCount() describe
@@ -295,6 +378,17 @@ void BtcScanner::stop()
 bool BtcScanner::isScanning() const
 {
     return busy();
+}
+
+bool BtcScanner::limitReached() const
+{
+    // A window that wants rows this scan may not derive: the row limit (or, for
+    // a gap larger than the limit, the end of a chain's indices) cuts it short.
+    // While it does, the scan never finishes (busy()), and the addresses past
+    // the cut go unchecked.
+    if (!running_) return false;
+    return std::any_of(chains_.cbegin(), chains_.cend(),
+                       [this](const Chain& c) { return c.next < c.window() && !mayDerive(c); });
 }
 
 int BtcScanner::checkedCount() const
@@ -311,23 +405,42 @@ int BtcScanner::derivedCount() const
 
 void BtcScanner::onClientReady()
 {
-    if (!running_) return;
-    if (resubscribeAll_) {
-        // The client was stopped and started again under a running scan,
-        // which clears its subscriptions (a plain reconnect restores them
-        // inside the client): every followed address is subscribed again.
-        resubscribeAll_ = false;
-        retry_.clear();
-        for (auto it = tracked_.begin(); it != tracked_.end(); ++it) {
-            if (it->sub == SubState::Live || it->sub == SubState::Retry) {
-                it->sub = SubState::Queued;
-                subQueue_.append(it.key());
-            }
+    if (!running_ || !client_) return;
+    // A new connection: after a drop (possibly to another server), or the
+    // client started again under the scan, which forgets every subscription.
+    // The client would restore the subscriptions by itself, but a refused
+    // restore never reaches this scanner (for an unused address not even as a
+    // notification): the address would still count as followed while no
+    // server watches it and nothing polls it. So the scanner subscribes again
+    // everything it follows, from here, and the client restores nothing whose
+    // subscribe is already queued when ready() returns. Every answer comes
+    // back through onSubscribeReply(): a refusal goes to Retry and is polled
+    // like any other, a status that moved meanwhile is applied. Subscriptions
+    // still on their way (Sent) are re-sent by the client itself.
+    retry_.clear();
+    QStringList again;
+    for (auto it = tracked_.begin(); it != tracked_.end(); ++it) {
+        if (it->sub == SubState::Live || it->sub == SubState::Retry) {
+            it->sub = SubState::Queued;
+            again.append(it.key());
         }
     }
-    // Refused subscriptions and failed balances get another try now, possibly
-    // on another server, without waiting for the retry round.
-    requeueFailed();
+    // All of them now, past kMaxOutstanding: only what is queued before ready()
+    // returns keeps the client from restoring it a second time, and the client
+    // would have queued just as many.
+    const quint64 gen = generation_;
+    for (const QString& sh : std::as_const(again)) {
+        if (gen != generation_ || !running_) return;
+        if (client_ && client_->isReady())
+            sendSubscribe(sh);
+        else
+            subQueue_.append(sh); // the connection went meanwhile: paced, once it is back
+    }
+    // Failed balances get another try now, possibly on another server,
+    // without waiting for the retry round.
+    const QSet<QString> balances = std::exchange(balanceRetry_, QSet<QString>());
+    for (const QString& sh : balances) queueBalance(sh);
+    idleReported_ = false;
     schedulePump();
 }
 
@@ -340,12 +453,25 @@ void BtcScanner::onScripthashChanged(const QString& scripthash, const QString& s
     if (!row.isBitcoin() || findChain(row.type, row.account, row.change) < 0) return; // not ours
     const QString sh = row.scripthash.toLower(); // the spelling tracked_ uses
 
+    QString text;
+    const int parsed = parseStatusText(status, &text);
+    if (parsed < 0) {
+        // It proves neither history nor its absence; the balance does (coins
+        // mark the address used).
+        queueBalance(sh);
+        schedulePump();
+        report(Problem::Failure, QStringLiteral("An Electrum server sent an invalid address status."), status);
+        return;
+    }
     // A subscribe reply already on its way may predate this status; one sent
     // later (or a row not followed yet in this run) is at least as new.
     const auto it = tracked_.find(sh);
-    if (it != tracked_.end() && it->sub == SubState::Sent) it->notified = true;
+    if (it != tracked_.end()) {
+        if (it->sub == SubState::Sent) it->notified = true;
+        it->status = text;
+    }
     const quint64 gen = generation_;
-    applyStatus(sh, !status.isEmpty());
+    applyStatus(sh, parsed == 1);
     if (gen != generation_) return;
     // The status changes with every new transaction, confirmation or reorg,
     // so the balance is fetched again even when `used` stayed the same.
@@ -386,18 +512,22 @@ void BtcScanner::deriveSlice()
 {
     if (!running_ || !model_) return;
     const quint64 gen = generation_;
-    int budget = kDeriveSlice;
-    for (int ci = 0; ci < chains_.size() && budget > 0; ++ci) {
-        while (budget > 0 && chains_.at(ci).next < chains_.at(ci).target()) {
+    int slice = kDeriveSlice;
+    for (int ci = 0; ci < chains_.size() && slice > 0; ++ci) {
+        while (slice > 0 && mayDerive(chains_.at(ci))) {
             const int index = chains_[ci].next++;
-            budget -= adoptOrDerive(ci, index);
+            slice -= adoptOrDerive(ci, index);
             // A model listener may have restarted or stopped the scan.
             if (gen != generation_ || !running_ || !model_) return;
         }
     }
-    const bool more = std::any_of(chains_.cbegin(), chains_.cend(),
-                                  [](const Chain& c) { return c.next < c.target(); });
-    if (more) scheduleDerive();
+    const bool more = std::any_of(chains_.cbegin(), chains_.cend(), [this](const Chain& c) { return mayDerive(c); });
+    if (more) {
+        scheduleDerive();
+    } else {
+        reportLimits();
+        if (gen != generation_ || !running_) return; // a problem() listener restarted or stopped the scan
+    }
     schedulePump();
     checkIdle();
 }
@@ -426,10 +556,11 @@ int BtcScanner::adoptOrDerive(int chainIndex, int index)
         row.address = QString::fromStdString(info.address);
         row.scripthash = QString::fromStdString(info.electrumScripthash);
     } catch (const std::exception& e) {
-        // CKDpub fails for about one index in 2^127; BIP32 says to skip it.
-        reportError(QStringLiteral("%1 skipped: %2")
-                        .arg(QString::fromStdString(chain::accountPath(c.type, c.account, c.change, i)),
-                             QString::fromUtf8(e.what())));
+        // CKDpub fails for about one index in 2^127; BIP32 says to skip it, so
+        // no address is missing and there is nothing to report as a problem.
+        qInfo().noquote() << QStringLiteral("%1 skipped: %2")
+                                 .arg(QString::fromStdString(chain::accountPath(c.type, c.account, c.change, i)),
+                                      QString::fromUtf8(e.what()));
         return 1;
     }
     const QString sh = row.scripthash;
@@ -445,6 +576,30 @@ void BtcScanner::track(const QString& scripthash)
     subQueue_.append(scripthash);
     idleReported_ = false;
     noteProgress();
+}
+
+int BtcScanner::rowLimit() const
+{
+    qint64 gaps = 0;
+    for (const Chain& c : chains_) gaps += c.gap;
+    return static_cast<int>(std::clamp(gaps * kRowsPerGapRow, qint64(kMinWalletRows), qint64(kMaxWalletRows)));
+}
+
+qint64 BtcScanner::reservedRows() const
+{
+    // Kept free inside the limit: a chain that grows first must not crowd
+    // another out of the addresses its gap alone asks for.
+    qint64 rows = 0;
+    for (const Chain& c : chains_) rows += std::max(0, c.base() - c.next);
+    return rows;
+}
+
+bool BtcScanner::mayDerive(const Chain& c) const
+{
+    if (c.next >= c.target()) return false;
+    if (c.next < c.base()) return true;
+    // Growth a used status asked for: only within the row limit.
+    return qint64(tracked_.size()) + reservedRows() < rowLimit();
 }
 
 // ----------------------------------------------------------------- requests ----
@@ -490,12 +645,15 @@ void BtcScanner::sendSubscribe(const QString& scripthash)
     client_->subscribeScripthash(scripthash, [self, gen, scripthash](const QJsonValue& result,
                                                                      const QString& error) {
         // Runs exactly once, possibly after the scanner is gone.
-        if (self) self->onSubscribeReply(gen, scripthash, error.isEmpty() ? parseStatus(result) : -1, error);
+        if (!self) return;
+        QString status;
+        const int parsed = error.isEmpty() ? parseStatus(result, &status) : -1;
+        self->onSubscribeReply(gen, scripthash, parsed, status, error);
     });
 }
 
 void BtcScanner::onSubscribeReply(quint64 generation, const QString& scripthash, int status,
-                                  const QString& error)
+                                  const QString& statusText, const QString& error)
 {
     if (outstanding_ > 0) --outstanding_;
     schedulePump();
@@ -511,8 +669,10 @@ void BtcScanner::onSubscribeReply(quint64 generation, const QString& scripthash,
         // on a stable connection only the round brings it back.
         it->sub = SubState::Retry;
         retry_.append(scripthash);
-        if (isStopped(error)) {
-            resubscribeAll_ = true;
+        if (droppedByClient(error)) {
+            // Nobody refused it: the client was stopped under the scan. The
+            // round armed here asks again should no ready() come first.
+            armRetry();
             return;
         }
         // get_balance does not need the subscription: coins on an address
@@ -521,19 +681,34 @@ void BtcScanner::onSubscribeReply(quint64 generation, const QString& scripthash,
         // it. Each round asks again, which also keeps that balance current.
         queueBalance(scripthash);
         armRetry();
-        reportError(error.isEmpty() ? QStringLiteral("An Electrum server sent an invalid address status.")
-                                    : error);
+        report(Problem::Failure,
+               error.isEmpty() ? QStringLiteral("An Electrum server sent an invalid address status.")
+                               : QStringLiteral("An Electrum server refused to follow an address."),
+               error);
         return;
     }
 
     it->sub = SubState::Live;
     // A notification that arrived while this reply was on its way is newer.
-    if (!it->notified) {
+    // A subscription made again after a reconnect that finds the status it
+    // knew changes nothing: the balance that status implies is known, or on
+    // its way (a pending request is sent again, a failed one retried).
+    if (!it->notified && !(it->confirmed && it->status == statusText)) {
+        it->status = statusText;
         applyStatus(scripthash, status == 1);
         if (generation != generation_) return;
     }
     markConfirmed(scripthash);
     checkIdle();
+}
+
+bool BtcScanner::droppedByClient(const QString& error) const
+{
+    // ElectrumClient::stop() fails every pending request with "stopped", after
+    // it stopped being ready. A server can send that very text as well, but a
+    // server's reply only ever arrives while the client is ready: the state
+    // tells the two apart where the text cannot.
+    return error == QLatin1String("stopped") && (!client_ || !client_->isReady());
 }
 
 void BtcScanner::queueBalance(const QString& scripthash)
@@ -578,17 +753,23 @@ void BtcScanner::onBalanceReply(quint64 generation, quint64 seq, const QString& 
         if (ok) {
             balanceRetry_.remove(scripthash);
             applyBalance(scripthash, confirmed, unconfirmed);
-        } else if (isStopped(error)) {
-            resubscribeAll_ = true; // fetched again after the re-subscription
         } else {
-            // The old balance stays meanwhile. Nothing else would ask again: a
-            // reconnect restores the subscription without a notification when
-            // the status is unchanged, and a shop address that is paid once
-            // never changes again. Until the retry gets through, the scan is
-            // not finished, so no total is presented as complete.
+            // The old balance stays meanwhile, and so does the row's check: a
+            // used address whose first balance this is stays unchecked. Nothing
+            // else would ask again: a reconnect subscribes again without
+            // fetching the balance when the status is unchanged, and a shop
+            // address that is paid once never changes again. Until the retry
+            // gets through, the scan is not finished, so no total is presented
+            // as complete. The same when the client dropped the request because
+            // it was stopped under the scan, except that no server failed, so
+            // nothing is reported.
             balanceRetry_.insert(scripthash);
             armRetry();
-            reportError(error.isEmpty() ? QStringLiteral("An Electrum server sent an invalid balance.") : error);
+            if (!droppedByClient(error))
+                report(Problem::Failure,
+                       error.isEmpty() ? QStringLiteral("An Electrum server sent an invalid balance.")
+                                       : QStringLiteral("An Electrum server refused a balance request."),
+                       error);
         }
         if (generation != generation_) return;
     }
@@ -641,8 +822,15 @@ void BtcScanner::applyStatus(const QString& scripthash, bool used)
     AddressRow row = model_->at(pos);
     const int ci = findChain(row.type, row.account, row.change);
     const int index = static_cast<int>(row.index);
-    bool changed = !row.checked || row.used != used;
-    row.checked = true;
+    // An unused address is checked with its status alone. A used one is
+    // checked once its balance has answered as well: until its first balance
+    // arrives (an address unknown or unused until now), its zero is no answer
+    // and the row must not read as empty. One whose balance is known (used and
+    // checked) keeps it, checked, until the balance queued below replaces it,
+    // so a new transaction never blanks a row on screen meanwhile.
+    const bool checked = !used || (row.used && row.checked);
+    bool changed = row.checked != checked || row.used != used;
+    row.checked = checked;
     row.used = used;
     if (!used && (row.btcConfirmed != 0 || row.btcUnconfirmed != 0)) {
         // No history means no coins: a balance must not outlive a reorg.
@@ -652,7 +840,9 @@ void BtcScanner::applyStatus(const QString& scripthash, bool used)
     }
     const quint64 gen = generation_;
     if (changed) model_->upsert(row);
-    if (!used || gen != generation_ || !running_) return;
+    if (gen != generation_ || !running_) return;
+    recount(scripthash);
+    if (!used) return;
     queueBalance(scripthash);
     if (ci >= 0) noteUsed(ci, index);
 }
@@ -665,13 +855,15 @@ void BtcScanner::applyBalance(const QString& scripthash, qint64 confirmed, qint6
     AddressRow row = model_->at(pos);
     // Coins imply history, even when no subscription has said so (one a
     // server refused). A zero balance proves nothing either way: such a row
-    // keeps an unknown status instead of showing up as unused.
+    // keeps an unknown status instead of showing up as unused. Any balance,
+    // zero included, completes the check of a row whose status says used.
     const bool coins = confirmed != 0 || unconfirmed != 0;
+    const bool answered = coins || row.used;
     const bool becameUsed = coins && !row.used;
-    const bool becameChecked = coins && !row.checked;
+    const bool becameChecked = answered && !row.checked;
     if (!becameUsed && !becameChecked && row.btcConfirmed == confirmed && row.btcUnconfirmed == unconfirmed)
         return;
-    row.checked = row.checked || coins;
+    row.checked = row.checked || answered;
     row.used = row.used || coins;
     row.btcConfirmed = confirmed;
     row.btcUnconfirmed = unconfirmed;
@@ -679,7 +871,9 @@ void BtcScanner::applyBalance(const QString& scripthash, qint64 confirmed, qint6
     const int index = static_cast<int>(row.index);
     const quint64 gen = generation_;
     model_->upsert(row);
-    if (becameUsed && ci >= 0 && gen == generation_ && running_) noteUsed(ci, index);
+    if (gen != generation_ || !running_) return;
+    recount(scripthash);
+    if (becameUsed && ci >= 0) noteUsed(ci, index);
 }
 
 void BtcScanner::noteUsed(int chainIndex, int index)
@@ -689,27 +883,31 @@ void BtcScanner::noteUsed(int chainIndex, int index)
     c.lastUsed = index;
     // The window always ends `gap` past the last used address, also after the
     // initial scan: a payment to any subscribed address can reveal more.
-    if (c.next < c.target()) scheduleDerive();
-    reportLimits(); // last: an error() listener may restart the scan
+    // deriveSlice() derives what the row limit allows and reports the rest.
+    if (c.next < c.window()) scheduleDerive();
 }
 
 void BtcScanner::reportLimits()
 {
-    // Once per chain and start(): the window wants rows past kMaxChainRows.
-    // The scan still completes up to the limit, so the rows shown stay right.
-    static const QLocale english(QLocale::English, QLocale::UnitedStates); // "100,000", as the UI groups
-    const quint64 gen = generation_;
-    for (int ci = 0; ci < chains_.size(); ++ci) {
-        Chain& c = chains_[ci];
-        if (c.limited || c.window() <= kMaxChainRows) continue;
-        c.limited = true;
-        const QString where = QString::fromStdString(chain::accountRootPath(c.type, c.account))
-                              + QLatin1Char('/') + QString::number(c.change);
-        reportError(QStringLiteral("Stopped at %1 addresses on %2, the limit per chain: the Electrum server "
-                                   "reports addresses that far out as used.")
-                        .arg(english.toString(kMaxChainRows), where));
-        if (gen != generation_) return; // a listener restarted or stopped the scan
-    }
+    // Once per start(), when a window reaches past what this scan may follow.
+    // Everything up to there is followed as usual; the scan then stays
+    // unfinished (busy()), so no total is presented as complete. Emitted past
+    // report()'s cap: it is what explains a scan that never ends.
+    if (limitReported_ || !limitReached()) return;
+    limitReported_ = true;
+    static const QLocale english(QLocale::English, QLocale::UnitedStates); // "15,000", as the UI groups
+    const QString count = english.toString(qlonglong(tracked_.size()));
+    emit problem(Problem::Limit,
+                 rowLimit() < kMaxWalletRows
+                     ? QStringLiteral("Bitcoin scan stopped at %1 addresses, the limit for these gap settings: the "
+                                      "Electrum server reports addresses that far out as used. If this wallet really "
+                                      "uses that many, raise the gaps in Settings; otherwise choose another server.")
+                           .arg(count)
+                     : QStringLiteral("Bitcoin scan stopped at %1 addresses, the most GitWallet follows: the "
+                                      "Electrum server reports addresses that far out as used. If that is wrong, "
+                                      "choose another server in Settings.")
+                           .arg(count),
+                 QString());
 }
 
 void BtcScanner::markConfirmed(const QString& scripthash)
@@ -717,7 +915,22 @@ void BtcScanner::markConfirmed(const QString& scripthash)
     const auto it = tracked_.find(scripthash);
     if (it == tracked_.end() || it->confirmed) return;
     it->confirmed = true;
-    ++checked_;
+    recount(scripthash);
+}
+
+void BtcScanner::recount(const QString& scripthash)
+{
+    // checked_ counts what the rows say, for this run: a row counts once this
+    // run has its status and the row is checked (applyStatus() and
+    // applyBalance() leave a used address unchecked until its first balance).
+    // It can go back down: a new transaction on an unused address.
+    const auto it = tracked_.find(scripthash);
+    if (it == tracked_.end() || !model_) return;
+    const int pos = model_->findByScripthash(scripthash);
+    const bool counted = it->confirmed && pos >= 0 && model_->at(pos).checked;
+    if (counted == it->counted) return;
+    it->counted = counted;
+    checked_ += counted ? 1 : -1;
     noteProgress();
 }
 
@@ -735,13 +948,18 @@ int BtcScanner::findChain(chain::ScriptType type, quint32 account, quint32 chang
 bool BtcScanner::busy() const
 {
     if (!running_) return false;
+    // checked_ leaves out a used address until its first balance has answered,
+    // so the initial scan does not finish while one is on its way or waiting
+    // for its retry.
     if (deriveScheduled_ || checked_ < tracked_.size()) return true;
+    // A window not derived to its end: rows still to come, or a window the row
+    // limit cuts short. Such a scan cannot complete, and must not look complete.
     for (const Chain& c : chains_) {
-        if (c.next < c.target()) return true;
+        if (c.next < c.window()) return true;
     }
     // A balance waiting for its retry counts too: until it arrives, the total
     // may be missing coins.
-    return !subQueue_.isEmpty() || subSent_ > 0 || !retry_.isEmpty() || resubscribeAll_
+    return !subQueue_.isEmpty() || subSent_ > 0 || !retry_.isEmpty()
            || !balanceQueue_.isEmpty() || balanceSent_ > 0 || !balanceRetry_.isEmpty();
 }
 
@@ -781,12 +999,15 @@ void BtcScanner::emitProgress()
     emit progress(checkedCount(), derivedCount());
 }
 
-void BtcScanner::reportError(const QString& message)
+void BtcScanner::report(Problem kind, const QString& message, const QString& serverText)
 {
-    const QString key = errorKey(message);
-    if (key.isEmpty() || reportedErrors_.contains(key) || reportedErrors_.size() >= kMaxErrorsPerRun) return;
+    // The server's wording goes into serverDetail only, cleaned up; `message`
+    // is always one of GitWallet's own sentences.
+    const QString detail = serverDetail(serverText);
+    const QString key = message + QLatin1Char('\n') + errorKey(detail);
+    if (reportedErrors_.contains(key) || reportedErrors_.size() >= kMaxErrorsPerRun) return;
     reportedErrors_.insert(key);
-    emit error(message.trimmed());
+    emit problem(kind, message, detail);
 }
 
 } // namespace wallet

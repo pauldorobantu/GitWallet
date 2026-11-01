@@ -10,6 +10,7 @@
 
 #include <QLocale>
 #include <QStringList>
+#include <QTimer>
 
 #include <exception>
 #include <limits>
@@ -471,9 +472,28 @@ QVariant AddressTableModel::headerData(int section, Qt::Orientation orientation,
 
 void AddressTableModel::appendRows()
 {
-    // The wallet model has already appended when it signals. Rows below rows_
-    // never move (it only appends), so every index a view holds stays valid;
-    // the views learn about the new rows here, inside begin/endInsertRows.
+    // The scanners append one row per signal, hundreds per event-loop turn.
+    // The sorted proxy pays O(rows) for every insert (it shifts its mapping
+    // from the insert point), so announcing each row on its own grows
+    // quadratically: minutes of GUI time when a hostile server pushes a scan
+    // to its row limit. The rows of one turn go out as one insert instead,
+    // which the proxy places in a few runs. Until then the views keep the old
+    // count: data() never reads past rows_, and changeRow() leaves a row that
+    // is not announced yet to its insert.
+    if (announcePosted_)
+        return;
+    announcePosted_ = true;
+    QTimer::singleShot(0, this, [this] {
+        announcePosted_ = false;
+        announceRows();
+    });
+}
+
+void AddressTableModel::announceRows()
+{
+    // The wallet model only appends. Rows below rows_ never move, so every
+    // index a view holds stays valid; the views learn about the new rows here,
+    // inside begin/endInsertRows.
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
     const int size = model ? model->size() : 0;
     if (size <= rows_)
@@ -496,6 +516,8 @@ void AddressTableModel::changeRow(int row)
 
 void AddressTableModel::resetRows()
 {
+    // The reset announces every row; an announceRows() still posted finds
+    // nothing left to add.
     beginResetModel();
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
     rows_ = model ? model->size() : 0;

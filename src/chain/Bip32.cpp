@@ -47,6 +47,14 @@ Bytes serializePub(const secp256k1_pubkey& pub, bool compressed)
     return out;
 }
 
+// Scrubs a buffer of key material when it goes out of scope, so it is wiped on
+// every way out of a function, the throws included.
+struct ScrubOnExit
+{
+    Bytes& buf;
+    ~ScrubOnExit() { secureClear(buf); }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------- HdKey ----
@@ -66,7 +74,10 @@ HdKey::HdKey(HdKey&& other) noexcept
 HdKey& HdKey::operator=(const HdKey& other)
 {
     if (this != &other) {
+        // Private key and chain code together are this node's xprv: wipe both
+        // before their buffers are reused or freed.
         secureClear(priv_);
+        secureClear(chainCode_);
         priv_ = other.priv_;
         chainCode_ = other.chainCode_;
         depth_ = other.depth_;
@@ -79,7 +90,9 @@ HdKey& HdKey::operator=(const HdKey& other)
 HdKey& HdKey::operator=(HdKey&& other) noexcept
 {
     if (this != &other) {
+        // Moving in frees the old buffers as they are: wipe both first.
         secureClear(priv_);
+        secureClear(chainCode_);
         priv_ = std::move(other.priv_);
         chainCode_ = std::move(other.chainCode_);
         depth_ = other.depth_;
@@ -92,13 +105,15 @@ HdKey& HdKey::operator=(HdKey&& other) noexcept
 HdKey::~HdKey()
 {
     secureClear(priv_);
+    secureClear(chainCode_);
 }
 
 HdKey HdKey::fromSeed(const Bytes& seed)
 {
     const std::string keyStr = "Bitcoin seed";
     const Bytes key(keyStr.begin(), keyStr.end());
-    Bytes I = hmacSha512(key, seed);
+    Bytes I = hmacSha512(key, seed); // the master xprv: IL = key, IR = chain code
+    const ScrubOnExit wipeI{I};
 
     HdKey k;
     k.priv_.assign(I.begin(), I.begin() + 32);
@@ -141,7 +156,12 @@ HdKey HdKey::deriveChild(uint32_t index, bool hardened) const
 {
     const uint32_t i = hardened ? (index | 0x80000000u) : index;
 
+    // 37 bytes on either path, reserved up front so the inserts below never
+    // reallocate: growing frees the old block without scrubbing it, and on the
+    // hardened path that block holds 0x00 || kpar.
     Bytes data;
+    const ScrubOnExit wipeData{data};
+    data.reserve(37);
     if (hardened) {
         // 0x00 || ser256(kpar) || ser32(i)
         data.push_back(0x00);
@@ -155,7 +175,8 @@ HdKey HdKey::deriveChild(uint32_t index, bool hardened) const
     ser32(i, ib);
     data.insert(data.end(), ib, ib + 4);
 
-    Bytes I = hmacSha512(chainCode_, data);
+    Bytes I = hmacSha512(chainCode_, data); // IL = tweak, IR = child chain code
+    const ScrubOnExit wipeI{I};             // also on the throw below
     secureClear(data);
 
     HdKey child;

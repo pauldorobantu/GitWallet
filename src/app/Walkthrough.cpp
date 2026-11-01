@@ -12,6 +12,7 @@
 #include <QAbstractItemModel>
 #include <QApplication>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -198,14 +199,22 @@ void Walkthrough::buildSteps()
                     QStringLiteral("wallet.dat holds neither the words nor readable xpubs"));
          },
          nullptr},
-        {QStringLiteral("scan-finished"), nullptr, [this] { return scanFinished_; }, 300000,
+        // scanFinished() says both initial scans are through; the status is
+        // final once nothing else holds a balance back (the connection, a
+        // balance fetched again, an Ethereum pass that failed).
+        {QStringLiteral("scan-finished"), nullptr,
+         [this, controller] { return scanFinished_ && controller()->balancesComplete(); }, 300000,
          [this, controller] {
              const wallet::WalletModel* m = controller()->model();
              expect(m->size() > 0, QStringLiteral("addresses were derived: %1").arg(m->size()));
              expect(m->checkedCount() == m->size(),
                     QStringLiteral("every address was checked (%1 of %2)").arg(m->checkedCount()).arg(m->size()));
-             expect(controller()->statusText().startsWith(QStringLiteral("Up to date")),
-                    QStringLiteral("status: ") + controller()->statusText());
+             const QString status = controller()->statusText();
+             expect(controller()->balancesComplete() && status.startsWith(QStringLiteral("Up to date")),
+                    QStringLiteral("status: ") + status);
+             expect(controller()->ethBalancesAt().isValid(),
+                    QStringLiteral("the Ethereum balances are dated: %1")
+                        .arg(controller()->ethBalancesAt().toString(QStringLiteral("HH:mm:ss"))));
          },
          nullptr},
         {QStringLiteral("addresses"), [this] { window_->showPage(QStringLiteral("addresses")); }, nullptr, 3000,
@@ -290,9 +299,15 @@ void Walkthrough::buildSteps()
              connect(window_->controller(), &WalletController::scanFinished, this,
                      [this] { scanFinished_ = true; });
          },
-         [this, controller] { return scanFinished_ && controller()->hasWallet(); }, 300000,
+         // The totals are compared once the reopened window's are final too.
+         [this, controller] {
+             return scanFinished_ && controller()->hasWallet() && controller()->balancesComplete();
+         },
+         300000,
          [this, controller] {
              expect(controller()->hasWallet(), QStringLiteral("reopened: the wallet loaded from wallet.dat without the seed"));
+             expect(controller()->balancesComplete(),
+                    QStringLiteral("reopened: status ") + controller()->statusText());
              expect(controller()->store().settings.btcReceiveGap == 100,
                     QStringLiteral("reopened: the saved gap (100) persisted"));
              expect(controller()->model()->usedCount() == rowsBeforeReopen_,

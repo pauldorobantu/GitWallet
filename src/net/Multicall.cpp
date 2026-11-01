@@ -224,6 +224,14 @@ bool decodeAggregate3(const QByteArray& returnData, QList<Result>* out)
 
     QList<Result> results;
     results.reserve(count);
+    // Bytes copied out so far. The checks in the loop look at one element at a
+    // time and mid() copies every sub-range, so a forged reply whose 65,536 head
+    // words all point at the same 2 MB tuple would pass each check and ask for
+    // 137 GB of copies from a 4 MB reply. Multicall3's encoding never lets two
+    // elements share bytes, so honest elements together hold fewer bytes than
+    // the reply: capping the total at the reply size keeps the work and the
+    // memory linear in what was received.
+    qsizetype copied = 0;
     for (qsizetype i = 0; i < count; ++i) {
         qsizetype tupleRel = 0;
         if (!readSize(returnData, base + i * kWord, &tupleRel)) return false;
@@ -241,6 +249,10 @@ bool decodeAggregate3(const QByteArray& returnData, QList<Result>* out)
         if (!readSize(returnData, lengthAt, &length)) return false;
         const qsizetype dataAt = lengthAt + kWord;
         if (length > returnData.size() - dataAt) return false;
+        // Before mid() copies anything; copied <= returnData.size(), so the
+        // subtraction cannot go negative and the sum cannot overflow.
+        if (length > returnData.size() - copied) return false;
+        copied += length;
 
         Result r;
         r.success = flag == 1;

@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QLocale>
 #include <QPointer>
 #include <QTimer>
 
@@ -21,19 +22,34 @@ namespace wallet {
 
 namespace {
 
-// 50 addresses per attempt: one JSON-RPC batch (a single HTTP request, see
-// EthRpc::kMaxBatch) plus one eth_call with 151 Multicall3 sub-calls (~1M gas):
-// the chain-id proof, then three balances per address.
-constexpr int kChunk = 50;
-static_assert(kChunk <= net::EthRpc::kMaxBatch, "a chunk must fit one JSON-RPC batch");
+// 49 addresses per attempt. (a) is one JSON-RPC batch of 50 calls, eth_chainId
+// and then the nonces: EthRpc posts up to kMaxBatch calls as a single HTTP
+// request and fails over with the whole of it, so one endpoint answers every
+// call of the batch. (b) is one eth_call with 148 Multicall3 sub-calls (~1M
+// gas): the chain-id proof, then three balances per address.
+constexpr int kChunk = 49;
+static_assert(kChunk + 1 <= net::EthRpc::kMaxBatch,
+              "eth_chainId and the nonces of a chunk must fit one JSON-RPC batch");
 
 constexpr int kMaxRetries = 3; // then the chunk is skipped until the next pass
 constexpr int kRetryMs = 10'000;
 constexpr int kProgressMs = 250;
 constexpr int kMaxGap = 100'000;
+// Rows derived per account at most. Every used address pushes the window `gap`
+// rows further and the model never drops a row, so an endpoint that calls every
+// address used (a nonce of 1, or 1 wei, for each) would otherwise grow the
+// wallet in a pass that never ends, until memory runs out. Far above what a
+// shop seed needs (the controller's largest gap is 5,000), and well below 2^31,
+// where non-hardened BIP32 indices end.
+constexpr qint64 kMaxEthRows = 100'000;
+// A nonce counts the transactions an address has sent. No mainnet address comes
+// anywhere near 2^32 of them, so a larger one is a malformed reply, not proof
+// that the address was used.
+constexpr quint64 kMaxPlausibleNonce = quint64(1) << 32;
 constexpr int kMinRefreshSeconds = 10; // public endpoints rate-limit; never poll faster
 constexpr int kMaxRefreshSeconds = 24 * 3600;
-constexpr qsizetype kMaxReported = 64; // distinct error texts remembered at once
+constexpr qsizetype kMaxReported = 64;      // distinct messages remembered at once
+constexpr qsizetype kMaxServerDetail = 200; // characters of server text a problem() carries
 constexpr quint64 kMainnetChainId = 1;
 constexpr quint32 kGetChainIdSelector = 0x3408e470u; // Multicall3.getChainId()
 
@@ -204,13 +220,39 @@ bool scanFieldsDiffer(const AddressRow& a, const AddressRow& b, const QList<Asse
     return false;
 }
 
-// Server error texts end up in the UI: one short line.
-QString clip(const QString& text)
+// What an endpoint sent (EthRpc's failure texts quote it), as problem() passes
+// it on: kept apart from GitWallet's own sentence and cleaned up, one line of
+// at most kMaxServerDetail characters without control or format characters
+// (bidi overrides, zero-width marks) that would make it read other than it is.
+QString serverDetail(const QString& text)
 {
-    QString s = text.simplified();
-    if (s.size() > 160)
-        s = s.left(159) + QStringLiteral("…");
-    return s;
+    const QList<uint> chars = text.left(4 * kMaxServerDetail).toUcs4(); // lone surrogates read U+FFFD
+    QList<char32_t> kept;
+    kept.reserve(chars.size());
+    for (const uint c : chars) {
+        if (QChar::isSpace(c))
+            kept.append(U' ');
+        else if (QChar::category(c) != QChar::Other_Control && QChar::category(c) != QChar::Other_Format)
+            kept.append(char32_t(c));
+    }
+    QString line = QString::fromUcs4(kept.constData(), kept.size()).simplified();
+    if (line.size() > kMaxServerDetail) {
+        line.truncate(kMaxServerDetail - 1);
+        if (line.back().isHighSurrogate())
+            line.chop(1); // never half a character
+        line += QStringLiteral("…");
+    }
+    return line;
+}
+
+// Settings accept any https URL; this is how a BSC, Polygon, L2 or testnet
+// endpoint gets noticed. Both requests of an attempt word it alike, so an
+// endpoint that fails both proofs is reported once.
+QString notMainnet(const QString& why)
+{
+    return QStringLiteral("Ethereum: the RPC endpoint does not look like Ethereum mainnet (%1), "
+                          "so its answers are ignored; check the Ethereum endpoints in Settings")
+        .arg(why);
 }
 
 } // namespace
@@ -247,9 +289,12 @@ EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
 
     // The window assumes its rows exist; after a clear, start over. A stop() or
     // start() the controller issues right after supersedes this restart, since
-    // the scan itself only begins on the next event-loop turn.
+    // the scan itself only begins on the next event-loop turn. The balances
+    // that balancesAt() dated are gone with the rows, stopped or not.
     if (model_) {
         connect(model_, &WalletModel::cleared, this, [this] {
+            balancesAt_ = QDateTime();
+            refreshFailing_ = false;
             if (running_)
                 start();
         });
@@ -332,6 +377,31 @@ int EthScanner::derivedCount() const
     return derived;
 }
 
+bool EthScanner::limitReached() const
+{
+    for (const AccountState& a : acc_)
+        if (cutAtLimit(a))
+            return true;
+    return false;
+}
+
+bool EthScanner::wrongChain() const
+{
+    // Judged by the endpoint requests go to now: once EthRpc has moved on from
+    // a rejected one, the answers of the next decide.
+    return rpc_ && !offMainnet_.isEmpty() && offMainnet_.contains(rpc_->currentEndpoint());
+}
+
+QDateTime EthScanner::balancesAt() const
+{
+    return balancesAt_;
+}
+
+bool EthScanner::refreshFailing() const
+{
+    return refreshFailing_;
+}
+
 // ------------------------------------------------------------ the window ----
 
 void EthScanner::beginScan()
@@ -350,8 +420,10 @@ void EthScanner::beginScan()
             a.chainNode = key.node().deriveChild(0);
         } catch (const std::exception&) {
             // The parser's own text is not passed on: it could quote the key.
-            report(QStringLiteral("Ethereum account %1: the stored public key could not be read")
-                       .arg(key.account));
+            report({Problem::Skipped,
+                    QStringLiteral("Ethereum account %1: the stored public key could not be read")
+                        .arg(key.account),
+                    QString()});
             continue;
         }
         acc_.append(a);
@@ -377,7 +449,7 @@ void EthScanner::adoptRows(int i)
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
         if (row.type != chain::ScriptType::EthAccount || row.account != a.key.account
-            || row.change != 0)
+            || row.change != 0 || qint64(row.index) >= kMaxEthRows) // past the cap: never derived here
             continue;
         const qint64 index = row.index;
         maxIndex = qMax(maxIndex, index);
@@ -395,18 +467,19 @@ void EthScanner::adoptRows(int i)
     // show someone else's balances; re-deriving one row tells them apart.
     bool replace = false;
     AddressRow probe;
-    QString problem;
-    if (!deriveRow(a, quint32(lowest), &probe, &problem)) {
-        report(problem);
+    QString why;
+    if (!deriveRow(a, quint32(lowest), &probe, &why)) {
+        report({Problem::Skipped, why, QString()});
     } else if (probe.address.compare(lowestAddress, Qt::CaseInsensitive) != 0) {
         replace = true;
         a.lastUsed = -1;
+        balancesAt_ = QDateTime(); // it dated the other key's balances
     }
     ensureRows(i, 0, maxIndex + 1, replace, false); // also fills any gap in the indices
 }
 
 bool EthScanner::deriveRow(const AccountState& account, quint32 index, AddressRow* out,
-                           QString* problem) const
+                           QString* why) const
 {
     try {
         const chain::AddressInfo info = chain::addressFromChainNode(
@@ -421,10 +494,10 @@ bool EthScanner::deriveRow(const AccountState& account, quint32 index, AddressRo
         *out = row;
         return true;
     } catch (const std::exception& e) {
-        *problem = QStringLiteral("Ethereum account %1: address %2 could not be derived (%3)")
-                       .arg(account.key.account)
-                       .arg(index)
-                       .arg(QString::fromUtf8(e.what()));
+        *why = QStringLiteral("Ethereum account %1: address %2 could not be derived (%3)")
+                   .arg(account.key.account)
+                   .arg(index)
+                   .arg(QString::fromUtf8(e.what()));
         return false;
     }
 }
@@ -440,12 +513,13 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
         if (replace
             || model_->find(chain::ScriptType::EthAccount, acc_.at(i).key.account, 0, idx) < 0) {
             AddressRow row;
-            QString problem;
-            if (!deriveRow(acc_.at(i), idx, &row, &problem)) {
+            QString why;
+            if (!deriveRow(acc_.at(i), idx, &row, &why)) {
                 // An underivable index is possible in BIP32 (odds ~2^-127) and
-                // other failures are permanent: the window ends here, visibly.
+                // other failures are permanent: the window ends here, visibly,
+                // and the addresses past it are never scanned.
                 acc_[i].limit = index;
-                report(problem);
+                report({Problem::Skipped, why, QString()});
                 return;
             }
             model_->upsert(row);
@@ -458,12 +532,39 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
     }
 }
 
-// target = lastUsed + 1 + gap: derives (and, during a pass, queues) the rows
-// the window gained since it was last computed.
+// lastUsed + 1 + gap, but never past an index that failed to derive, nor past
+// kMaxEthRows.
+qint64 EthScanner::windowEnd(const AccountState& account) const
+{
+    return qMin(qMin(account.lastUsed + 1 + gap_, account.limit), kMaxEthRows);
+}
+
+// The rows the window wants past kMaxEthRows are neither derived nor checked.
+bool EthScanner::cutAtLimit(const AccountState& account) const
+{
+    return qMin(account.lastUsed + 1 + gap_, account.limit) > kMaxEthRows;
+}
+
+// Derives (and, during a pass, queues) the rows the window gained since it was
+// last computed.
 void EthScanner::extendWindow(int i, bool enqueue)
 {
-    const AccountState& a = acc_.at(i);
-    const qint64 target = qMin(a.lastUsed + 1 + gap_, a.limit);
+    AccountState& a = acc_[i];
+    if (!a.capReported && cutAtLimit(a)) {
+        // Once per account and start(). The passes still check every row up to
+        // the limit, so the rows shown stay right.
+        a.capReported = true;
+        static const QLocale english(QLocale::English, QLocale::UnitedStates); // "100,000", as the UI groups
+        const QString where = QString::fromStdString(
+                                  chain::accountRootPath(chain::ScriptType::EthAccount, a.key.account))
+                              + QStringLiteral("/0");
+        report({Problem::Limit,
+                QStringLiteral("Stopped at %1 addresses on %2, the limit per account: the Ethereum "
+                               "endpoint reports addresses that far out as used.")
+                    .arg(english.toString(kMaxEthRows), where),
+                QString()});
+    }
+    const qint64 target = windowEnd(a);
     if (target > a.end)
         ensureRows(i, a.end, target, false, enqueue);
 }
@@ -477,6 +578,7 @@ void EthScanner::startPass()
     const quint64 gen = gen_;
     passActive_ = true;
     passFailed_ = false;
+    passSkipped_ = false;
     queue_.clear();
     queueHead_ = 0;
     for (int i = 0; i < acc_.size(); ++i) {
@@ -511,12 +613,22 @@ void EthScanner::nextChunk()
     sendNonces();
 }
 
-// (a) One JSON-RPC batch: eth_getTransactionCount of every address in the chunk.
+// (a) One JSON-RPC batch: eth_chainId, then eth_getTransactionCount of every
+// address in the chunk. The batch is a single HTTP request (see kChunk), so its
+// chain id proves where its nonces come from, whichever endpoint answered it;
+// the eth_call of (b) cannot, since EthRpc may fail over between the two. No
+// nonce counts without chain id 1: one read on another chain would mark the
+// address used here (sticky) and push the window. EthRpc itself withholds the
+// answers of an endpoint whose eth_chainId is not 1 and replies with an error
+// instead (EthRpc::isOffChain() tells it apart), so the chain id check here is
+// the second line. Endpoint failure texts quote the endpoint: they go out as
+// the server detail only.
 void EthScanner::sendNonces()
 {
-    chunkErrors_.clear();
+    chunkIssues_.clear();
     QList<QPair<QString, QJsonArray>> calls;
-    calls.reserve(chunk_.size());
+    calls.reserve(1 + chunk_.size());
+    calls.append(qMakePair(QStringLiteral("eth_chainId"), QJsonArray()));
     for (const Slot& s : std::as_const(chunk_))
         calls.append(qMakePair(QStringLiteral("eth_getTransactionCount"),
                                QJsonArray{s.address, QStringLiteral("latest")}));
@@ -526,40 +638,73 @@ void EthScanner::sendNonces()
     const quint64 seq = ++nextSeq_;
     pendingSeq_ = seq;
     QPointer<EthScanner> self(this);
-    rpc_->batch(calls, [self, gen, seq, n](const QList<QJsonValue>& results,
-                                           const QStringList& errors) {
+    rpc_->batch(calls, [self, gen, seq, n](const QList<QJsonValue>& results, const QStringList& errors,
+                                           const QStringList& endpoints) {
         if (!self || !self->acceptReply(gen, seq))
             return;
         QList<quint64> nonces(n, quint64(0));
         QList<bool> ok(n, false);
-        QStringList problems;
-        for (qsizetype i = 0; i < n; ++i) {
-            const QString err = i < errors.size() ? errors.at(i) : QStringLiteral("no reply");
-            if (err.isEmpty() && i < results.size() && parseQuantity(results.at(i), &nonces[i]))
-                ok[i] = true;
-            else if (!err.isEmpty())
-                problems << QStringLiteral("Ethereum nonce lookup failed: %1").arg(clip(err));
-            else
-                problems << QStringLiteral("Ethereum nonce lookup failed: unexpected reply");
+        QList<Issue> issues;
+        const QString idError = errors.value(0, QStringLiteral("no reply"));
+        quint64 chainId = 0;
+        if (!idError.isEmpty() && self->rpc_->isOffChain(endpoints.value(0))) {
+            // EthRpc already skips it; recorded here so wrongChain() can say so.
+            if (!self->offMainnet_.contains(endpoints.value(0)))
+                self->offMainnet_.append(endpoints.value(0));
+            issues << Issue{Problem::WrongChain, notMainnet(QStringLiteral("eth_chainId is not 1")),
+                            serverDetail(idError)};
+        } else if (!idError.isEmpty()) {
+            issues << Issue{Problem::Failure, QStringLiteral("Ethereum nonce lookup failed"),
+                            serverDetail(idError)};
+        } else if (!parseQuantity(results.value(0), &chainId)) {
+            issues << Issue{Problem::Failure,
+                            QStringLiteral("Ethereum nonce lookup failed: no valid chain id in the reply"),
+                            QString()};
+        } else if (chainId != kMainnetChainId) {
+            issues << Issue{Problem::WrongChain, notMainnet(QStringLiteral("chain id %1").arg(chainId)),
+                            QString()};
+            self->refuseEndpoint(endpoints.value(0), true);
+            if (!self || gen != self->gen_)
+                return; // a slot of EthRpc's signals restarted or stopped the scan
+        } else {
+            for (qsizetype i = 0; i < n; ++i) {
+                const qsizetype call = 1 + i; // after eth_chainId
+                const QString err = errors.value(call, QStringLiteral("no reply"));
+                quint64 nonce = 0;
+                if (err.isEmpty() && parseQuantity(results.value(call), &nonce)
+                    && nonce <= kMaxPlausibleNonce) {
+                    nonces[i] = nonce;
+                    ok[i] = true;
+                } else if (!err.isEmpty()) {
+                    issues << Issue{Problem::Failure, QStringLiteral("Ethereum nonce lookup failed"),
+                                    serverDetail(err)};
+                } else {
+                    issues << Issue{Problem::Failure,
+                                    QStringLiteral("Ethereum nonce lookup failed: unexpected reply"),
+                                    QString()};
+                }
+            }
         }
-        problems.removeDuplicates();
-        self->onNonces(nonces, ok, problems);
+        self->onNonces(nonces, ok, issues);
     });
 }
 
 void EthScanner::onNonces(const QList<quint64>& nonces, const QList<bool>& ok,
-                          const QStringList& problems)
+                          const QList<Issue>& issues)
 {
     nonce_ = nonces;
     nonceOk_ = ok;
-    for (const QString& p : problems)
-        noteFailure(p);
+    for (const Issue& issue : issues)
+        noteFailure(issue);
     // (b) runs even when (a) failed: whatever balances arrive are still shown.
     defer(&EthScanner::sendBalances);
 }
 
 // (b) One eth_call to Multicall3.aggregate3: getChainId first, then per address
-// getEthBalance plus balanceOf on every ERC-20 contract, in that order.
+// getEthBalance plus balanceOf on every ERC-20 contract, in that order. An
+// endpoint that answers it with something unusable, or with what shows another
+// chain (or no mainnet state), may well have said chain id 1 to eth_chainId:
+// only this reply gives it away, so it is rejected here, before the retry.
 void EthScanner::sendBalances()
 {
     const QString multicall = QString::fromLatin1(net::multicall::kAddress);
@@ -590,8 +735,10 @@ void EthScanner::sendBalances()
     }
     if (!encoded) {
         applyChunk(QList<bool>(count, false), QList<chain::Amount>(count),
-                   {QStringLiteral("Ethereum balance lookup failed: the Multicall3 request "
-                                   "could not be encoded")},
+                   {Issue{Problem::Failure,
+                          QStringLiteral("Ethereum balance lookup failed: the Multicall3 request "
+                                         "could not be encoded"),
+                          QString()}},
                    false);
         return;
     }
@@ -604,56 +751,62 @@ void EthScanner::sendBalances()
     pendingSeq_ = seq;
     QPointer<EthScanner> self(this);
     rpc_->call(QStringLiteral("eth_call"), QJsonArray{tx, QStringLiteral("latest")},
-               [self, gen, seq, n, tokens = tokens_](const QJsonValue& result,
-                                                     const QString& rpcError) {
+               [self, gen, seq, n, tokens = tokens_](const QJsonValue& result, const QString& rpcError,
+                                                     const QString& endpoint) {
                    if (!self || !self->acceptReply(gen, seq))
                        return;
                    const qsizetype count = n * (1 + tokens.size());
                    QList<bool> known(count, false);
                    QList<chain::Amount> amounts(count);
-                   QStringList problems;
+                   QList<Issue> issues;
                    bool otherChain = false;
+                   bool unusable = false;
                    QString why;
                    if (!rpcError.isEmpty()) {
-                       problems << QStringLiteral("Ethereum balance lookup failed: %1")
-                                       .arg(clip(rpcError));
+                       issues << Issue{Problem::Failure, QStringLiteral("Ethereum balance lookup failed"),
+                                       serverDetail(rpcError)};
                    } else {
                        switch (parseBalances(result, n, tokens, &known, &amounts, &why)) {
                        case BalanceReply::Ok:
+                           self->offMainnet_.removeAll(endpoint); // it serves mainnet (again)
                            if (known.contains(false))
-                               problems << QStringLiteral(
-                                   "Ethereum balance lookup: some balance calls failed");
+                               issues << Issue{Problem::Failure,
+                                               QStringLiteral("Ethereum balance lookup: some balance calls failed"),
+                                               QString()};
                            break;
                        case BalanceReply::Malformed:
-                           problems << QStringLiteral(
-                               "Ethereum balance lookup failed: unexpected Multicall3 reply");
+                           unusable = true;
+                           issues << Issue{Problem::Failure,
+                                           QStringLiteral("Ethereum balance lookup failed: unexpected Multicall3 reply"),
+                                           QString()};
                            break;
                        case BalanceReply::OtherChain:
-                           // Settings accept any https URL; this is how a BSC,
-                           // Polygon, L2 or testnet endpoint gets noticed.
                            otherChain = true;
-                           problems << QStringLiteral(
-                                           "Ethereum: the RPC endpoint does not look like "
-                                           "Ethereum mainnet (%1), so its answers are ignored; "
-                                           "check the Ethereum endpoints in Settings")
-                                           .arg(why);
+                           issues << Issue{Problem::WrongChain, notMainnet(why), QString()};
                            break;
                        }
                    }
-                   self->applyChunk(known, amounts, problems, otherChain);
+                   if (unusable || otherChain) {
+                       self->refuseEndpoint(endpoint, otherChain);
+                       if (!self || gen != self->gen_)
+                           return; // a slot of EthRpc's signals restarted or stopped the scan
+                   }
+                   self->applyChunk(known, amounts, issues, otherChain);
                });
 }
 
 // Writes what the attempt learned into the rows, grows the window past newly
 // used addresses, then moves on, or schedules a retry of the rows still missing
-// an answer. With `otherChain` the nonces of the attempt are dropped as well:
-// (a) went to the same endpoint unless EthRpc failed over in between, and an
-// address used on another chain must not read as used (sticky) here.
+// an answer. Each request proves its own chain: nonceOk_ is only set where (a)
+// itself answered chain id 1 (see sendNonces()), and the balances count only
+// where (b) did. With `otherChain` the nonces are dropped as well, so an
+// attempt that met a non-mainnet endpoint changes no row and is retried whole,
+// on another endpoint if there is one (sendBalances() rejected that one).
 void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>& amounts,
-                            const QStringList& problems, bool otherChain)
+                            const QList<Issue>& issues, bool otherChain)
 {
-    for (const QString& p : problems)
-        noteFailure(p);
+    for (const Issue& issue : issues)
+        noteFailure(issue);
 
     const quint64 gen = gen_;
     const qsizetype stride = 1 + tokens_.size();
@@ -696,7 +849,8 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
                 return; // a model slot restarted or stopped the scan
         }
         AccountState& a = acc_[s.account];
-        if (row.used && qint64(s.index) > a.lastUsed) {
+        // An index at or past kMaxEthRows never moves the window (none is queued).
+        if (row.used && qint64(s.index) > a.lastUsed && qint64(s.index) < kMaxEthRows) {
             a.lastUsed = s.index;
             if (!grown.contains(s.account))
                 grown.append(s.account);
@@ -719,7 +873,7 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
     }
 
     passFailed_ = true;
-    QStringList messages = chunkErrors_;
+    QList<Issue> messages = chunkIssues_;
     if (attempts_ < kMaxRetries) {
         ++attempts_;
         chunk_ = failed; // only the rows still missing an answer
@@ -729,11 +883,22 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
         // confirmed values) and the next refresh pass tries them again.
         chunk_.clear();
         defer(&EthScanner::nextChunk);
-        messages << QStringLiteral("Ethereum: some addresses could not be checked after %1 "
-                                   "retries; the next refresh tries them again")
-                        .arg(kMaxRetries);
+        messages << Issue{Problem::Failure,
+                          QStringLiteral("Ethereum: some addresses could not be checked after %1 "
+                                         "retries; the next refresh tries them again")
+                              .arg(kMaxRetries),
+                          QString()};
+        // The pass can no longer answer every row. Said now, not when it ends:
+        // during an outage a large window takes hours to fail chunk by chunk,
+        // and its balances must not pass for current meanwhile. The progress()
+        // noted above goes out even with the same counts, as the cue to look.
+        passSkipped_ = true;
+        if (!refreshFailing_) {
+            refreshFailing_ = true;
+            lastChecked_ = -1;
+        }
     }
-    for (const QString& m : std::as_const(messages))
+    for (const Issue& m : std::as_const(messages))
         report(m);
 }
 
@@ -743,6 +908,14 @@ void EthScanner::finishPass()
     queue_.clear();
     queueHead_ = 0;
     chunk_.clear();
+    // The balances are current as of now only if every row of the pass got a
+    // full answer and the whole window exists; otherwise balancesAt() keeps
+    // the end of the last pass that did.
+    const bool windowDone = windowChecked();
+    const bool complete = !passSkipped_ && windowDone;
+    if (complete)
+        balancesAt_ = QDateTime::currentDateTime();
+    refreshFailing_ = !complete;
     // A pass without failures ends an outage: the next one is reported again
     // instead of staying silent for the rest of the session.
     if (!passFailed_)
@@ -750,22 +923,25 @@ void EthScanner::finishPass()
     if (!acc_.isEmpty())
         refreshTimer_->start(refreshSeconds_ * 1000);
 
+    const quint64 gen = gen_;
     // Skipped chunks leave the window incomplete; the refresh passes keep
     // retrying them, and the scan counts as finished once nothing is missing.
-    if (!finished_ && windowChecked()) {
+    if (!finished_ && windowDone) {
         finished_ = true;
         progressTimer_->stop();
-        const quint64 gen = gen_;
         emitProgress(); // the final counts before scanFinished()
-        if (gen == gen_)
-            emit scanFinished();
+        if (gen != gen_)
+            return;
+        emit scanFinished();
     }
+    if (gen == gen_) // a slot may have restarted or stopped the scan
+        emit passFinished();
 }
 
 bool EthScanner::windowChecked() const
 {
     for (const AccountState& a : acc_) {
-        const qint64 target = qMin(a.lastUsed + 1 + gap_, a.limit);
+        const qint64 target = windowEnd(a);
         for (qint64 index = 0; index < target; ++index) {
             const int pos = model_->find(chain::ScriptType::EthAccount, a.key.account, 0,
                                          quint32(index));
@@ -812,35 +988,55 @@ void EthScanner::stopWork()
     chunk_.clear();
     nonce_.clear();
     nonceOk_.clear();
-    chunkErrors_.clear();
+    chunkIssues_.clear();
     attempts_ = 0;
     passActive_ = false;
     passFailed_ = false;
+    passSkipped_ = false;
+    offMainnet_.clear();
 }
 
-void EthScanner::noteFailure(const QString& message)
+// `url` (as the reply named it) gave an answer nothing can be read from: EthRpc
+// moves requests to another endpoint and tries it last for a while. `offMainnet`:
+// the answer showed it does not serve Ethereum mainnet (see wrongChain()).
+void EthScanner::refuseEndpoint(const QString& url, bool offMainnet)
 {
-    if (!chunkErrors_.contains(message))
-        chunkErrors_.append(message);
+    if (url.isEmpty())
+        return;
+    // Recorded first: endpointChanged() slots may already ask wrongChain().
+    if (offMainnet && !offMainnet_.contains(url))
+        offMainnet_.append(url);
+    rpc_->rejectEndpoint(url);
 }
 
-// Each distinct text is emitted once, from the event loop, so a slot that
-// reacts by restarting the scanner never runs in the middle of a step.
-void EthScanner::report(const QString& message)
+void EthScanner::noteFailure(const Issue& issue)
 {
-    if (message.isEmpty() || reported_.contains(message))
+    for (const Issue& noted : std::as_const(chunkIssues_))
+        if (noted.message == issue.message)
+            return;
+    chunkIssues_.append(issue);
+}
+
+// Each distinct message is emitted once per outage, with the server detail it
+// first came with, and from the event loop, so a slot that reacts by
+// restarting the scanner never runs in the middle of a step. Keyed on
+// GitWallet's own sentence alone: an endpoint that varies its error texts
+// cannot multiply the reports.
+void EthScanner::report(const Issue& issue)
+{
+    if (issue.message.isEmpty() || reported_.contains(issue.message))
         return;
     if (reported_.size() >= kMaxReported)
-        reported_.clear(); // texts with varying details must not pile up forever
-    reported_.append(message);
+        reported_.clear(); // messages naming varying accounts or indices must not pile up forever
+    reported_.append(issue.message);
     const quint64 gen = gen_;
-    QTimer::singleShot(0, this, [this, gen, message] {
+    QTimer::singleShot(0, this, [this, gen, issue] {
         if (gen == gen_)
-            emit error(message);
+            emit problem(issue.kind, issue.message, issue.serverDetail);
     });
 }
 
-// A chunk updates up to 50 rows at once: coalesce into one signal per 250 ms.
+// A chunk updates up to kChunk rows at once: coalesce into one signal per 250 ms.
 void EthScanner::noteProgress()
 {
     if (!progressTimer_->isActive())

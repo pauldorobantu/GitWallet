@@ -38,6 +38,16 @@ struct AccountKey {
 
 enum class AddressState { Unknown, Unused, Used, Funded };
 
+// What a scanner's problem report is about, so the UI reacts to the kind and
+// never has to parse the wording.
+enum class Problem {
+    Failure,        // a lookup failed and is retried; balances may be incomplete meanwhile
+    Limit,          // a chain or account reached the row limit; later addresses are not scanned
+    WrongChain,     // the Ethereum endpoint does not answer for mainnet (chain id, no Multicall3, ...)
+    BuiltInServers, // none of the Electrum servers in Settings works; the built-in list is in use
+    Skipped,        // an account or chain cannot be scanned at all
+};
+
 struct AddressRow {
     chain::ScriptType type = chain::ScriptType::P2WPKH;
     quint32 account = 0;
@@ -47,7 +57,8 @@ struct AddressRow {
     QString address;
     QString scripthash; // Bitcoin: the Electrum scripthash; empty for Ethereum
 
-    bool checked = false; // a scan result has arrived for this address
+    bool checked = false; // every lookup has answered: BTC the status, plus the balance
+                          // of a used address; ETH the nonce and every balance
     bool used = false;    // BTC: has history; ETH: nonce > 0 or any balance > 0
 
     // Balances in smallest units.
@@ -58,7 +69,8 @@ struct AddressRow {
     quint64 nonce = 0;                 // Ethereum: outgoing transaction count
 
     bool isBitcoin() const { return chain::isBitcoin(type); }
-    // Funded if any balance > 0; else Used / Unused once checked; else Unknown.
+    // Funded if any balance > 0; else Used if it has history (checked or not);
+    // else Unused once checked; else Unknown.
     AddressState state() const;
     // This row's balance in `a` (BTC: confirmed + unconfirmed, floored at 0;
     // zero for assets of the other chain).

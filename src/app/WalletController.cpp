@@ -9,14 +9,23 @@
 #include "wallet/EthScanner.h"
 #include "wallet/WalletModel.h"
 
+#include <QCryptographicHash>
+#include <QDate>
+#include <QDateTime>
+#include <QFile>
+#include <QFileInfo>
 #include <QLocale>
+#include <QLockFile>
 #include <QLoggingCategory>
 #include <QSet>
 #include <QTimer>
+#include <QUrl>
 
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <memory>
+#include <optional>
 #include <string_view>
 
 namespace app {
@@ -39,6 +48,38 @@ constexpr std::chrono::minutes kPriceInterval{5};
 // Scanners report progress once per address (thousands in a row on a shop
 // seed); the title chip needs only a few updates a second.
 constexpr std::chrono::milliseconds kStatusThrottle{150};
+// Far above any wallet.dat GitWallet writes (WalletStore stops at 1 MiB): a
+// larger file is not one this session loaded or wrote, and is not hashed.
+constexpr qint64 kMaxDigestBytes = qint64(16) << 20;
+
+// Beside wallet.dat, so every --data-dir folder locks on its own.
+QString lockFilePath()
+{
+    return wallet::WalletStore::dataDir() + QStringLiteral("/wallet.lock");
+}
+
+// SHA-256 of wallet.dat as it is on disk now: an empty array when there is no
+// file, nullopt when it is there but cannot be read (or is far too large to be
+// a wallet file). The bytes are DPAPI ciphertext; only their digest is kept.
+std::optional<QByteArray> diskDigest()
+{
+    const QString path = wallet::WalletStore::filePath();
+    if (!QFileInfo(path).isFile()) // the test WalletStore::exists() makes
+        return QByteArray();
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > kMaxDigestBytes)
+        return std::nullopt;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&file))
+        return std::nullopt;
+    return hash.result();
+}
+
+// Why a write is refused in a second GitWallet on the same data folder.
+QString inUseElsewhere()
+{
+    return QStringLiteral("wallet.dat is in use by another GitWallet window.");
+}
 
 void setError(QString* error, const QString& message)
 {
@@ -115,6 +156,16 @@ QString addressCount(int n)
     return grouped(n) + (n == 1 ? QStringLiteral(" address") : QStringLiteral(" addresses"));
 }
 
+// Local time: the time alone while it is today, with the date once it is not
+// (a session runs for days, and "23:58" alone would read as today).
+QString clockTime(const QDateTime& when)
+{
+    static const QLocale english(QLocale::English, QLocale::UnitedStates);
+    const QDateTime local = when.toLocalTime();
+    const bool today = local.date() == QDate::currentDate();
+    return english.toString(local, today ? QStringLiteral("HH:mm") : QStringLiteral("d MMM HH:mm"));
+}
+
 // chain::bip39::validate() answers in terse developer English. The user gets a
 // sentence that names the unknown word's position, never the word itself, so
 // no part of a seed can reach a label, a toast or the log.
@@ -186,12 +237,18 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     connect(eth_, &net::EthRpc::log, this,
             [](const QString& line) { qCDebug(lcNet).noquote() << "[eth]" << line; });
 
+    // Progress is also the cue for the scanners' other states: EthScanner
+    // sends it when a pass gives up on addresses, BtcScanner when a failure
+    // makes it busy again.
     connect(btcScanner_, &wallet::BtcScanner::progress, this, &WalletController::queueStatus);
     connect(ethScanner_, &wallet::EthScanner::progress, this, &WalletController::queueStatus);
     connect(btcScanner_, &wallet::BtcScanner::scanFinished, this, [this] { onScanFinished(&btcDone_); });
     connect(ethScanner_, &wallet::EthScanner::scanFinished, this, [this] { onScanFinished(&ethDone_); });
-    connect(btcScanner_, &wallet::BtcScanner::error, this, &WalletController::onScannerError);
-    connect(ethScanner_, &wallet::EthScanner::error, this, &WalletController::onScannerError);
+    // The only signal of a refresh pass that changed no row, failed or not:
+    // ethBalancesAt() and ethRefreshFailing() move then.
+    connect(ethScanner_, &wallet::EthScanner::passFinished, this, &WalletController::queueStatus);
+    connect(btcScanner_, &wallet::BtcScanner::problem, this, &WalletController::onScannerProblem);
+    connect(ethScanner_, &wallet::EthScanner::problem, this, &WalletController::onScannerProblem);
 }
 
 WalletController::~WalletController()
@@ -213,20 +270,28 @@ bool WalletController::hasWallet() const
 bool WalletController::loadExisting(QString* error)
 {
     setError(error, QString());
+    // The first GitWallet on a data folder becomes the one that writes it. A
+    // later one still loads and shows the wallet, but saves nothing (and takes
+    // the lock over at its next write if the first one has quit by then).
+    lockDataDir();
     if (!store_.exists()) {
-        fileLoaded_ = false;
+        fileDigest_.clear();
         return false;
     }
 
+    // Hashed before and after reading: equal digests name exactly the bytes
+    // load() parsed. A file replaced meanwhile counts as one never opened.
+    const std::optional<QByteArray> before = diskDigest();
     QString why;
     if (!store_.load(&why)) {
         // The file stays as it is: settings alone never replace it (an import
         // does). It may still open later, for the right Windows user.
-        fileLoaded_ = false;
+        fileDigest_.clear();
         setError(error, storeMessage(why, QStringLiteral("The wallet file could not be read.")));
         return false;
     }
-    fileLoaded_ = true;
+    const std::optional<QByteArray> after = diskDigest();
+    fileDigest_ = (before && after && *before == *after) ? *after : QByteArray();
     store_.settings = sanitized(store_.settings);
 
     // Nothing runs yet at startup; a second call starts again from a clean slate.
@@ -245,6 +310,13 @@ bool WalletController::importMnemonic(const std::vector<std::string>& words,
                                       const std::string& passphrase, QString* error)
 {
     setError(error, QString());
+
+    // Before the words are touched: a phrase that could not be saved is never
+    // turned into keys.
+    if (!lockDataDir()) {
+        setError(error, QStringLiteral("The seed was not imported: ") + inUseElsewhere());
+        return false;
+    }
 
     // `words` and `passphrase` are only ever passed on by reference: no copy is
     // made here. `why` can quote a mistyped seed word, so it is scrubbed.
@@ -279,7 +351,7 @@ bool WalletController::importMnemonic(const std::vector<std::string>& words,
         setError(error, storeMessage(saveError, QStringLiteral("The wallet could not be saved.")));
         return false;
     }
-    fileLoaded_ = true;
+    fileDigest_ = diskDigest().value_or(QByteArray()); // the file just written
 
     stopServices();
     model_->clear();
@@ -292,6 +364,11 @@ bool WalletController::importMnemonic(const std::vector<std::string>& words,
 bool WalletController::removeWallet(QString* error)
 {
     setError(error, QString());
+    // Checked first, so a refusal leaves the scan running as it was.
+    if (!lockDataDir()) {
+        setError(error, QStringLiteral("The wallet was not removed: ") + inUseElsewhere());
+        return false;
+    }
     stopServices();
 
     QString why;
@@ -305,14 +382,14 @@ bool WalletController::removeWallet(QString* error)
         }
         // The store forgot the wallet although the file stayed: show no wallet,
         // and never write settings alone over the keys still in that file.
-        fileLoaded_ = false;
+        fileDigest_.clear();
         model_->clear();
         emit walletChanged();
         emit statusChanged();
         return false;
     }
 
-    fileLoaded_ = false; // no file any more
+    fileDigest_.clear(); // no file any more
     model_->clear();
     emit walletChanged();
     emit statusChanged();
@@ -329,26 +406,30 @@ bool WalletController::applySettings(const wallet::ScanSettings& settings, QStri
     // that a private server set up first is still the one the import talks to
     // after a restart (loadExisting() reads a file without accounts as "no
     // wallet yet"). Settings alone never replace a wallet.dat this session did
-    // not load or write: an unreadable one may still open for the right
-    // Windows user, and only an import replaces it.
+    // not load or write, or one changed since: an unreadable one may still
+    // open for the right Windows user, a newer one holds what someone else
+    // saved, and only an import replaces either (settingsSaveBlocker()).
     bool saved = false;
-    if (fileLoaded_ || !store_.exists()) {
+    const QString blocker = settingsSaveBlocker();
+    if (blocker.isEmpty()) {
         QString why;
         if (!store_.save(&why)) {
             store_.settings = previous;
             setError(error, storeMessage(why, QStringLiteral("The settings could not be saved.")));
             return false;
         }
-        fileLoaded_ = true;
+        fileDigest_ = diskDigest().value_or(QByteArray()); // the file just written
         saved = true;
     } else {
         // In memory only, used by an import in this session. Shown in a toast
         // that elides long text, so the outcome comes first.
-        setError(error, QStringLiteral("Applied for this session only: wallet.dat was not opened."));
+        setError(error, QStringLiteral("Applied for this session only: ") + blocker);
     }
 
-    // The model keeps its rows: the restarted scanners reuse them instead of
-    // rescanning from index 0.
+    // The model keeps its rows: the restarted scanners adopt them instead of
+    // deriving them again, and their last known state stays on screen
+    // meanwhile; the Bitcoin scanner still checks every status again from
+    // index 0.
     stopServices();
     startServices();
     emit statusChanged();
@@ -366,19 +447,74 @@ void WalletController::refresh()
 
 bool WalletController::isScanning() const
 {
-    return btcScanner_->isScanning() || ethScanner_->isScanning();
+    return btcScanning() || ethScanning();
+}
+
+bool WalletController::btcScanning() const
+{
+    return btcScanner_->isScanning();
+}
+
+bool WalletController::ethScanning() const
+{
+    return ethScanner_->isScanning();
+}
+
+bool WalletController::addressLimitReached() const
+{
+    return btcScanner_->limitReached() || ethScanner_->limitReached();
+}
+
+bool WalletController::ethWrongChain() const
+{
+    return ethScanner_->wrongChain();
+}
+
+QDateTime WalletController::ethBalancesAt() const
+{
+    return ethScanner_->balancesAt();
+}
+
+bool WalletController::ethRefreshFailing() const
+{
+    return ethScanner_->refreshFailing();
+}
+
+bool WalletController::balancesComplete() const
+{
+    return status() == Status::UpToDate;
 }
 
 QString WalletController::statusText() const
 {
-    if (!hasWallet())
+    const QString rows = addressCount(model_->size());
+    switch (status()) {
+    case Status::NoWallet:
         return QStringLiteral("No wallet");
-    if (hasAccounts(store_.accounts, true) && !electrum_->isReady())
+    case Status::Connecting:
         return QStringLiteral("Connecting…");
-    if (isScanning())
-        return QStringLiteral("Scanning · %1").arg(addressCount(model_->size()));
-    return QStringLiteral("Up to date · %1 · %2 funded")
-        .arg(addressCount(model_->size()), grouped(model_->fundedCount()));
+    case Status::Limit:
+        return QStringLiteral("Address limit reached · %1").arg(rows);
+    case Status::WrongChain:
+        return QStringLiteral("Ethereum endpoint not on mainnet · %1").arg(rows);
+    case Status::EthStale: {
+        // Before the first pass that answered every address there is no time
+        // to date the figures by.
+        const QDateTime at = ethBalancesAt();
+        return at.isValid() ? QStringLiteral("ETH balances from %1 · %2").arg(clockTime(at), rows)
+                            : QStringLiteral("ETH lookups failing · %1").arg(rows);
+    }
+    case Status::Scanning:
+        return QStringLiteral("Scanning · %1").arg(rows);
+    case Status::Unchecked:
+        return QStringLiteral("Balances incomplete · %1 · %2 not checked")
+            .arg(rows, grouped(model_->size() - model_->checkedCount()));
+    case Status::Unscanned:
+        return QStringLiteral("Some addresses not scanned · %1").arg(rows);
+    case Status::UpToDate:
+        break;
+    }
+    return QStringLiteral("Up to date · %1 · %2 funded").arg(rows, grouped(model_->fundedCount()));
 }
 
 QString WalletController::electrumServer() const
@@ -388,7 +524,9 @@ QString WalletController::electrumServer() const
 
 QString WalletController::ethEndpoint() const
 {
-    return eth_->currentEndpoint();
+    // Host only: a configured endpoint may carry an API key in its path, query
+    // or user info, and this name is shown on screen and written to reports.
+    return QUrl(eth_->currentEndpoint()).host();
 }
 
 double WalletController::usdValue(wallet::Asset asset) const
@@ -460,8 +598,10 @@ void WalletController::startServices()
         // instead of being replaced by it.
         QTimer::singleShot(0, this, [this] {
             if (running_)
-                emit errorOccurred(QStringLiteral("None of the Electrum servers in Settings is "
-                                                  "valid (host:port); using the built-in list."));
+                emit errorOccurred(wallet::Problem::BuiltInServers,
+                                   QStringLiteral("None of the Electrum servers in Settings is "
+                                                  "valid (host:port); using the built-in list."),
+                                   QString());
         });
     }
 }
@@ -496,13 +636,107 @@ void WalletController::onScanFinished(bool* chainDone)
     }
 }
 
-void WalletController::onScannerError(const QString& message)
+void WalletController::onScannerProblem(wallet::Problem kind, const QString& message,
+                                        const QString& serverDetail)
 {
     // While stopping, the clients fail every pending request ("stopped"):
     // that is the shutdown itself, not something to show the user.
     if (!running_ || message.trimmed().isEmpty())
         return;
-    emit errorOccurred(message);
+    emit errorOccurred(kind, message, serverDetail);
+    // The scan state may have moved with the report (a window cut at the
+    // limit, an endpoint off mainnet) while no progress() says so.
+    queueStatus();
+}
+
+WalletController::Status WalletController::status() const
+{
+    if (!hasWallet())
+        return Status::NoWallet;
+    if (hasAccounts(store_.accounts, true) && !electrum_->isReady())
+        return Status::Connecting;
+    // A balance kept missing or stale by something no scan cures comes before
+    // "Scanning": a window cut at the limit keeps the Bitcoin scan unfinished
+    // for good, and an endpoint off mainnet, or failing, leaves Ethereum
+    // addresses unanswered pass after pass.
+    if (addressLimitReached())
+        return Status::Limit;
+    if (ethWrongChain())
+        return Status::WrongChain;
+    if (ethRefreshFailing())
+        return Status::EthStale;
+    if (isScanning())
+        return Status::Scanning;
+    // Nothing is scanning, yet a row has no answer (one no scan follows any
+    // more, left from before a server or gap change): its balance is unknown.
+    if (model_->checkedCount() < model_->size())
+        return Status::Unchecked;
+    if (accountUnscanned())
+        return Status::Unscanned;
+    return Status::UpToDate;
+}
+
+bool WalletController::accountUnscanned() const
+{
+    // An account key that could not be read, or a Bitcoin chain that could
+    // not be derived from it, gets no rows at all: the scanners report it
+    // (problem(), Skipped) and finish without it. Asked only once nothing is
+    // scanning, when every chain that can be scanned has its first rows.
+    // Index 1 counts as well, for an index 0 that BIP32 skips for having no key.
+    const auto hasRows = [this](const wallet::AccountKey& a, quint32 change) {
+        return model_->find(a.type, a.account, change, 0) >= 0
+               || model_->find(a.type, a.account, change, 1) >= 0;
+    };
+    const QList<wallet::AccountKey>& accounts = store_.accounts;
+    return std::any_of(accounts.cbegin(), accounts.cend(), [&hasRows](const wallet::AccountKey& a) {
+        return !hasRows(a, 0) || (chain::isBitcoin(a.type) && !hasRows(a, 1));
+    });
+}
+
+bool WalletController::lockDataDir()
+{
+    const QString path = lockFilePath();
+    if (!lock_ || lock_->fileName() != path) {
+        lock_ = std::make_unique<QLockFile>(path); // a lock on another folder is let go
+        // Held for as long as the window stays open, days included: stale only
+        // once the process that took it is gone, never because of its age.
+        lock_->setStaleLockTime(std::chrono::milliseconds::zero());
+    }
+    if (lock_->isLocked() || lock_->tryLock())
+        return true;
+#ifdef Q_OS_WIN
+    // Windows cannot delete the lock file of a live holder (it keeps the file
+    // open without FILE_SHARE_DELETE), so this succeeds only for one a crash
+    // left behind that Qt cannot prove stale: unreadable, written on another
+    // PC, or naming a process id a GitWallet has been given since (this very
+    // one included, after a reboot).
+    if (lock_->error() == QLockFile::LockFailedError && lock_->removeStaleLockFile() && lock_->tryLock())
+        return true;
+#endif
+    // Only another holder blocks writing. In a folder where no lock file can be
+    // made at all, the save itself fails with the better message.
+    return lock_->error() != QLockFile::LockFailedError;
+}
+
+QString WalletController::settingsSaveBlocker()
+{
+    if (!lockDataDir())
+        return inUseElsewhere();
+    const std::optional<QByteArray> disk = diskDigest();
+    if (!disk)
+        return QStringLiteral("wallet.dat could not be read to check it.");
+    if (disk->isEmpty()) {
+        // No file: settings alone make one without keys. Keys still shown here
+        // came from a file deleted since ("Remove wallet" in another window,
+        // Explorer; this window's own Remove forgets the keys): they are never
+        // written back.
+        return hasWallet() ? QStringLiteral("wallet.dat was deleted outside this window.") : QString();
+    }
+    if (fileDigest_.isEmpty() && !hasWallet())
+        return QStringLiteral("wallet.dat was not opened."); // unreadable, or made since by someone else
+    if (*disk != fileDigest_)
+        return QStringLiteral("wallet.dat was changed outside this window; restart GitWallet to load it.");
+    return QString();
 }
 
 } // namespace app

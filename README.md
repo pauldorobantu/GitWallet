@@ -35,7 +35,8 @@ Only the four **account-level public keys** (zpub / ypub / xpub at
 settings, in `wallet.dat`, encrypted for the current Windows user with DPAPI.
 The seed is used once at import to derive those keys and is then scrubbed from
 memory; it is never written anywhere. Public keys can show balances but cannot
-spend.
+spend. Starting GitWallet again brings the open window to the front instead of
+opening a second one, and only one window at a time writes `wallet.dat`.
 
 ## Network
 
@@ -96,8 +97,10 @@ Requirements: Visual Studio 2022 (MSVC x64), Qt 6.10.3 at
 build.bat
 ```
 
-This configures with the vcpkg toolchain (Botan, zlib, secp256k1) and produces
-`build\GitWallet.exe`.
+This configures with the vcpkg toolchain (Botan, zlib, secp256k1), builds
+`build\GitWallet.exe` and deploys a runnable copy to `dist\` (the exe, Qt and
+the Visual C++ runtime, with the Qt plugins in `dist\lib\plugins`). Start
+`dist\GitWallet.exe`; the `dist` folder can be copied anywhere.
 
 ## Security
 

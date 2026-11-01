@@ -3,12 +3,16 @@
 #include "wallet/Types.h"
 #include "wallet/WalletStore.h"
 
+#include <QByteArray>
+#include <QDateTime>
 #include <QObject>
 #include <QString>
 
+#include <memory>
 #include <string>
 #include <vector>
 
+class QLockFile;
 class QTimer;
 
 namespace net {
@@ -28,7 +32,9 @@ namespace app {
 // Owns the wallet's data and services: the store (xpubs + settings), the address
 // model, the Electrum and Ethereum clients, the USD price feed and the two
 // scanners. Pages read from it; the import dialog and the Settings page write
-// through it. GUI thread only.
+// through it. One process at a time writes a data folder (its wallet.lock): a
+// second GitWallet on the same folder shows the wallet but saves nothing.
+// GUI thread only.
 class WalletController : public QObject
 {
     Q_OBJECT
@@ -38,20 +44,26 @@ public:
 
     bool hasWallet() const;
 
-    // At startup: loads wallet.dat if present and starts scanning. Returns false
-    // with an empty `error` when there is no wallet yet, false with a message
-    // when the file could not be read.
+    // At startup: takes the data folder's lock if it is free, loads wallet.dat
+    // if present and starts scanning. Returns false with an empty `error` when
+    // there is no wallet yet, false with a message when the file could not be
+    // read.
     bool loadExisting(QString* error);
 
     // Validates the mnemonic, derives the account xpubs, saves them (DPAPI) and
     // starts scanning. Never stores the words; the caller scrubs its own copies.
+    // Refused while another GitWallet process holds the data folder.
     bool importMnemonic(const std::vector<std::string>& words, const std::string& passphrase,
                         QString* error);
 
-    // Deletes wallet.dat, stops scanning and clears the model.
+    // Deletes wallet.dat, stops scanning and clears the model. Refused while
+    // another GitWallet process holds the data folder.
     bool removeWallet(QString* error);
 
     // Saves new scan settings and restarts the scanners / clients with them.
+    // When wallet.dat is not this session's to write (another process holds
+    // the folder, or the file changed or went away after this session read
+    // it), they apply for this session only: false, with the reason.
     bool applySettings(const wallet::ScanSettings& settings, QString* error);
 
     const wallet::WalletStore& store() const { return store_; }
@@ -60,8 +72,22 @@ public:
 
     void refresh(); // prices + Ethereum balances now (Bitcoin is live)
 
-    bool isScanning() const;
-    QString statusText() const;   // one short line for the title bar chip
+    bool isScanning() const;  // either chain
+    bool btcScanning() const; // the Bitcoin scan is not through (it never is while cut at the limit)
+    bool ethScanning() const;
+    bool addressLimitReached() const; // a Bitcoin or Ethereum window is cut at the row limit
+    bool ethWrongChain() const;       // the Ethereum endpoint in use was found not to serve mainnet
+    // When the last Ethereum pass ended that answered every address (local
+    // time); invalid before the first one.
+    QDateTime ethBalancesAt() const;
+    // The last Ethereum pass failed or left addresses without an answer: the
+    // ETH, USDT and USDC figures are as of ethBalancesAt() at best.
+    bool ethRefreshFailing() const;
+    // Every balance shown is whole and current: statusText() says "Up to date".
+    bool balancesComplete() const;
+    // One short line for the title bar chip. "Up to date" only when
+    // balancesComplete(); otherwise it leads with what keeps it from that.
+    QString statusText() const;
     QString electrumServer() const;
     QString ethEndpoint() const;
 
@@ -70,18 +96,41 @@ public:
 
 signals:
     void walletChanged();  // loaded / imported / removed
-    void statusChanged();  // statusText() or isScanning() changed
+    void statusChanged();  // statusText() or any of the scan states above changed
     void totalsChanged();  // balances or prices changed
     void scanFinished();   // both chains finished their initial scan
-    void errorOccurred(const QString& message);
+    // The scanners' problem() reports and the controller's own. `message` is
+    // GitWallet's own sentence; `serverDetail` is what a server wrote, if
+    // anything (one line, cleaned up), and is never part of `message`.
+    void errorOccurred(wallet::Problem kind, const QString& message, const QString& serverDetail);
 
 private:
     // --- implementation (WalletController.cpp may add private members) ---
+    // What statusText() leads with, the most pressing first.
+    enum class Status {
+        NoWallet,
+        Connecting,
+        Limit,      // a window cut at the row limit
+        WrongChain, // the Ethereum endpoint is off mainnet
+        EthStale,   // the last Ethereum pass left addresses without an answer
+        Scanning,
+        Unchecked,  // nothing scans, yet a row has no answer
+        Unscanned,  // an account, or a Bitcoin chain, has no rows at all
+        UpToDate,
+    };
+
     void startServices();
     void stopServices();
     void queueStatus();                   // throttled statusChanged() for progress and balances
     void onScanFinished(bool* chainDone); // a scanner finished its initial scan
-    void onScannerError(const QString& message);
+    void onScannerProblem(wallet::Problem kind, const QString& message, const QString& serverDetail);
+    Status status() const;
+    bool accountUnscanned() const; // an account (a Bitcoin one: either chain) without a single row
+    // Takes, or keeps, the data folder's wallet.lock. False while another
+    // GitWallet process holds it: that one alone writes or deletes wallet.dat.
+    bool lockDataDir();
+    // Empty when settings alone may be written to wallet.dat now, else why not.
+    QString settingsSaveBlocker();
 
     wallet::WalletStore store_;
     wallet::WalletModel* model_ = nullptr;
@@ -96,9 +145,14 @@ private:
     bool ethDone_ = false;
     bool running_ = false;          // between startServices() and stopServices()
     bool scanFinishedSent_ = false; // scanFinished() already emitted for this start
-    // wallet.dat is the file this session last loaded or wrote; only then may
-    // settings alone be written over an existing one.
-    bool fileLoaded_ = false;
+    // Taken at the first load or write and held until this controller is
+    // destroyed, however many days the window stays open.
+    std::unique_ptr<QLockFile> lock_;
+    // SHA-256 of wallet.dat as this session last loaded or wrote it; empty when
+    // it has no such file (none, deleted, unreadable). Settings alone are
+    // written over an existing wallet.dat only while it still has this digest,
+    // so nothing written there since by someone else is replaced.
+    QByteArray fileDigest_;
 };
 
 } // namespace app

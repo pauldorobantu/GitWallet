@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QPointer>
+#include <QRandomGenerator>
 #include <QSslError>
 #include <QSslSocket>
 #include <QStringList>
@@ -29,11 +30,26 @@ constexpr int kPingTimeoutMs = 30'000;
 constexpr int kWatchdogIntervalMs = 5'000;
 constexpr int kFirstBackoffMs = 1'000;
 constexpr int kMaxBackoffMs = 30'000;
+// After a session that had proved itself (it answered a ping) drops in a way
+// the network may have caused, the same server is asked again for this long
+// before the client moves on: long enough for Wi-Fi to return after sleep, or
+// for a server to restart.
+constexpr int kStickyWindowMs = 180'000;
 // A subscription the server refused is asked again on this many ping ticks
 // before the client looks for a server that accepts it.
 constexpr int kRefusedRetries = 2;
-constexpr qsizetype kMaxLineBytes = qsizetype(64) * 1024 * 1024;
+// The longest line accepted. Every reply and notification of the methods this
+// client uses is well under 1 KB. Each line is parsed in full on the GUI thread
+// before its meaning is known, so this bounds what one line can cost in memory
+// and in time.
+constexpr qsizetype kMaxLineBytes = qsizetype(1) * 1024 * 1024;
 constexpr qsizetype kMaxServerText = 300;
+// Unsolicited lines (notifications, blank lines) a server may send per window:
+// two for every subscription plus the allowance. An honest server notifies when
+// a subscribed status changes or a block arrives, far below that; a flood would
+// keep the GUI thread busy and is dropped.
+constexpr int kUnsolicitedWindowMs = 60'000;
+constexpr qsizetype kUnsolicitedAllowance = 1'000;
 
 constexpr QLatin1String kScripthashSubscribe("blockchain.scripthash.subscribe");
 constexpr QLatin1String kHeadersSubscribe("blockchain.headers.subscribe");
@@ -61,9 +77,46 @@ QJsonObject makeRequest(int id, const QString& method, const QJsonArray& params)
 }
 
 // A scripthash status is a hex string, or JSON null for "no history" ("").
+// Subscribe results reach the callbacks only after parseStatus() accepted them
+// (handleMessage()), already in that form.
 QString statusOf(const QJsonValue& value)
 {
     return value.isString() ? value.toString() : QString();
+}
+
+// 64 hex digits: the hash of a scripthash's history.
+bool isHex64(const QString& text)
+{
+    return text.size() == 64 && std::all_of(text.cbegin(), text.cend(), [](QChar c) {
+               const char16_t u = c.unicode();
+               return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'f') || (u >= u'A' && u <= u'F');
+           });
+}
+
+// A scripthash status as a server sends it: JSON null (no history) or the
+// 64-hex-digit hash of the history. On success *status is "" or that hash in
+// lowercase. Anything else (a number, an object, a string of another shape or
+// length) is a protocol violation, never "no history": a status is kept for
+// every subscription for the whole run, so an unchecked one would also let a
+// server fill memory.
+bool parseStatus(const QJsonValue& value, QString* status)
+{
+    if (value.isNull()) {
+        status->clear();
+        return true;
+    }
+    if (!value.isString())
+        return false;
+    const QString text = value.toString();
+    if (!isHex64(text))
+        return false;
+    *status = text.toLower();
+    return true;
+}
+
+QString tooLongText()
+{
+    return QStringLiteral("reply longer than %1 MB").arg(kMaxLineBytes / (1024 * 1024));
 }
 
 // Text a server sent ends up in the log and the UI: one line, bounded.
@@ -203,11 +256,12 @@ void ElectrumClient::setServers(const QList<ElectrumServer>& servers)
     servers_ = list;
     serverIndex_ = -1; // the next connection starts at the first server
     goodIndex_ = -1;
+    stickyUntilMs_ = 0;
     refusalSwitches_ = 0;
     // The controller normally sets servers while stopped; a live connection
-    // moves to the new list right away.
+    // moves to the new list right away (Server: never back to the old one).
     if (running_ && socket_)
-        failConnection(QStringLiteral("server list changed"));
+        failConnection(QStringLiteral("server list changed"), Blame::Server);
 }
 
 void ElectrumClient::start()
@@ -216,6 +270,7 @@ void ElectrumClient::start()
         return;
     running_ = true;
     backoffMs_ = kFirstBackoffMs;
+    stickyUntilMs_ = 0;
     refusalSwitches_ = 0;
     if (servers_.isEmpty())
         servers_ = defaultElectrumServers();
@@ -304,7 +359,12 @@ void ElectrumClient::connectNext()
         return;
     if (servers_.isEmpty())
         servers_ = defaultElectrumServers();
-    serverIndex_ = (serverIndex_ + 1) % static_cast<int>(servers_.size());
+    const int count = static_cast<int>(servers_.size());
+    // The same server again while the window failConnection() opened after a
+    // working session lasts; otherwise the next one in the list.
+    const bool again = serverIndex_ >= 0 && serverIndex_ < count && monotonicMs() < stickyUntilMs_;
+    if (!again)
+        serverIndex_ = (serverIndex_ + 1) % count;
     current_ = servers_.at(serverIndex_);
     ++generation_;
 
@@ -372,7 +432,7 @@ void ElectrumClient::handleVersionReply(const QJsonValue& result, const QString&
 {
     versionId_ = 0;
     if (!error.isEmpty()) {
-        failConnection(QStringLiteral("server.version refused: %1").arg(error));
+        failConnection(QStringLiteral("server.version refused: %1").arg(error), Blame::Server);
         return;
     }
     const QJsonArray version = result.toArray(); // [software, protocol]
@@ -385,12 +445,12 @@ void ElectrumClient::handleHeadersReply(const QJsonValue& result, const QString&
 {
     headersId_ = 0;
     if (!error.isEmpty()) {
-        failConnection(QStringLiteral("blockchain.headers.subscribe refused: %1").arg(error));
+        failConnection(QStringLiteral("blockchain.headers.subscribe refused: %1").arg(error), Blame::Server);
         return;
     }
     const int height = result.toObject().value(QLatin1String("height")).toInt(-1);
     if (height < 0) {
-        failConnection(QStringLiteral("blockchain.headers.subscribe returned no height"));
+        failConnection(QStringLiteral("blockchain.headers.subscribe returned no height"), Blame::Server);
         return;
     }
     becomeReady(height);
@@ -400,7 +460,10 @@ void ElectrumClient::becomeReady(int height)
 {
     handshakeTimer_->stop();
     ready_ = true;
-    backoffMs_ = kFirstBackoffMs;
+    // The backoff is not reset here but once the session proves stable
+    // (noteStable()): a server that completes the handshake and then drops the
+    // session would otherwise get a new connection, and every subscription
+    // again, each second.
     goodIndex_ = serverIndex_;
     pingTimer_->start(kPingIntervalMs);
     watchdogTimer_->start(kWatchdogIntervalMs);
@@ -527,7 +590,8 @@ void ElectrumClient::retryRefused()
     // the client hopping.
     if (stuck > 0 && refusalSwitches_ < servers_.size() - 1) {
         ++refusalSwitches_;
-        failConnection(QStringLiteral("refused %1 subscription(s) (%2)").arg(QString::number(stuck), lastRefusal_));
+        failConnection(QStringLiteral("refused %1 subscription(s) (%2)").arg(QString::number(stuck), lastRefusal_),
+                       Blame::Server);
         return;
     }
     for (const QString& scripthash : std::as_const(again))
@@ -542,11 +606,12 @@ void ElectrumClient::retryRefused()
     }
 }
 
-void ElectrumClient::failConnection(const QString& reason)
+void ElectrumClient::failConnection(const QString& reason, Blame blame)
 {
     if (!running_ || !socket_)
         return; // stopped, or this connection has already been given up
     const QString what = current_.toString() + QStringLiteral(": ") + reason;
+    const bool wasStable = stable_;
     ready_ = false;
     ++generation_;
     handshakeTimer_->stop();
@@ -562,14 +627,33 @@ void ElectrumClient::failConnection(const QString& reason)
     dropSocket();
     resetConnectionState();
 
-    const int delay = backoffMs_;
+    // Where the next attempt goes (connectNext()). A server whose session had
+    // proved itself is asked again for kStickyWindowMs when that session ends
+    // in a way the network may have caused (sleep, Wi-Fi, a server restart):
+    // moving on would hand every subscribed scripthash, linked by this IP, to
+    // one more operator. Attempts that fail meanwhile keep the window, so an
+    // outage shorter than it does not move the client. A server that
+    // misbehaved is left at once, and so is one that never held a session
+    // long enough to prove itself (no window is opened for it).
+    if (blame == Blame::Server)
+        stickyUntilMs_ = 0;
+    else if (wasStable)
+        stickyUntilMs_ = monotonicMs() + kStickyWindowMs;
+    const bool sameServer = monotonicMs() < stickyUntilMs_;
+
+    // The backoff doubles on every failure and is reset only by a stable
+    // session (noteStable()). Equal jitter: between half and all of it, so
+    // clients that lost the same server do not all return in the same second.
+    const int delay = backoffMs_ / 2 + QRandomGenerator::global()->bounded(backoffMs_ / 2 + 1);
     backoffMs_ = std::min(backoffMs_ * 2, kMaxBackoffMs);
     reconnectTimer_->start(delay);
 
     // Signals last, on a consistent state: a slot may stop() or restart us.
     const quint64 gen = generation_;
     QPointer<ElectrumClient> self(this);
-    emit log(QStringLiteral("%1; next attempt in %2 s").arg(what, QString::number(delay / 1000)));
+    emit log(QStringLiteral("%1; next attempt in %2 s%3")
+                 .arg(what, QString::number(delay / 1000.0, 'f', 1),
+                      sameServer ? QStringLiteral(", same server") : QString()));
     if (!self || gen != generation_)
         return;
     emit connectionLost(what);
@@ -596,10 +680,42 @@ void ElectrumClient::resetConnectionState()
     headersId_ = 0;
     pingId_ = 0;
     serverSoftware_.clear();
+    stable_ = false;
+    lastReceivedMs_ = 0;
+    unsolicitedSinceMs_ = monotonicMs();
+    unsolicitedCount_ = 0;
     // Refusals belong to one server; the next one is asked everything afresh.
     refused_.clear();
     lastRefusal_.clear();
     refusalLogged_ = false;
+}
+
+void ElectrumClient::noteStable()
+{
+    if (stable_)
+        return;
+    // A minute after the handshake (the first ping goes out kPingIntervalMs
+    // after it) and still answering: a working server. Only now is the backoff
+    // reset, and only a stable session has failConnection() ask the same
+    // server again first.
+    stable_ = true;
+    backoffMs_ = kFirstBackoffMs;
+}
+
+bool ElectrumClient::noteUnsolicited()
+{
+    const qint64 now = monotonicMs();
+    if (now - unsolicitedSinceMs_ >= kUnsolicitedWindowMs) {
+        unsolicitedSinceMs_ = now;
+        unsolicitedCount_ = 0;
+    }
+    const qsizetype budget = 2 * subscriptions_.size() + kUnsolicitedAllowance;
+    if (++unsolicitedCount_ <= budget)
+        return true;
+    failConnection(QStringLiteral("more than %1 notifications or blank lines within %2 s")
+                       .arg(QString::number(budget), QString::number(kUnsolicitedWindowMs / 1000)),
+                   Blame::Server);
+    return false;
 }
 
 QList<ElectrumClient::Pending> ElectrumClient::takeInFlight()
@@ -660,22 +776,30 @@ void ElectrumClient::checkTimeouts()
     if (!ready_ || !socket_)
         return;
     const qint64 now = monotonicMs();
+    // Nothing arrived since the request went out: the network may be down
+    // (sleep, Wi-Fi), so the server is not to blame. A server that kept
+    // sending while it let the request wait is.
     if (pingId_ != 0 && now - pingSentAtMs_ > kPingTimeoutMs) {
-        failConnection(QStringLiteral("no reply to server.ping within %1 s").arg(kPingTimeoutMs / 1000));
+        failConnection(QStringLiteral("no reply to server.ping within %1 s").arg(kPingTimeoutMs / 1000),
+                       lastReceivedMs_ > pingSentAtMs_ ? Blame::Server : Blame::Link);
         return;
     }
     qint64 oldest = now;
     for (const Pending& p : std::as_const(inFlight_))
         oldest = std::min(oldest, p.sentAtMs);
     if (now - oldest > kRequestTimeoutMs)
-        failConnection(QStringLiteral("no reply to a request within %1 s").arg(kRequestTimeoutMs / 1000));
+        failConnection(QStringLiteral("no reply to a request within %1 s").arg(kRequestTimeoutMs / 1000),
+                       lastReceivedMs_ > oldest ? Blame::Server : Blame::Link);
 }
 
 // ------------------------------------------------------------ replies ----
 
 void ElectrumClient::onReadyRead()
 {
-    buffer_.append(socket_->readAll());
+    const QByteArray data = socket_->readAll();
+    if (!data.isEmpty())
+        lastReceivedMs_ = monotonicMs();
+    buffer_.append(data);
 
     const quint64 gen = generation_;
     QPointer<ElectrumClient> self(this);
@@ -684,7 +808,7 @@ void ElectrumClient::onReadyRead()
         if (newline < 0)
             break;
         if (newline > kMaxLineBytes) {
-            failConnection(QStringLiteral("reply larger than 64 MB"));
+            failConnection(tooLongText(), Blame::Server);
             return;
         }
         // Each line leaves the buffer before it is handled, so whatever its
@@ -692,15 +816,20 @@ void ElectrumClient::onReadyRead()
         const QByteArray line = buffer_.left(newline).trimmed();
         buffer_.remove(0, newline + 1); // O(1) at the front of a Qt 6 array
         scanFrom_ = 0;
-        if (line.isEmpty())
+        if (line.isEmpty()) {
+            // Not a message. Counted like a notification, so a stream of
+            // newlines cannot keep this loop busy for free.
+            if (!noteUnsolicited())
+                return;
             continue;
+        }
         handleLine(line);
         if (!self || gen != generation_)
             return; // the connection was dropped or replaced meanwhile
     }
     scanFrom_ = buffer_.size(); // the next search starts at the new data only
     if (buffer_.size() > kMaxLineBytes) {
-        failConnection(QStringLiteral("reply larger than 64 MB"));
+        failConnection(tooLongText(), Blame::Server);
         return;
     }
     pump();
@@ -711,52 +840,66 @@ void ElectrumClient::handleLine(const QByteArray& line)
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
     if (parseError.error != QJsonParseError::NoError) {
-        failConnection(QStringLiteral("malformed reply (%1)").arg(parseError.errorString()));
+        failConnection(QStringLiteral("malformed reply (%1)").arg(parseError.errorString()), Blame::Server);
         return;
     }
-    if (doc.isObject()) {
-        handleMessage(doc.object());
+    // One JSON-RPC object per line. A batch (an array) only ever answers a
+    // batch request, and this client sends none.
+    if (!doc.isObject()) {
+        failConnection(QStringLiteral("malformed reply (not a JSON-RPC object)"), Blame::Server);
         return;
     }
-    // A batch reply: an array of reply objects.
-    const QJsonArray batch = doc.array();
-    if (!doc.isArray()
-        || std::any_of(batch.begin(), batch.end(), [](const QJsonValue& v) { return !v.isObject(); })) {
-        failConnection(QStringLiteral("malformed reply (not a JSON-RPC object)"));
-        return;
-    }
-    const quint64 gen = generation_;
-    QPointer<ElectrumClient> self(this);
-    for (const QJsonValue& item : batch) {
-        handleMessage(item.toObject());
-        if (!self || gen != generation_)
-            return;
-    }
+    handleMessage(doc.object());
 }
 
 void ElectrumClient::handleMessage(const QJsonObject& message)
 {
+    // Every message must answer a request of ours or be a notification this
+    // client subscribed to. Anything else fails the connection: ignored, junk
+    // could be sent forever, each line parsed in full on the GUI thread.
     const QJsonValue idValue = message.value(QLatin1String("id"));
     if (idValue.isUndefined() || idValue.isNull()) {
-        // A notification. (An error without an id answers nothing we sent.)
-        const QString method = message.value(QLatin1String("method")).toString();
-        if (!method.isEmpty())
-            handleNotification(method, message.value(QLatin1String("params")).toArray());
+        const QJsonValue method = message.value(QLatin1String("method"));
+        if (method.isString()) {
+            handleNotification(method.toString(), message.value(QLatin1String("params")).toArray());
+            return;
+        }
+        // Not a notification. An error without an id answers nothing we sent
+        // (JSON-RPC uses it for a request the server could not read).
+        const QJsonValue errorValue = message.value(QLatin1String("error"));
+        failConnection(errorValue.isUndefined() || errorValue.isNull()
+                           ? QStringLiteral("malformed reply (no id)")
+                           : QStringLiteral("server error: %1").arg(errorText(errorValue)),
+                       Blame::Server);
         return;
     }
-    if (message.contains(QLatin1String("method")))
-        return; // a request from the server: not part of the Electrum protocol
+    if (message.contains(QLatin1String("method"))) {
+        // A request from the server: not part of the Electrum protocol.
+        failConnection(QStringLiteral("malformed reply (a request from the server)"), Blame::Server);
+        return;
+    }
 
     const int id = idValue.isString() ? idValue.toString().toInt() : idValue.toInt(0);
-    if (id <= 0)
+    if (id <= 0) {
+        failConnection(QStringLiteral("malformed reply (bad id)"), Blame::Server);
         return;
+    }
     const QJsonValue errorValue = message.value(QLatin1String("error"));
     const bool failed = !errorValue.isUndefined() && !errorValue.isNull();
     const QString error = failed ? errorText(errorValue) : QString();
     QJsonValue result = failed ? QJsonValue() : message.value(QLatin1String("result"));
-    if (result.isUndefined())
-        result = QJsonValue();
 
+    if (id == pingId_) {
+        pingId_ = 0; // any answer, even an error, shows the server is alive
+        noteStable();
+        return;
+    }
+    // A reply carries "result" or "error". Read as null, a missing result
+    // would say "no history" for a subscription.
+    if (result.isUndefined()) {
+        failConnection(QStringLiteral("malformed reply (no result)"), Blame::Server);
+        return;
+    }
     if (id == versionId_) {
         handleVersionReply(result, error);
         return;
@@ -765,13 +908,23 @@ void ElectrumClient::handleMessage(const QJsonObject& message)
         handleHeadersReply(result, error);
         return;
     }
-    if (id == pingId_) {
-        pingId_ = 0; // any answer, even an error, shows the server is alive
+    const auto it = inFlight_.find(id);
+    if (it == inFlight_.end()) {
+        // Every id on the wire is in flight until answered: this answers
+        // nothing, or answers a request twice.
+        failConnection(QStringLiteral("malformed reply (answers no request)"), Blame::Server);
         return;
     }
-    const auto it = inFlight_.find(id);
-    if (it == inFlight_.end())
-        return; // not ours, or already answered
+    if (!failed && it->method == kScripthashSubscribe) {
+        QString status;
+        if (!parseStatus(result, &status)) {
+            // Left in flight: failConnection() sends it again on the next
+            // server, so its caller still gets exactly one, valid, reply.
+            failConnection(QStringLiteral("malformed scripthash status"), Blame::Server);
+            return;
+        }
+        result = status.isEmpty() ? QJsonValue() : QJsonValue(status);
+    }
     // Out of the table before the callback runs: it may re-enter the client.
     Pending done = std::move(it.value());
     inFlight_.erase(it);
@@ -781,15 +934,22 @@ void ElectrumClient::handleMessage(const QJsonObject& message)
 
 void ElectrumClient::handleNotification(const QString& method, const QJsonArray& params)
 {
+    if (!noteUnsolicited())
+        return;
     if (method == kScripthashSubscribe) {
         // [scripthash, status or null]
-        if (params.isEmpty() || !params.at(0).isString())
+        QString status;
+        if (params.size() < 2 || !params.at(0).isString() || !parseStatus(params.at(1), &status)) {
+            failConnection(QStringLiteral("malformed scripthash notification"), Blame::Server);
             return;
+        }
         const QString scripthash = params.at(0).toString().toLower();
         const auto it = subscriptions_.find(scripthash);
-        if (it == subscriptions_.end())
-            return; // not subscribed here: a server must not grow the list restored on the next one
-        const QString status = params.size() > 1 ? statusOf(params.at(1)) : QString();
+        if (it == subscriptions_.end()) {
+            // Never subscribed: a server must not grow the list restored on the next one.
+            failConnection(QStringLiteral("notification for a scripthash never subscribed"), Blame::Server);
+            return;
+        }
         it.value() = status;
         emit scripthashChanged(scripthash, status);
     } else if (method == kHeadersSubscribe) {
@@ -797,10 +957,15 @@ void ElectrumClient::handleNotification(const QString& method, const QJsonArray&
         int height = -1;
         for (const QJsonValue& header : params)
             height = std::max(height, header.toObject().value(QLatin1String("height")).toInt(-1));
-        if (height < 0)
+        if (height < 0) {
+            failConnection(QStringLiteral("malformed headers notification"), Blame::Server);
             return;
+        }
         tip_ = height;
         emit tipChanged(height);
+    } else {
+        // Protocol 1.4 has no other notification, and nothing else was subscribed.
+        failConnection(QStringLiteral("unexpected notification %1").arg(clipped(method)), Blame::Server);
     }
 }
 

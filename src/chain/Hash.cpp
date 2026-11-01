@@ -85,14 +85,19 @@ Bytes fromHex(const std::string& hex)
     return out;
 }
 
+// Both scrub the whole allocation, not only size(): bytes past the end, left
+// there by earlier and longer contents, are as secret as the rest. Growing to
+// capacity() never reallocates.
 void secureClear(Bytes& data)
 {
+    data.resize(data.capacity());
     if (!data.empty()) Botan::secure_scrub_memory(data.data(), data.size());
     data.clear();
 }
 
 void secureClear(std::string& text)
 {
+    text.resize(text.capacity());
     if (!text.empty()) Botan::secure_scrub_memory(text.data(), text.size());
     text.clear();
 }

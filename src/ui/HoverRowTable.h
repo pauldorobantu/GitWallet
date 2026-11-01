@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QEvent>
+#include <QHeaderView>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QSet>
@@ -53,7 +54,17 @@ inline void paintRowStrips(QTableView* view, QPainter& p, int hoverRow)
     const bool alternate = view->alternatingRowColors();
     const int w = view->viewport()->width();
     const int vh = view->viewport()->height();
-    for (int row = 0; row < m->rowCount(); ++row) {
+    // Only the rows the viewport can show, found as QTableView::paintEvent finds
+    // them: a walk over every row of a long table on each repaint and hover
+    // change costs milliseconds. -1 (no row at that edge) falls back to that end
+    // of the table; the check below still skips rows outside.
+    const QHeaderView* header = view->verticalHeader();
+    const int firstVisual = qMax(header->visualIndexAt(0), 0);
+    int lastVisual = header->visualIndexAt(vh - 1);
+    if (lastVisual < 0)
+        lastVisual = header->count() - 1;
+    for (int visual = firstVisual; visual <= lastVisual; ++visual) {
+        const int row = header->logicalIndex(visual);
         const int y = view->rowViewportPosition(row);
         const int h = view->rowHeight(row);
         if (y + h <= 0 || y >= vh)

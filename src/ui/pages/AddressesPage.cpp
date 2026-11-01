@@ -10,6 +10,7 @@
 #include "ui/TableUtil.h"
 #include "ui/ThemeManager.h"
 #include "wallet/Types.h"
+#include "wallet/WalletModel.h"
 
 #include <QComboBox>
 #include <QFontMetrics>
@@ -62,6 +63,8 @@ public:
     }
     // A combo narrows the list (the search text is reported separately).
     bool filtered() const { return chain_ != ChainAll || state_ != StateAll; }
+    // The search text or a combo hides rows; otherwise every row passes.
+    bool narrowed() const { return filtered() || !query_.isEmpty(); }
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const override
@@ -114,6 +117,21 @@ QString countText(int shown, int total, int funded)
                                          : trText(QStringLiteral("%1 of %2"))
                                                .arg(english.toString(shown), english.toString(total));
     return trText(QStringLiteral("%1 %2 · %3 funded")).arg(count, noun, english.toString(funded));
+}
+
+// Funded rows among the first `rows` of the wallet model, the ones the table
+// has announced: the model's own count, less the rows appended since (they
+// reach the table on the next event-loop turn). No walk over every row.
+int fundedAmong(const wallet::WalletModel* model, int rows)
+{
+    if (!model)
+        return 0;
+    int funded = model->fundedCount();
+    for (int i = rows; i < model->size(); ++i) {
+        if (model->at(i).state() == wallet::AddressState::Funded)
+            --funded;
+    }
+    return funded;
 }
 
 // The glyph is a pixmap in the text colour of the theme it was drawn for.
@@ -241,7 +259,8 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->refresh->setEnabled(false);
     });
 
-    // Scan results arrive as single-row inserts and changes: recount in batches.
+    // Scan results arrive as inserts and single-row changes, hundreds a second:
+    // recount in batches.
     connect(ui_->filter, &QAbstractItemModel::rowsInserted, this, &AddressesPage::scheduleUpdate);
     connect(ui_->filter, &QAbstractItemModel::rowsRemoved, this, &AddressesPage::scheduleUpdate);
     connect(ui_->filter, &QAbstractItemModel::dataChanged, this, &AddressesPage::scheduleUpdate);
@@ -347,13 +366,20 @@ void AddressesPage::updateState()
     ui_->refresh->setEnabled(hasWallet && !ui_->cooldown->isActive());
 
     const int shown = ui_->filter->rowCount();
+    const int total = ui_->model->rowCount();
     int funded = 0;
-    for (int row = 0; row < shown; ++row) {
-        const QVariant state = ui_->filter->index(row, 0).data(AddressTableModel::StateRole);
-        if (state.toInt() == int(wallet::AddressState::Funded))
-            ++funded;
+    if (!ui_->filter->narrowed()) {
+        // Every row shows: the model counts them, so a scan streaming in
+        // thousands of rows costs no recount per burst.
+        funded = fundedAmong(controller_ ? controller_->model() : nullptr, total);
+    } else {
+        for (int row = 0; row < shown; ++row) {
+            const QVariant state = ui_->filter->index(row, 0).data(AddressTableModel::StateRole);
+            if (state.toInt() == int(wallet::AddressState::Funded))
+                ++funded;
+        }
     }
-    ui_->count->setText(hasWallet ? countText(shown, ui_->model->rowCount(), funded) : QString());
+    ui_->count->setText(hasWallet ? countText(shown, total, funded) : QString());
     ui_->count->setVisible(hasWallet);
 
     // Without a wallet a leftover search or filter must not turn the

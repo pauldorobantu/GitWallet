@@ -16,12 +16,15 @@
 #include "wallet/WalletStore.h"
 
 #include <QAction>
+#include <QContextMenuEvent>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -131,11 +134,43 @@ QIcon copyIcon()
     return makeIcon(icon::Kind::Copy, page::accent(), 16);
 }
 
+// An xpub reveals every address of its account. QLineEdit's own copy (Ctrl+C,
+// the context menu) puts plain text on the clipboard, which Windows keeps in
+// its history and may sync; every copy here goes through copyTextToClipboard()
+// instead, which keeps it out of both.
+class XpubField : public QLineEdit
+{
+public:
+    using QLineEdit::QLineEdit;
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        if (event->matches(QKeySequence::Copy)) {
+            copySelection();
+            return;
+        }
+        QLineEdit::keyPressEvent(event);
+    }
+
+    // Read-only: Copy and Select All are all the standard menu would offer.
+    void contextMenuEvent(QContextMenuEvent* event) override
+    {
+        QMenu menu(this);
+        menu.addAction(QStringLiteral("Copy"), this, [this] { copySelection(); });
+        menu.addAction(QStringLiteral("Select All"), this, &QLineEdit::selectAll);
+        menu.exec(event->globalPos());
+    }
+
+private:
+    void copySelection() { copyTextToClipboard(this, hasSelectedText() ? selectedText() : text()); }
+};
+
 // A read-only xpub with a copy button at its end (a line-edit action, as
 // the search field carries its magnifier).
 QLineEdit* makeXpubField(QWidget* parent, const wallet::AccountKey& key)
 {
-    auto* edit = new QLineEdit(key.xpub, parent);
+    auto* edit = new XpubField(key.xpub, parent);
     edit->setReadOnly(true);
     edit->setCursorPosition(0); // the prefix (xpub / ypub / zpub) stays visible
     edit->setToolTip(QStringLiteral("%1\n%2").arg(accountPath(key), key.xpub));

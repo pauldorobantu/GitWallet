@@ -8,6 +8,7 @@
 #include <QClipboard>
 #include <QColor>
 #include <QEvent>
+#include <QMimeData>
 #include <QMouseEvent>
 #include <QSet>
 #include <QTableWidgetItem>
@@ -41,7 +42,20 @@ void copyTextToClipboard(QWidget* host, const QString& text, const QString& labe
     const QString value = text.trimmed();
     if (value.isEmpty())
         return;
-    QApplication::clipboard()->setText(value);
+    auto* data = new QMimeData;
+    data->setText(value);
+#ifdef Q_OS_WIN
+    // Windows clipboard history (Win+V) would keep the copy and cloud clipboard
+    // sync would upload it, and an xpub lists every address of its account.
+    // These formats opt it out of both; the text pastes as before. Qt registers
+    // each custom format under the name in quotes.
+    const QByteArray off(4, '\0'); // DWORD 0 (the first format takes any data)
+    for (const char* format : {"ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory",
+                               "CanUploadToCloudClipboard"})
+        data->setData(QStringLiteral("application/x-qt-windows-mime;value=\"%1\"").arg(QLatin1StringView(format)),
+                      off);
+#endif
+    QApplication::clipboard()->setMimeData(data); // takes ownership
     QString shown = value;
     if (shown.size() > 72)
         shown = shown.left(69) + QStringLiteral("…");

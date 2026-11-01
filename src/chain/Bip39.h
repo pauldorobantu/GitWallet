@@ -11,7 +11,9 @@
 // already NFKD-normalised (the GUI does this with Qt).
 namespace chain::bip39 {
 
-// Splits a sentence into lowercase words on whitespace.
+// Splits a sentence into lowercase words on whitespace. A word's buffer holds
+// nothing of the sentence beyond its own size() characters, so secureClear()
+// on each word leaves no copy of them behind.
 std::vector<std::string> split(const std::string& sentence);
 
 // True if every word is in the list and the BIP39 checksum matches.

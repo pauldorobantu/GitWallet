@@ -9,7 +9,8 @@
 // BIP32 hierarchical-deterministic keys over secp256k1.
 //
 // HdKey is a private node: it is only alive while a seed is being imported (or,
-// later, while signing) and scrubs its private key when destroyed. HdPubKey is
+// later, while signing) and scrubs its private key and chain code (together an
+// xprv) when destroyed or overwritten. HdPubKey is
 // the public half of a node: an account-level HdPubKey (m/purpose'/coin'/account')
 // is all GitWallet stores, and every address below it is derived publicly, so
 // the seed never has to be kept.
@@ -54,7 +55,7 @@ public:
     HdKey(HdKey&& other) noexcept;
     HdKey& operator=(const HdKey& other);
     HdKey& operator=(HdKey&& other) noexcept;
-    ~HdKey(); // scrubs the private key
+    ~HdKey(); // scrubs the private key and the chain code
 
 private:
     HdKey() = default;

@@ -10,11 +10,18 @@
 #include "wallet/WalletStore.h"
 
 #include <QApplication>
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QMessageBox>
+#include <QStandardPaths>
 #include <QString>
 #include <QTimer>
 
@@ -22,6 +29,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <aclapi.h> // GetSecurityInfo; not in windows.h under WIN32_LEAN_AND_MEAN
 #endif
 
 namespace {
@@ -48,6 +56,123 @@ QString argValue(const QStringList& args, const QString& name)
 {
     const qsizetype i = args.indexOf(name);
     return (i >= 0 && i + 1 < args.size()) ? args.at(i + 1) : QString();
+}
+
+// The real wallet's folder: the one WalletStore uses without --data-dir.
+// Mirrors WalletStore::dataDir(), but creates nothing.
+QString realDataDir()
+{
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (dir.isEmpty()) dir = QDir::homePath() + QStringLiteral("/GitWallet");
+    return dir;
+}
+
+// Whether two paths name the same folder. The spellings are compared the way
+// NTFS compares them (case-insensitive); existing folders also by volume and
+// file ID, so 8.3 short names, \\?\ paths, junctions and symbolic links match.
+bool sameFolder(const QString& a, const QString& b)
+{
+    const auto clean = [](const QString& p) { return QDir::cleanPath(QDir(p).absolutePath()); };
+    if (clean(a).compare(clean(b), Qt::CaseInsensitive) == 0) return true;
+#ifdef _WIN32
+    const auto fileId = [](const QString& path, BY_HANDLE_FILE_INFORMATION* info) {
+        const QString native = QDir::toNativeSeparators(path);
+        const HANDLE h = CreateFileW(reinterpret_cast<const wchar_t*>(native.utf16()), 0,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        const bool ok = GetFileInformationByHandle(h, info) != FALSE;
+        CloseHandle(h);
+        return ok;
+    };
+    BY_HANDLE_FILE_INFORMATION x{}, y{};
+    if (fileId(a, &x) && fileId(b, &y))
+        return x.dwVolumeSerialNumber == y.dwVolumeSerialNumber && x.nFileIndexHigh == y.nFileIndexHigh
+               && x.nFileIndexLow == y.nFileIndexLow;
+#endif
+    return false;
+}
+
+// The name the open window listens on: one per Windows user and wallet folder,
+// so a second start finds it and a window on another --data-dir stays apart.
+// Hashed: pipe names are listed machine-wide, and a path may not fit in one.
+QString instanceName()
+{
+    const QString dir = wallet::WalletStore::dataDir();
+    const QString canonical = QFileInfo(dir).canonicalFilePath(); // links resolved
+    const QString key = QDir::homePath() + QLatin1Char('\n') + (canonical.isEmpty() ? dir : canonical);
+    // Lowercase: NTFS compares names case-insensitively.
+    const QByteArray digest = QCryptographicHash::hash(key.toLower().toUtf8(), QCryptographicHash::Sha256);
+    return QStringLiteral("GitWallet-") + QString::fromLatin1(digest.toHex());
+}
+
+#ifdef _WIN32
+// Whether this Windows user created the pipe `socket` is connected to. Pipe
+// names are machine-wide: another account could take GitWallet's name first,
+// and a start that obeyed its pipe would never show a window.
+bool ownPipe(const QLocalSocket& socket)
+{
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (GetSecurityInfo(reinterpret_cast<HANDLE>(socket.socketDescriptor()), SE_KERNEL_OBJECT,
+                        OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &descriptor)
+        != ERROR_SUCCESS)
+        return false;
+    bool own = false;
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        alignas(TOKEN_USER) BYTE user[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+        DWORD size = 0;
+        if (GetTokenInformation(token, TokenUser, user, sizeof user, &size))
+            own = EqualSid(owner, reinterpret_cast<const TOKEN_USER*>(user)->User.Sid) != FALSE;
+        CloseHandle(token);
+    }
+    LocalFree(descriptor);
+    return own;
+}
+#endif
+
+// Asks the window already open on this wallet folder to come to the front.
+// True when one answered: this start then has nothing left to do.
+bool raiseRunningWindow(const QString& name)
+{
+    QLocalSocket socket;
+    socket.connectToServer(name);
+    if (!socket.waitForConnected(1000)) return false;
+#ifdef _WIN32
+    if (!ownPipe(socket)) return false;
+    // Windows lets the other process take the focus only when this one, which
+    // the user just started, passes that right on.
+    AllowSetForegroundWindow(ASFW_ANY);
+#endif
+    socket.write("raise\n");
+    socket.waitForBytesWritten(1000);
+    // The window hangs up once it is in front.
+    if (socket.state() != QLocalSocket::UnconnectedState) socket.waitForDisconnected(3000);
+    return true;
+}
+
+// Answers raiseRunningWindow() for `window`: restores it from the taskbar
+// (still maximised if it was) and brings it to the front.
+void serveRaiseRequests(QLocalServer* server, QWidget* window)
+{
+    QObject::connect(server, &QLocalServer::newConnection, window, [server, window] {
+        while (QLocalSocket* peer = server->nextPendingConnection()) {
+            QObject::connect(peer, &QLocalSocket::disconnected, peer, &QObject::deleteLater);
+            QObject::connect(peer, &QLocalSocket::readyRead, peer, [peer, window] {
+                // One short line; more than that without a newline is no request.
+                if (!peer->canReadLine() && peer->bytesAvailable() < 64) return;
+                if (peer->readLine(64).trimmed() == "raise") {
+                    window->setWindowState((window->windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+                    window->raise();
+                    window->activateWindow();
+                }
+                peer->disconnectFromServer();
+            });
+        }
+    });
+    // A window that is closing cannot come forward: later starts open their own.
+    QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, server, &QLocalServer::close);
 }
 
 // The public BIP39 test mnemonic (published in BIP84 and every wallet test
@@ -98,6 +223,12 @@ bool writeScanReport(const QString& path, app::WalletController* c, bool timedOu
         {QStringLiteral("electrumServer"), c->electrumServer()},
         {QStringLiteral("ethEndpoint"), c->ethEndpoint()},
         {QStringLiteral("status"), c->statusText()},
+        // Whether the figures below are complete and current, as the UI judges it.
+        {QStringLiteral("balancesComplete"), c->balancesComplete()},
+        {QStringLiteral("addressLimitReached"), c->addressLimitReached()},
+        {QStringLiteral("ethWrongChain"), c->ethWrongChain()},
+        {QStringLiteral("ethRefreshFailing"), c->ethRefreshFailing()},
+        {QStringLiteral("ethBalancesAt"), c->ethBalancesAt().toString(Qt::ISODate)},
         {QStringLiteral("rowCount"), m->size()},
         {QStringLiteral("usedCount"), m->usedCount()},
         {QStringLiteral("fundedCount"), m->fundedCount()},
@@ -134,9 +265,26 @@ int main(int argc, char** argv)
         return st.ok ? 0 : 1;
     }
 
-    // A separate data folder (tests, screenshots, a second wallet).
-    const QString dataDir = argValue(args, QStringLiteral("--data-dir"));
+    // A separate data folder (tests, screenshots, a second wallet). Trimmed as
+    // WalletStore::setDataDir trims it, so a blank value counts as no
+    // --data-dir (the real wallet) in the check below as well.
+    const QString dataDir = argValue(args, QStringLiteral("--data-dir")).trimmed();
     if (!dataDir.isEmpty()) wallet::WalletStore::setDataDir(dataDir);
+
+    // Test-only switches save, replace or delete wallet.dat, or put the xpubs,
+    // addresses and balances into unencrypted files (report, screenshots), so
+    // they only run on a separate --data-dir: refused without one, and when the
+    // folder WalletStore actually resolved is the real wallet's after all.
+    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
+                                QStringLiteral("--scan-report"), QStringLiteral("--screenshot")}) {
+        if (!args.contains(name)) continue;
+        if (dataDir.isEmpty() || sameFolder(wallet::WalletStore::dataDir(), realDataDir())) {
+            attachParentConsole();
+            std::fprintf(stderr, "%s needs --data-dir <folder>, a folder other than the real wallet's\n",
+                         qPrintable(name));
+            return 2;
+        }
+    }
 
     app::ui::theme::ThemeManager::instance()->loadFromSettings();
     app::ui::theme::ThemeManager::instance()->apply();
@@ -154,15 +302,10 @@ int main(int argc, char** argv)
     }
 
     // --walkthrough <dir>: drive the real UI end to end (import with mistakes,
-    // scan, pages, settings, reopen, remove) with a screenshot per step. Only
-    // with --data-dir, so it can never touch the real wallet.
+    // scan, pages, settings, reopen, remove) with a screenshot per step. Only on
+    // a separate --data-dir (checked above), so it never touches the real wallet.
     const QString walkthroughDir = argValue(args, QStringLiteral("--walkthrough"));
     if (!walkthroughDir.isEmpty()) {
-        if (dataDir.isEmpty()) {
-            attachParentConsole();
-            std::fputs("--walkthrough needs --data-dir <folder>\n", stderr);
-            return 2;
-        }
         app::Walkthrough walkthrough(
             [] {
                 auto* w = new app::ui::MainWindow;
@@ -174,18 +317,32 @@ int main(int argc, char** argv)
         return app.exec();
     }
 
+    // One window per wallet folder: a second start brings the open one to the
+    // front instead (WalletController's lock already keeps a second window from
+    // writing). Test runs and --page open their own window on a throw-away
+    // folder, often beside a normal one, so they skip this.
+    bool singleWindow = true;
+    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
+                                QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
+                                QStringLiteral("--page")})
+        singleWindow = singleWindow && !args.contains(name);
+    QLocalServer instance; // listens before the window is built: a start meanwhile finds it
+    if (singleWindow) {
+        const QString name = instanceName();
+        if (raiseRunningWindow(name)) return 0;
+        instance.setSocketOptions(QLocalServer::UserAccessOption); // this Windows user only
+        if (!instance.listen(name))
+            qWarning().noquote() << "[instance] not listening:" << instance.errorString();
+    }
+
     app::ui::MainWindow window;
     app::WalletController* controller = window.controller();
+    if (instance.isListening()) serveRaiseRequests(&instance, &window);
     window.show(); // the saved wallet loads on the first event-loop pass
 
-    // --import-test-mnemonic: the PUBLIC test seed into a throw-away --data-dir.
-    // Refused without --data-dir so it can never touch the real wallet.
+    // --import-test-mnemonic: the PUBLIC test seed into a throw-away --data-dir
+    // (checked above), so it never lands in the real wallet.
     if (args.contains(QStringLiteral("--import-test-mnemonic"))) {
-        if (dataDir.isEmpty()) {
-            attachParentConsole();
-            std::fputs("--import-test-mnemonic needs --data-dir <folder>\n", stderr);
-            return 2;
-        }
         QTimer::singleShot(0, controller, [controller] {
             if (controller->hasWallet()) return;
             QString error;
@@ -202,7 +359,8 @@ int main(int argc, char** argv)
 
     if (!reportPath.isEmpty()) {
         // Wait for both chains' initial scan (or the timeout), then write the
-        // report (and the screenshot, if asked) and quit.
+        // report (and the screenshot, if asked) and quit. Only on a separate
+        // --data-dir (checked above): the report holds the xpubs in plain text.
         const int timeoutMs = qBound(10, argValue(args, QStringLiteral("--timeout")).toInt(), 3600) * 1000;
         auto finish = [&window, controller, reportPath, shot](bool timedOut) {
             static bool done = false;
@@ -217,8 +375,9 @@ int main(int argc, char** argv)
         QTimer::singleShot(argValue(args, QStringLiteral("--timeout")).isEmpty() ? 300000 : timeoutMs,
                            controller, [finish] { finish(true); });
     } else if (!shot.isEmpty()) {
-        // --screenshot <file.png>: render the window and quit
-        // (documentation / visual checks; works with QT_QPA_PLATFORM=offscreen).
+        // --screenshot <file.png>: render the window and quit (documentation /
+        // visual checks on a separate --data-dir, checked above; works with
+        // QT_QPA_PLATFORM=offscreen).
         QTimer::singleShot(1200, &window, [&window, shot] {
             window.grab().save(shot);
             QCoreApplication::quit();

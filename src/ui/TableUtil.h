@@ -19,6 +19,7 @@ QString shortTimestamp(const QString& raw);
 
 // Copies to the clipboard + a discreet confirmation next to the cursor.
 // Truncates long text in the confirmation (keys/URLs stay whole in the clipboard).
+// On Windows the copy is kept out of clipboard history and cloud clipboard sync.
 void copyTextToClipboard(QWidget* host, const QString& text,
                          const QString& label = QString());
 

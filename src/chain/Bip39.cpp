@@ -38,25 +38,51 @@ const std::unordered_map<std::string, int>& wordIndex()
     return idx;
 }
 
+// Calls f(first, last) for every run of non-whitespace characters in `text`.
+// split() walks the sentence twice through here, so the number of words it
+// reserves room for and the words it then builds can never disagree.
+template <class F>
+void forEachWord(const std::string& text, F&& f)
+{
+    const auto isSpace = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    const char* p = text.data();
+    const char* const end = p + text.size();
+    while (p != end) {
+        if (isSpace(*p)) { ++p; continue; }
+        const char* const first = p;
+        while (p != end && !isSpace(*p)) ++p;
+        f(first, p);
+    }
+}
+
 } // namespace
 
 std::vector<std::string> split(const std::string& sentence)
 {
-    // Reserve up front: a vector or string that grows reallocates, and the old
-    // buffer — holding seed words — would be freed without being scrubbed.
+    // Every word is built once, straight from its slice of the sentence, and
+    // lowercased in place, so its buffer holds no seed bytes beyond its own
+    // size() characters and secureClear() on it leaves nothing behind. Words
+    // cut from one reused buffer would not: clear() keeps the tails of
+    // earlier, longer words past the new end, and copying a short word copies
+    // its whole small-string buffer, those tails included.
+    // The words are counted first so the vector is reserved exactly: a vector
+    // that grows reallocates, and the old buffer would be freed unscrubbed.
+    size_t count = 0;
+    forEachWord(sentence, [&count](const char*, const char*) { ++count; });
+
     std::vector<std::string> out;
-    out.reserve(sentence.size() / 2 + 1);
-    std::string cur;
-    cur.reserve(sentence.size());
-    for (char c : sentence) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
-            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
-        } else {
-            cur.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    secureClear(cur);
+    // If building a word throws (no memory for a long one), the words built so
+    // far are scrubbed before the vector frees them.
+    struct Scrub {
+        std::vector<std::string>* words; bool done;
+        ~Scrub() { if (!done) for (std::string& w : *words) secureClear(w); }
+    } scrub{&out, false};
+    out.reserve(count);
+    forEachWord(sentence, [&out](const char* first, const char* last) {
+        std::string& word = out.emplace_back(first, static_cast<size_t>(last - first));
+        for (char& c : word) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    });
+    scrub.done = true;
     return out;
 }
 

@@ -36,4 +36,20 @@ cmake -S . -B build -G Ninja ^
     -DVCPKG_INSTALLED_DIR=C:/app-vcpkg-installed || exit /b 1
 cmake --build build || exit /b 1
 
-echo [build] OK: build\GitWallet.exe
+rem dist\ = a folder that runs on its own: the exe, its DLLs and the Qt plugins
+rem in lib\plugins, where the embedded qt.conf (Prefix = lib) looks for them.
+set "DIST=%REPO%\dist"
+if exist "%DIST%" rmdir /s /q "%DIST%" || (echo [build] dist\ is in use - close GitWallet & exit /b 1)
+mkdir "%DIST%" || exit /b 1
+copy /y build\GitWallet.exe "%DIST%\" >nul || exit /b 1
+copy /y build\*.dll "%DIST%\" >nul || exit /b 1
+"%QT_DIR%\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler ^
+    --no-system-dxc-compiler --no-opengl-sw --no-compiler-runtime ^
+    --plugindir "%DIST%\lib\plugins" "%DIST%\GitWallet.exe" >nul || exit /b 1
+rem windeployqt also copies Windows' own ICU, which every supported Windows has.
+if exist "%DIST%\icuuc.dll" del "%DIST%\icuuc.dll"
+rem The Visual C++ runtime next to the exe, so the folder also runs where it is
+rem not installed.
+copy /y "%VCToolsRedistDir%x64\Microsoft.VC143.CRT\*.dll" "%DIST%\" >nul || exit /b 1
+
+echo [build] OK: build\GitWallet.exe, runnable copy in dist\
