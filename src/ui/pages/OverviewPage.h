@@ -13,8 +13,9 @@ class WalletController;
 
 namespace app::ui {
 
-// The Overview page. Without a wallet: an empty state with an "Add wallet"
-// primary button (emits importRequested). With wallets: the grand total in USD,
+// The Overview page. Without a wallet: an empty state with an "Add wallet" primary
+// button and "Add many" beside it (importRequested, importManyRequested). With
+// wallets: the grand total in USD,
 // one card per asset (BTC, ETH, USDT, USDC: amount in its own unit + USD), the
 // scan progress and when the prices were last updated, and a Refresh action in
 // the bottom action bar. A figure reads plain only once every balance behind it
@@ -30,6 +31,7 @@ public:
 
 signals:
     void importRequested();
+    void importManyRequested();
 
 private:
     QWidget* buildEmptyState();

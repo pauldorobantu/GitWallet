@@ -46,6 +46,16 @@ struct WalletEntry {
     QList<AccountKey> accounts;
 };
 
+// A wallet to add, as a batch asks for it. `refused` says why it was not added, if it
+// was not.
+struct WalletRequest {
+    QList<AccountKey> accounts;
+    QString label;         // empty: "Wallet N"
+    bool fromKeys = false;
+    int line = 0;          // the caller's: which line of its list this came from
+    QString refused;
+};
+
 enum class AddressState { Unknown, Unused, Used, Funded };
 
 // What a scanner's problem report is about, so the UI reacts to the kind and

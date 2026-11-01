@@ -199,20 +199,30 @@ QWidget* OverviewPage::buildEmptyState()
 {
     QWidget* empty = page::makeEmptyState(
         this, static_cast<int>(icon::Kind::Dashboard), QStringLiteral("No wallet yet"),
-        QStringLiteral("Add a seed, or its public keys, to see every Bitcoin and Ethereum address it controls."));
-    auto* importButton = new QPushButton(QStringLiteral("Add wallet"), empty);
+        QStringLiteral("Add your seeds, one by one or a whole list, or just their public keys, to see "
+                       "every Bitcoin and Ethereum address they control."));
+    auto* actions = new QWidget(empty);
+    auto* row = new QHBoxLayout(actions);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(page::kToolbarSpacing);
+    auto* manyButton = new QPushButton(QStringLiteral("Add many"), actions);
+    manyButton->setToolTip(QStringLiteral("A list of seeds or public keys, pasted or from a file"));
+    connect(manyButton, &QPushButton::clicked, this, &OverviewPage::importManyRequested);
+    auto* importButton = new QPushButton(QStringLiteral("Add wallet"), actions);
     importButton->setObjectName(QStringLiteral("primaryButton"));
     connect(importButton, &QPushButton::clicked, this, &OverviewPage::importRequested);
+    row->addWidget(manyButton);
+    row->addWidget(importButton);
 
-    // The button joins the kit's own centred column, under the subtitle. An
+    // The buttons join the kit's own centred column, under the subtitle. An
     // outer layout around the empty state squeezed its icon badge instead: it
     // sized the column for a one-line subtitle at the page's full width, while
     // the column wraps the subtitle at its own, narrower width.
     if (QLayout* column = empty->layout()) {
         if (auto* box = qobject_cast<QBoxLayout*>(column))
-            box->addSpacing(page::kToolbarSpacing); // a little air above the action
-        column->addWidget(importButton);
-        column->setAlignment(importButton, Qt::AlignHCenter);
+            box->addSpacing(page::kToolbarSpacing); // a little air above the actions
+        column->addWidget(actions);
+        column->setAlignment(actions, Qt::AlignHCenter);
     }
     return empty;
 }

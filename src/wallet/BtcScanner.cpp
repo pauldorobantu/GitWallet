@@ -53,7 +53,7 @@ constexpr int kMaxGap = 100000;
 // wallet; all wallets share it, since they share one connection.
 constexpr qint64 kRowsPerGapRow = 20;
 constexpr int kMinWalletRows = 10000;
-constexpr int kMaxWalletRows = 40000;
+constexpr int kMaxWalletRows = BtcScanner::kMaxFollowedRows;
 
 // The end of a chain's indices. Only a gap window larger than the row limit (a
 // caller other than the controller) gets near it; well below 2^31, where

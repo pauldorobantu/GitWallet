@@ -306,6 +306,7 @@ struct WalletsPage::Ui : QObject
     QPushButton* rename = nullptr;
     QPushButton* remove = nullptr;
     QPushButton* addresses = nullptr;
+    QPushButton* addMany = nullptr;
     QPushButton* add = nullptr;
     QWidget* empty = nullptr;
     QWidget* noResults = nullptr;
@@ -349,7 +350,8 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
 
     ui_->empty = page::makeEmptyState(
         this, int(icon::Kind::ListRows), QStringLiteral("No wallet yet"),
-        QStringLiteral("Add each seed you receive payments on, and see what every one of them holds."));
+        QStringLiteral("Add each seed you receive payments on, one by one or a whole list, and see what "
+                       "every one of them holds."));
     ui_->noResults = page::makeNoResultsState(this);
     root->addWidget(ui_->empty, 1);
     root->addWidget(ui_->noResults, 1);
@@ -365,12 +367,15 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     ui_->rename = new QPushButton(QStringLiteral("Rename"), bar.widget);
     ui_->remove = new QPushButton(QStringLiteral("Remove"), bar.widget);
     ui_->addresses = new QPushButton(QStringLiteral("View addresses"), bar.widget);
+    ui_->addMany = new QPushButton(QStringLiteral("Add many"), bar.widget);
+    ui_->addMany->setToolTip(QStringLiteral("A list of seeds or public keys, pasted or from a file"));
     ui_->add = new QPushButton(QStringLiteral("Add wallet"), bar.widget);
     ui_->add->setObjectName(QStringLiteral("primaryButton"));
     bar.right->addWidget(ui_->keys);
     bar.right->addWidget(ui_->rename);
     bar.right->addWidget(ui_->remove);
     bar.right->addWidget(ui_->addresses);
+    bar.right->addWidget(ui_->addMany);
     bar.right->addWidget(ui_->add);
     root->addWidget(bar.widget);
 
@@ -394,6 +399,7 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
             emit showAddressesRequested(id);
     });
     connect(ui_->add, &QPushButton::clicked, this, &WalletsPage::addRequested);
+    connect(ui_->addMany, &QPushButton::clicked, this, &WalletsPage::addManyRequested);
     connect(ui_->addresses, &QPushButton::clicked, this, [this] {
         if (const quint32 id = selectedId())
             emit showAddressesRequested(id);

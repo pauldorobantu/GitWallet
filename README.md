@@ -19,7 +19,12 @@ after the first gap and miss funds further down.
 
 1. **View** *(done)* — add as many named wallets as you need, up to 500: a BIP39
    seed once, or just its public keys (zpub, ypub, xpub) when the seed should
-   never touch this PC. GitWallet derives the account public keys and scans every
+   never touch this PC. **One at a time or a whole list:** *Add many* takes one seed
+   or one set of public keys per line, pasted or from a text or CSV file, each with
+   a name if you want (`Shop 1: word word ...`, `"Shop 2","word word ..."`, a
+   numbered list). The good lines go in together; a line with a problem stays in
+   the field, named by its number and never quoted, and a seed already here is
+   refused. GitWallet derives the account public keys and scans every
    Bitcoin address type (native SegWit, nested SegWit, legacy — receive and
    change) and Ethereum (ETH, USDT, USDC) far past the last used address (gap
    limits are configurable, default 200 / 50 / 100). The Wallets page lists what
@@ -99,8 +104,8 @@ Every claim below is reproducible with the public BIP39 test mnemonic
 | Bitcoin addresses vs **Electrum 4.8.3** watch-only wallets from the same zpub / ypub / xpub (receive + change, all three types) | 90 / 90 identical |
 | Every Bitcoin address's history and balance vs **Blockstream's electrs** server (a different operator and implementation than the scan used) + a mempool.space sample | 988 / 988 identical |
 | Every Ethereum address's nonce, ETH, USDT and USDC vs a **different RPC node**, with plain calls instead of Multicall | 297 / 297 identical |
-| `--walkthrough`: the real UI driven like a user — a seed with three kinds of mistakes, a second seed, the same seed refused, public keys, totals per wallet adding up, filter, CSV, rename, settings, close and reopen from `wallet.dat`, remove one, remove all | run on every push (see below) |
-| `--store-test`: a `wallet.dat` of the earlier format, ids, repeated keys, public-key parsing and per-wallet totals, offline | run on every push (see below) |
+| `--walkthrough`: the real UI driven like a user — a seed with three kinds of mistakes, a second seed, the same seed refused, public keys, totals per wallet adding up, filter, CSV, rename, settings, close and reopen from `wallet.dat`, remove one, a list of seeds and of public keys from a file and a paste, remove all | run on every push (see below) |
+| `--store-test`: a `wallet.dat` of the earlier format, ids, repeated keys, public-key parsing, reading lists, adding in a batch and per-wallet totals, offline | run on every push (see below) |
 
 The address and balance comparisons above were made on the single-seed view; the
 address derivation they cover is unchanged. Every push builds GitWallet on a clean
@@ -116,7 +121,11 @@ GitWallet --selftest
 GitWallet --data-dir C:\tmp\gw --import-test-mnemonic --scan-report report.json
 GitWallet --data-dir C:\tmp\gw2 --walkthrough C:\tmp\walk
 GitWallet --data-dir C:\tmp\gw3 --store-test
+GitWallet --data-dir C:\tmp\gw4 --demo-wallets
 ```
+
+`--demo-wallets` fills the folder with published test seeds, to see the app with real
+addresses and balances. Anyone can spend from those seeds: never send anything to them.
 
 ## Build
 

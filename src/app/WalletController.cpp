@@ -361,60 +361,99 @@ bool WalletController::addKeysWallet(const QList<wallet::AccountKey>& keys, cons
 bool WalletController::addWallet(QList<wallet::AccountKey> accounts, const QString& label,
                                  bool fromKeys, const QString& what, QString* error)
 {
-    if (store_.wallets.size() >= wallet::WalletStore::kMaxWallets) {
-        setError(error, QStringLiteral("%1: GitWallet keeps at most %2 wallets.")
-                            .arg(what)
-                            .arg(wallet::WalletStore::kMaxWallets));
-        return false;
-    }
+    QList<wallet::WalletRequest> one(1);
+    one.first().accounts = std::move(accounts);
+    one.first().label = label;
+    one.first().fromKeys = fromKeys;
+    QString why;
+    if (addWalletsAs(&one, what, &why) == 1)
+        return true;
+    setError(error, why.isEmpty() ? what + QStringLiteral(": ") + one.first().refused : why);
+    return false;
+}
+
+int WalletController::addWallets(QList<wallet::WalletRequest>* requests, QString* error)
+{
+    return addWalletsAs(requests, QStringLiteral("The wallets were not added"), error);
+}
+
+int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const QString& what, QString* error)
+{
+    setError(error, QString());
+
     // One set of addresses has one owner: the scanners and the totals count each
     // address once. By what decides the addresses, not by the text of the key.
+    QHash<QByteArray, QString> owners; // an account's addresses -> its wallet's name
     try {
-        QSet<QByteArray> ours;
-        for (const wallet::AccountKey& key : std::as_const(accounts))
-            ours.insert(wallet::WalletStore::addressSetId(key));
         for (const wallet::WalletEntry& other : std::as_const(store_.wallets)) {
-            for (const wallet::AccountKey& theirs : other.accounts) {
-                if (ours.contains(wallet::WalletStore::addressSetId(theirs))) {
-                    setError(error, QStringLiteral("%1: wallet “%2” already has these keys.").arg(what, other.label));
-                    return false;
-                }
-            }
+            for (const wallet::AccountKey& theirs : other.accounts)
+                owners.insert(wallet::WalletStore::addressSetId(theirs), other.label);
         }
     } catch (const std::exception&) {
         setError(error, what + QStringLiteral(": a public key could not be read."));
-        return false;
+        return 0;
     }
+
+    qsizetype room = wallet::WalletStore::kMaxWallets - store_.wallets.size();
+    QList<wallet::WalletEntry> entries;
+    for (wallet::WalletRequest& request : *requests) {
+        request.refused.clear();
+        QList<QByteArray> ids;
+        try {
+            for (const wallet::AccountKey& key : std::as_const(request.accounts))
+                ids.append(wallet::WalletStore::addressSetId(key));
+        } catch (const std::exception&) {
+            request.refused = QStringLiteral("a public key could not be read.");
+            continue;
+        }
+        const auto owned = std::find_if(ids.cbegin(), ids.cend(),
+                                        [&owners](const QByteArray& id) { return owners.contains(id); });
+        if (owned != ids.cend()) {
+            request.refused = QStringLiteral("wallet “%1” already has these keys.").arg(owners.value(*owned));
+            continue;
+        }
+        if (room <= 0) {
+            request.refused = QStringLiteral("GitWallet keeps at most %1 wallets.").arg(wallet::WalletStore::kMaxWallets);
+            continue;
+        }
+        --room;
+
+        wallet::WalletEntry entry;
+        entry.id = store_.takeWalletId();
+        entry.label = wallet::WalletStore::cleanLabel(request.label);
+        if (entry.label.isEmpty())
+            entry.label = QStringLiteral("Wallet %1").arg(entry.id);
+        entry.fromKeys = request.fromKeys;
+        entry.accounts = request.accounts;
+        for (wallet::AccountKey& key : entry.accounts)
+            key.wallet = entry.id;
+        for (const QByteArray& id : std::as_const(ids))
+            owners.insert(id, entry.label);
+        entries.append(entry);
+    }
+    if (entries.isEmpty())
+        return 0;
 
     // Last before the save: nothing is moved for an add refused above.
     QString movedTo;
     const QString blocker = walletSaveBlocker(&movedTo);
     if (!blocker.isEmpty()) {
         setError(error, what + QStringLiteral(": ") + blocker);
-        return false;
+        return 0;
     }
-
-    wallet::WalletEntry entry;
-    entry.id = store_.takeWalletId();
-    entry.label = wallet::WalletStore::cleanLabel(label);
-    if (entry.label.isEmpty())
-        entry.label = QStringLiteral("Wallet %1").arg(entry.id);
-    entry.fromKeys = fromKeys;
-    for (wallet::AccountKey& key : accounts)
-        key.wallet = entry.id;
-    entry.accounts = std::move(accounts);
 
     // Save before touching anything else: on failure the wallets shown so far
     // keep running as they were.
-    store_.wallets.append(entry);
+    const qsizetype before = store_.wallets.size();
+    store_.wallets.append(entries);
     QString saveError;
     if (!saveStore(&saveError)) {
-        store_.wallets.removeLast();
+        store_.wallets.remove(before, entries.size());
         // The file moved aside goes back, so the next start warns about it again.
         if (!movedTo.isEmpty())
             QFile::rename(movedTo, wallet::WalletStore::filePath());
         setError(error, storeMessage(saveError, QStringLiteral("The wallet could not be saved.")));
-        return false;
+        return 0;
     }
 
     restartServices();
@@ -427,7 +466,7 @@ bool WalletController::addWallet(QList<wallet::AccountKey> accounts, const QStri
                                .arg(QDir::toNativeSeparators(movedTo)),
                            QString());
     }
-    return true;
+    return int(entries.size());
 }
 
 bool WalletController::removeWallet(quint32 id, QString* error)

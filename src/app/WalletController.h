@@ -59,6 +59,11 @@ public:
                            const QString& label, QString* error);
     // The same for public keys from WalletStore::accountsFromPublicKeys().
     bool addKeysWallet(const QList<wallet::AccountKey>& keys, const QString& label, QString* error);
+    // Adds every request that can go in, with one save and one restart of the
+    // scanners, which is what a list of hundreds needs. A request that cannot says
+    // why in its `refused`. Returns how many went in; 0 with `error` when the file
+    // could not take any of them.
+    int addWallets(QList<wallet::WalletRequest>* requests, QString* error);
 
     // Forgets one wallet: its keys leave wallet.dat, its rows the model; the
     // others keep their data and go on being watched.
@@ -158,6 +163,7 @@ private:
     // refusal says starts with `what` ("The seed was not added").
     bool addWallet(QList<wallet::AccountKey> accounts, const QString& label, bool fromKeys,
                    const QString& what, QString* error);
+    int addWalletsAs(QList<wallet::WalletRequest>* requests, const QString& what, QString* error);
     // Empty when the wallet list may be written to wallet.dat now, else why not.
     // A wallet.dat that opens after all is left alone (the answer says to restart).
     // One that still cannot be read is moved aside, its new name in `movedTo`: it

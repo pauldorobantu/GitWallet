@@ -31,6 +31,9 @@ class BtcScanner : public QObject
 {
     Q_OBJECT
 public:
+    // Addresses one connection follows at most, all wallets together (BtcScanner.cpp).
+    static constexpr int kMaxFollowedRows = 40000;
+
     BtcScanner(net::ElectrumClient* client, WalletModel* model, QObject* parent = nullptr);
 
     void setAccounts(const QList<AccountKey>& accounts); // non-Bitcoin accounts are ignored

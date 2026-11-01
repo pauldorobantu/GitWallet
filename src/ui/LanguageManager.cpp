@@ -50,6 +50,8 @@ const Tr kTr[] = {
     { "Wallet", "Billetera", "Portefeuille", "Wallet", "Кошелёк" },
     { "Wallets", "Billeteras", "Portefeuilles", "Wallets", "Кошельки" },
     { "Add wallet", "Añadir billetera", "Ajouter un portefeuille", "Wallet hinzufügen", "Добавить кошелёк" },
+    { "Add wallets", "Añadir billeteras", "Ajouter les portefeuilles", "Wallets hinzufügen", "Добавить кошельки" },
+    { "Add many", "Añadir varias", "En ajouter plusieurs", "Mehrere hinzufügen", "Добавить несколько" },
     { "Overview", "Resumen", "Vue d'ensemble", "Übersicht", "Обзор" },
     { "Addresses", "Direcciones", "Adresses", "Adressen", "Адреса" },
     { "Send", "Enviar", "Envoyer", "Senden", "Отправить" },

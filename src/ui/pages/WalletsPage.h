@@ -23,6 +23,7 @@ public:
 
 signals:
     void addRequested();
+    void addManyRequested();
     void showAddressesRequested(quint32 wallet);
 
 protected:

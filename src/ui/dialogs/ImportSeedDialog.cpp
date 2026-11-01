@@ -9,12 +9,14 @@
 #include "ui/PageKit.h"
 #include "ui/XpubField.h"
 #include "ui/design/Style.h"
+#include "wallet/BtcScanner.h"
 #include "wallet/WalletStore.h"
 
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFile>
+#include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -38,6 +40,15 @@
 namespace app::ui {
 
 namespace {
+
+// The pages of the dialog, in the order of its "Add from" list.
+enum Source { OneSeed, ManySeeds, OneKeys, ManyKeys };
+
+// A list file is text someone keeps: far above any list, far below what could stall
+// the window.
+constexpr qint64 kMaxListFileBytes = 4 << 20;
+// Problems the status line spells out; the rest are counted.
+constexpr qsizetype kShownProblems = 4;
 
 // Neither field may teach an input method or a touch keyboard what was typed.
 constexpr Qt::InputMethodHints kSecretInputHints =
@@ -88,8 +99,9 @@ void takeUtf8(QString& text, std::string& out)
 // zero-width space, a soft hyphen, a direction mark) are dropped instead of
 // spaced: they never show as a gap, so a word on screen stays one word. The
 // live check and the import both read the phrase through here, so the words
-// that passed the check are the words imported.
-void takePhrase(const QPlainTextEdit* edit, std::string& out)
+// that passed the check are the words imported. `lines`: a list keeps its line
+// breaks and tabs, which wallet::parseSeedLines() reads.
+void takePhrase(const QPlainTextEdit* edit, std::string& out, bool lines = false)
 {
     QString typed = edit->toPlainText();
     QString nfkd = typed.normalized(QString::NormalizationForm_KD);
@@ -98,7 +110,8 @@ void takePhrase(const QPlainTextEdit* edit, std::string& out)
     for (const QChar c : std::as_const(nfkd)) {
         if (c.category() == QChar::Other_Format)
             continue;
-        phrase.append(c.isSpace() ? QChar(u' ') : c);
+        const bool keep = lines && (c == QChar(u'\n') || c == QChar(u'\t'));
+        phrase.append(c.isSpace() && !keep ? QChar(u' ') : c);
     }
     // normalized() hands a phrase that needs no change (any ASCII one) back
     // in the very buffer `typed` holds; filling both zeroes it whichever of
@@ -174,20 +187,6 @@ void wipeTextEdit(QPlainTextEdit* edit)
     edit->clear();
 }
 
-// A recovery phrase in a field that is not the seed field. Six words: a name cut
-// at kMaxLabelChars still holds that many, and a real name hardly ever does.
-bool looksLikeSeedWords(const QString& text)
-{
-    static const QRegularExpression space(QStringLiteral("\\s+"));
-    int words = 0;
-    const QStringList tokens = text.split(space, Qt::SkipEmptyParts);
-    for (const QString& token : tokens) {
-        if (isBip39Word(token.toLower().toStdString()) && ++words >= 6)
-            return true;
-    }
-    return false;
-}
-
 // The address a key starts with, for the user to compare with the other wallet.
 // Throws what the derivation throws.
 QString firstAddress(const wallet::AccountKey& key)
@@ -196,9 +195,39 @@ QString firstAddress(const wallet::AccountKey& key)
     return QString::fromStdString(chain::addressFromChainNode(chainNode, key.type, key.account, 0, 0).address);
 }
 
+// The status line of a list: how many lines can go in, and what is wrong with the rest.
+QString listSummary(int ready, const QString& oneReady, const QString& manyReady, const QStringList& problems)
+{
+    QStringList lines;
+    if (ready > 0)
+        lines << (ready == 1 ? oneReady : manyReady.arg(ready));
+    for (qsizetype i = 0; i < problems.size() && i < kShownProblems; ++i)
+        lines << problems.at(i);
+    if (problems.size() > kShownProblems)
+        lines << trText(QStringLiteral("and %1 more lines to fix")).arg(problems.size() - kShownProblems);
+    return lines.join(QLatin1Char('\n'));
+}
+
+// A list's accounts: an xpub is read as `xpubType`, which may be an Ethereum account.
+bool accountsOfLine(const wallet::KeyLine& line, chain::ScriptType xpubType, QList<wallet::AccountKey>* out,
+                    QString* why)
+{
+    const bool xpubIsEthereum = xpubType == chain::ScriptType::EthAccount;
+    QStringList bitcoin;
+    QStringList ethereum;
+    for (const QString& key : line.keys) {
+        if (xpubIsEthereum && key.startsWith(QLatin1String("xpub")))
+            ethereum << key;
+        else
+            bitcoin << key;
+    }
+    return wallet::WalletStore::accountsFromPublicKeys(bitcoin, ethereum,
+                                                       xpubIsEthereum ? chain::ScriptType::P2PKH : xpubType, out, why);
+}
+
 } // namespace
 
-ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent)
+ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent, bool many)
     : QDialog(parent)
     , controller_(controller)
 {
@@ -214,14 +243,14 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     identity->setSpacing(tokens::layout::kFormHSpacing);
     auto* nameBlock = new QVBoxLayout;
     nameBlock->setSpacing(tokens::layout::kFormVSpacing);
-    auto* nameLabel = new QLabel(QStringLiteral("Wallet name"), this);
-    nameLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    nameLabel_ = new QLabel(QStringLiteral("Wallet name"), this);
+    nameLabel_->setObjectName(QStringLiteral("formSectionLabel"));
     name_ = new QLineEdit(this);
     name_->setObjectName(QStringLiteral("walletName"));
     name_->setMaxLength(wallet::WalletStore::kMaxLabelChars);
     name_->setPlaceholderText(QStringLiteral("For example: Online shop"));
-    nameLabel->setBuddy(name_);
-    nameBlock->addWidget(nameLabel);
+    nameLabel_->setBuddy(name_);
+    nameBlock->addWidget(nameLabel_);
     nameBlock->addWidget(name_);
     identity->addLayout(nameBlock, 1);
     auto* sourceBlock = new QVBoxLayout;
@@ -230,7 +259,8 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     sourceLabel->setObjectName(QStringLiteral("formSectionLabel"));
     source_ = new QComboBox(this);
     source_->setObjectName(QStringLiteral("walletSource"));
-    source_->addItems({QStringLiteral("Seed words"), QStringLiteral("Public keys (watch only)")});
+    source_->addItems({QStringLiteral("One seed"), QStringLiteral("Many seeds"),
+                       QStringLiteral("Public keys (watch only)"), QStringLiteral("Many public keys (watch only)")});
     sourceLabel->setBuddy(source_);
     sourceBlock->addWidget(sourceLabel);
     sourceBlock->addWidget(source_);
@@ -287,8 +317,32 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     passphrase_->setVisible(false);
     passphraseBlock->addWidget(hasPassphrase_);
     passphraseBlock->addWidget(passphrase_);
-    wordsColumn->addLayout(passphraseBlock);
     pages_->addWidget(wordsPage);
+
+    // A list of seeds, secret like the words.
+    auto* seedListPage = new QWidget(pages_);
+    auto* seedListColumn = new QVBoxLayout(seedListPage);
+    seedListColumn->setContentsMargins(0, 0, 0, 0);
+    seedListColumn->setSpacing(tokens::layout::kFormVSpacing);
+    auto* seedListLabel = new QLabel(QStringLiteral("Seeds, one per line"), seedListPage);
+    seedListLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    seedList_ = new QPlainTextEdit(seedListPage);
+    seedList_->setObjectName(QStringLiteral("seedList"));
+    seedList_->setTabChangesFocus(true);
+    seedList_->setUndoRedoEnabled(false);
+    seedList_->setLineWrapMode(QPlainTextEdit::NoWrap);
+    seedList_->setInputMethodHints(seedList_->inputMethodHints() | kSecretInputHints);
+    seedList_->setPlaceholderText(QStringLiteral("Shop 1: word word word ...\nShop 2: word word word ...\n"
+                                                 "word word word ...   (a name is optional)"));
+    seedList_->setAccessibleName(QStringLiteral("Seeds, one per line"));
+    seedListLabel->setBuddy(seedList_);
+    auto* loadSeeds = new QPushButton(QStringLiteral("Load from file"), seedListPage);
+    loadSeeds->setToolTip(QStringLiteral("A text or CSV file with one seed per line. GitWallet only reads it: "
+                                         "it stays where it is, so delete it yourself if you no longer need it."));
+    seedListColumn->addWidget(seedListLabel);
+    seedListColumn->addWidget(seedList_, 1);
+    seedListColumn->addWidget(loadSeeds, 0, Qt::AlignLeft);
+    pages_->addWidget(seedListPage);
 
     // Or public keys alone. Not secret themselves, but seed words pasted here by
     // mistake are, so these fields keep no undo history either.
@@ -337,7 +391,48 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     keysColumn->addWidget(ethLabel);
     keysColumn->addWidget(ethKey_);
     pages_->addWidget(keysPage);
+
+    // A list of public keys, one wallet per line.
+    auto* keyListPage = new QWidget(pages_);
+    auto* keyListColumn = new QVBoxLayout(keyListPage);
+    keyListColumn->setContentsMargins(0, 0, 0, 0);
+    keyListColumn->setSpacing(tokens::layout::kFormVSpacing);
+    auto* keyListLabel = new QLabel(QStringLiteral("Public keys, one wallet per line"), keyListPage);
+    keyListLabel->setObjectName(QStringLiteral("formSectionLabel"));
+    keyList_ = new QPlainTextEdit(keyListPage);
+    keyList_->setObjectName(QStringLiteral("keyList"));
+    keyList_->setTabChangesFocus(true);
+    keyList_->setUndoRedoEnabled(false);
+    keyList_->setLineWrapMode(QPlainTextEdit::NoWrap);
+    keyList_->setInputMethodHints(keyList_->inputMethodHints() | kSecretInputHints);
+    keyList_->setPlaceholderText(QStringLiteral("Shop 1: zpub...\nShop 2: zpub... xpub...\n"
+                                                "zpub...   (a name is optional)"));
+    keyListLabel->setBuddy(keyList_);
+    listKindRow_ = new QWidget(keyListPage);
+    auto* listKindLayout = new QHBoxLayout(listKindRow_);
+    listKindLayout->setContentsMargins(0, 0, 0, 0);
+    listKindLayout->setSpacing(tokens::layout::kFormHSpacing);
+    listKindLayout->addWidget(new QLabel(QStringLiteral("An xpub here is"), listKindRow_));
+    listKind_ = new QComboBox(listKindRow_);
+    listKind_->setObjectName(QStringLiteral("listKind"));
+    listKind_->addItem(QStringLiteral("Native SegWit (m/84'/0'/…)"), int(chain::ScriptType::P2WPKH));
+    listKind_->addItem(QStringLiteral("Nested SegWit (m/49'/0'/…)"), int(chain::ScriptType::P2SH_P2WPKH));
+    listKind_->addItem(QStringLiteral("Legacy (m/44'/0'/…)"), int(chain::ScriptType::P2PKH));
+    listKind_->addItem(QStringLiteral("Ethereum (m/44'/60'/…)"), int(chain::ScriptType::EthAccount));
+    listKind_->setPlaceholderText(QStringLiteral("Choose"));
+    listKind_->setCurrentIndex(-1);
+    listKindLayout->addWidget(listKind_);
+    listKindLayout->addStretch(1);
+    listKindRow_->setVisible(false);
+    auto* loadKeys = new QPushButton(QStringLiteral("Load from file"), keyListPage);
+    keyListColumn->addWidget(keyListLabel);
+    keyListColumn->addWidget(keyList_, 1);
+    keyListColumn->addWidget(listKindRow_);
+    keyListColumn->addWidget(loadKeys, 0, Qt::AlignLeft);
+    pages_->addWidget(keyListPage);
+
     root->addWidget(pages_, 1);
+    root->addLayout(passphraseBlock); // for the one seed or the whole list
     root->addWidget(status_);
 
     info_ = new QLabel(this);
@@ -349,12 +444,12 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     auto* buttons = new QHBoxLayout;
     buttons->setSpacing(tokens::layout::kToolbarSpacing);
     buttons->addStretch(1);
-    auto* cancel = new QPushButton(QStringLiteral("Cancel"), this);
+    cancel_ = new QPushButton(QStringLiteral("Cancel"), this);
     import_ = new QPushButton(QStringLiteral("Add wallet"), this);
     import_->setObjectName(QStringLiteral("primaryButton"));
     import_->setDefault(true);
     import_->setEnabled(false);
-    buttons->addWidget(cancel);
+    buttons->addWidget(cancel_);
     buttons->addWidget(import_);
     root->addLayout(buttons);
 
@@ -363,12 +458,17 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     connect(keys_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateKeys);
     connect(ethKey_, &QLineEdit::textChanged, this, &ImportSeedDialog::validateKeys);
     connect(xpubKind_, &QComboBox::currentIndexChanged, this, &ImportSeedDialog::validateKeys);
+    connect(seedList_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateSeedList);
+    connect(keyList_, &QPlainTextEdit::textChanged, this, &ImportSeedDialog::validateKeyList);
+    connect(listKind_, &QComboBox::currentIndexChanged, this, &ImportSeedDialog::validateKeyList);
+    connect(loadSeeds, &QPushButton::clicked, this, &ImportSeedDialog::chooseListFile);
+    connect(loadKeys, &QPushButton::clicked, this, &ImportSeedDialog::chooseListFile);
     connect(name_, &QLineEdit::textChanged, this, [this](const QString& text) {
-        if (!looksLikeSeedWords(text))
+        if (!wallet::looksLikeSeedWords(text))
             return;
         setStatus(status_,
                   trText(QStringLiteral("That looks like seed words, so it was not kept as a name. "
-                                        "Paste them in the Seed words field.")),
+                                        "Paste them in the field for seeds.")),
                   Tone::Error);
         // Queued: not from inside the field's own signal.
         QMetaObject::invokeMethod(this, [this] { wipeLineEdit(name_); }, Qt::QueuedConnection);
@@ -384,54 +484,176 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
         updateImportEnabled();
     });
     connect(passphrase_, &QLineEdit::textChanged, this, &ImportSeedDialog::updateImportEnabled);
-    connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
+    connect(cancel_, &QPushButton::clicked, this, &QDialog::reject);
     connect(import_, &QPushButton::clicked, this, &ImportSeedDialog::importSeed);
 
+    source_->setCurrentIndex(many ? ManySeeds : OneSeed);
     sourceChanged();
     // A phrase pasted straight away lands where it belongs.
-    words_->setFocus();
+    (many ? seedList_ : words_)->setFocus();
     page::fitDialog(this, page::DialogSize::Form);
 }
 
 ImportSeedDialog::~ImportSeedDialog()
 {
     // Closing goes through done(); this covers a dialog destroyed while open.
+    stopList();
     wipeFields();
 }
 
 void ImportSeedDialog::done(int result)
 {
+    stopList();
     wipeFields();
     // Shown again, the dialog starts blank: no stale status, no passphrase.
     hasPassphrase_->setChecked(false);
     xpubKind_->setCurrentIndex(-1);
-    source_->setCurrentIndex(0);
+    listKind_->setCurrentIndex(-1);
+    source_->setCurrentIndex(OneSeed);
     setStatus(status_, QString(), Tone::Muted);
     updateImportEnabled();
     QDialog::done(result);
 }
 
-bool ImportSeedDialog::wordsMode() const
+int ImportSeedDialog::source() const
 {
-    return pages_->currentIndex() == 0;
+    return pages_->currentIndex();
 }
 
 void ImportSeedDialog::sourceChanged()
 {
-    pages_->setCurrentIndex(source_->currentIndex());
-    info_->setText(wordsMode()
-                       ? trText(QStringLiteral("GitWallet derives the public keys of your accounts from the "
-                                               "seed and keeps only those, encrypted for your Windows user. "
-                                               "The seed itself is never saved."))
-                       : trText(QStringLiteral("Public keys show addresses and balances but can never spend. "
-                                               "A wallet added this way needs no seed on this PC.")));
-    if (wordsMode()) {
-        validateWords();
-        words_->setFocus();
-    } else {
+    const int chosen = source_->currentIndex();
+    pages_->setCurrentIndex(chosen);
+    const bool seeds = chosen == OneSeed || chosen == ManySeeds;
+    const bool many = chosen == ManySeeds || chosen == ManyKeys;
+    hasPassphrase_->setVisible(seeds);
+    passphrase_->setVisible(seeds && hasPassphrase_->isChecked());
+    nameLabel_->setText(many ? trText(QStringLiteral("Name for lines without one")) : trText(QStringLiteral("Wallet name")));
+    name_->setPlaceholderText(many ? trText(QStringLiteral("For example: Shop, which gives Shop 1, Shop 2"))
+                                   : trText(QStringLiteral("For example: Online shop")));
+    import_->setText(many ? trText(QStringLiteral("Add wallets")) : trText(QStringLiteral("Add wallet")));
+    info_->setText(seeds ? trText(QStringLiteral("GitWallet derives the public keys of your accounts from each "
+                                                 "seed and keeps only those, encrypted for your Windows user. "
+                                                 "A seed itself is never saved."))
+                         : trText(QStringLiteral("Public keys show addresses and balances but can never spend. "
+                                                 "A wallet added this way needs no seed on this PC.")));
+    switch (chosen) {
+    case ManySeeds:
+        validateSeedList();
+        seedList_->setFocus();
+        break;
+    case OneKeys:
         validateKeys();
         keys_->setFocus();
+        break;
+    case ManyKeys:
+        validateKeyList();
+        keyList_->setFocus();
+        break;
+    default:
+        validateWords();
+        words_->setFocus();
+        break;
     }
+}
+
+void ImportSeedDialog::validateSeedList()
+{
+    if (running_ || source() != ManySeeds)
+        return;
+    listReady_ = 0;
+    QString message;
+    Tone tone = Tone::Muted;
+    try {
+        std::string text;
+        takePhrase(seedList_, text, true);
+        const std::vector<wallet::SeedLine> lines = wallet::parseSeedLines(text);
+        chain::secureClear(text);
+        QStringList problems;
+        for (const wallet::SeedLine& line : lines) {
+            if (line.problem.isEmpty())
+                ++listReady_;
+            else
+                problems << trText(QStringLiteral("Line %1: %2")).arg(line.number).arg(line.problem);
+        }
+        message = listSummary(listReady_, trText(QStringLiteral("1 seed ready")), trText(QStringLiteral("%1 seeds ready")),
+                              problems);
+        tone = !problems.isEmpty() ? (listReady_ > 0 ? Tone::Warning : Tone::Error)
+                                   : (listReady_ > 0 ? Tone::Success : Tone::Muted);
+        // What a seed asks of the one connection, at the gaps set now: each of its
+        // three Bitcoin account types watches both of its chains.
+        if (controller_ && listReady_ > 0) {
+            const wallet::ScanSettings& s = controller_->store().settings;
+            const qint64 perSeed = 3 * (qint64(s.btcReceiveGap) + s.btcChangeGap);
+            const qint64 needed = (controller_->store().wallets.size() + listReady_) * perSeed;
+            if (needed > wallet::BtcScanner::kMaxFollowedRows) {
+                message += QLatin1Char('\n')
+                           + trText(QStringLiteral("At these gaps the wallets need about %1 Bitcoin addresses, more than "
+                                                   "the %2 one connection follows. Lower the gaps in Settings, or some "
+                                                   "wallets will read as not fully scanned."))
+                                 .arg(needed)
+                                 .arg(wallet::BtcScanner::kMaxFollowedRows);
+                tone = Tone::Warning;
+            }
+        }
+    } catch (const std::exception&) {
+        listReady_ = 0;
+        message = trText(QStringLiteral("Could not check the list"));
+        tone = Tone::Error;
+    }
+    setStatus(status_, message, tone);
+    updateImportEnabled();
+}
+
+void ImportSeedDialog::validateKeyList()
+{
+    if (running_ || source() != ManyKeys)
+        return;
+    listReady_ = 0;
+    const QString text = keyList_->toPlainText();
+
+    const QStringList raw = text.split(QLatin1Char('\n'));
+    if (std::any_of(raw.cbegin(), raw.cend(), [](const QString& line) { return wallet::looksLikeSeedWords(line); })) {
+        setStatus(status_,
+                  trText(QStringLiteral("Those look like seed words, not public keys, so they were removed. "
+                                        "Choose Many seeds to add seeds.")),
+                  Tone::Error);
+        updateImportEnabled();
+        // Queued: not from inside the field's own signal.
+        QMetaObject::invokeMethod(this, [this] { wipeTextEdit(keyList_); }, Qt::QueuedConnection);
+        return;
+    }
+
+    const QList<wallet::KeyLine> lines = wallet::parseKeyLines(text);
+    const bool anyXpub = std::any_of(lines.cbegin(), lines.cend(), [](const wallet::KeyLine& line) {
+        return std::any_of(line.keys.cbegin(), line.keys.cend(),
+                           [](const QString& key) { return key.startsWith(QLatin1String("xpub")); });
+    });
+    listKindRow_->setVisible(anyXpub);
+    if (anyXpub && listKind_->currentIndex() < 0) {
+        setStatus(status_, trText(QStringLiteral("Choose what an xpub here is: its prefix does not say.")), Tone::Muted);
+        updateImportEnabled();
+        return;
+    }
+    const auto xpubType = anyXpub ? static_cast<chain::ScriptType>(listKind_->currentData().toInt())
+                                  : chain::ScriptType::P2PKH;
+    QStringList problems;
+    for (const wallet::KeyLine& line : lines) {
+        QString why = line.problem;
+        QList<wallet::AccountKey> accounts;
+        if (why.isEmpty())
+            accountsOfLine(line, xpubType, &accounts, &why);
+        if (why.isEmpty())
+            ++listReady_;
+        else
+            problems << trText(QStringLiteral("Line %1: %2")).arg(line.number).arg(why);
+    }
+    const QString message = listSummary(listReady_, trText(QStringLiteral("1 wallet ready")),
+                                        trText(QStringLiteral("%1 wallets ready")), problems);
+    setStatus(status_, message,
+              !problems.isEmpty() ? (listReady_ > 0 ? Tone::Warning : Tone::Error)
+                                  : (listReady_ > 0 ? Tone::Success : Tone::Muted));
+    updateImportEnabled();
 }
 
 void ImportSeedDialog::validateKeys()
@@ -439,10 +661,10 @@ void ImportSeedDialog::validateKeys()
     wordsValid_ = false; // this source does not use them
     parsedKeys_.clear();
 
-    if (looksLikeSeedWords(keys_->toPlainText()) || looksLikeSeedWords(ethKey_->text())) {
+    if (wallet::looksLikeSeedWords(keys_->toPlainText()) || wallet::looksLikeSeedWords(ethKey_->text())) {
         setStatus(status_,
                   trText(QStringLiteral("Those look like seed words, not public keys, so they were removed. "
-                                        "Choose Seed words to add a seed.")),
+                                        "Choose One seed to add a seed.")),
                   Tone::Error);
         updateImportEnabled();
         // Queued: not from inside the fields' own signals.
@@ -504,11 +726,14 @@ void ImportSeedDialog::wipeFields()
     wipeLineEdit(name_);
     wipeTextEdit(keys_);
     wipeLineEdit(ethKey_);
+    wipeTextEdit(seedList_);
+    wipeTextEdit(keyList_);
     // The live check and the import hold their std::string copies in a
     // SeedCopy that scrubs itself before the slot returns, so the editors are
     // the only place left where the words live.
     wordsValid_ = false;
     parsedKeys_.clear();
+    listReady_ = 0;
 }
 
 void ImportSeedDialog::validateWords()
@@ -567,27 +792,43 @@ void ImportSeedDialog::validateWords()
 
 void ImportSeedDialog::updateImportEnabled()
 {
-    if (!wordsMode()) {
-        import_->setEnabled(controller_ != nullptr && !parsedKeys_.isEmpty());
-        return;
-    }
     // A ticked box with an empty field is unfinished input, not "no passphrase".
     const bool passphraseReady = !hasPassphrase_->isChecked() || !passphrase_->text().isEmpty();
-    import_->setEnabled(controller_ != nullptr && wordsValid_ && passphraseReady);
+    bool ready = false;
+    switch (source()) {
+    case ManySeeds: ready = listReady_ > 0 && passphraseReady; break;
+    case OneKeys: ready = !parsedKeys_.isEmpty(); break;
+    case ManyKeys: ready = listReady_ > 0; break;
+    default: ready = wordsValid_ && passphraseReady; break;
+    }
+    import_->setEnabled(controller_ != nullptr && !running_ && ready);
 }
 
 void ImportSeedDialog::importSeed()
 {
-    if (!controller_)
+    if (!controller_ || running_)
         return;
-    if (!wordsMode()) {
-        QString error;
-        if (controller_->addKeysWallet(parsedKeys_, name_->text(), &error))
-            accept();
-        else
-            setStatus(status_, error.isEmpty() ? trText(QStringLiteral("Could not add the keys")) : error, Tone::Error);
-        return;
+    switch (source()) {
+    case ManySeeds: startSeedList(); break;
+    case OneKeys: addOneKeys(); break;
+    case ManyKeys: addKeyList(); break;
+    default: addOneSeed(); break;
     }
+}
+
+void ImportSeedDialog::addOneKeys()
+{
+    QString error;
+    if (controller_->addKeysWallet(parsedKeys_, name_->text(), &error)) {
+        result_ = trText(QStringLiteral("Wallet added"));
+        accept();
+    } else {
+        setStatus(status_, error.isEmpty() ? trText(QStringLiteral("Could not add the keys")) : error, Tone::Error);
+    }
+}
+
+void ImportSeedDialog::addOneSeed()
+{
     if (!wordsValid_)
         return;
 
@@ -616,7 +857,218 @@ void ImportSeedDialog::importSeed()
                   Tone::Error);
         return;
     }
+    result_ = trText(QStringLiteral("Wallet added"));
     accept();
+}
+
+// ------------------------------------------------------------------ lists ----
+
+QString ImportSeedDialog::labelFor(const QString& name)
+{
+    if (!name.isEmpty())
+        return name;
+    const QString base = name_->text().trimmed();
+    return base.isEmpty() ? QString() : QStringLiteral("%1 %2").arg(base).arg(++unnamed_);
+}
+
+void ImportSeedDialog::setBusy(bool busy)
+{
+    running_ = busy;
+    pages_->setEnabled(!busy);
+    source_->setEnabled(!busy);
+    name_->setEnabled(!busy);
+    hasPassphrase_->setEnabled(!busy);
+    passphrase_->setEnabled(!busy);
+    updateImportEnabled();
+}
+
+void ImportSeedDialog::stopList()
+{
+    running_ = false;
+    pending_.clear(); // each line scrubs its words
+    chain::secureClear(listPassphrase_);
+}
+
+void ImportSeedDialog::startSeedList()
+{
+    listRequests_.clear();
+    listToFix_.clear();
+    pendingNext_ = 0;
+    pendingDone_ = 0;
+    pendingTotal_ = 0;
+    try {
+        std::string text;
+        takePhrase(seedList_, text, true); // read exactly as the live check read it
+        pending_ = wallet::parseSeedLines(text);
+        chain::secureClear(text);
+        if (hasPassphrase_->isChecked()) {
+            // BIP39 salts with the NFKD form of the passphrase.
+            QString passphrase = passphrase_->text().normalized(QString::NormalizationForm_KD);
+            takeUtf8(passphrase, listPassphrase_);
+        }
+    } catch (const std::exception&) {
+        stopList();
+        setStatus(status_, trText(QStringLiteral("Could not read the list")), Tone::Error);
+        return;
+    }
+    for (const wallet::SeedLine& line : pending_) {
+        if (line.problem.isEmpty())
+            ++pendingTotal_;
+        else
+            listToFix_.insert(line.number, line.problem);
+    }
+    setBusy(true);
+    QMetaObject::invokeMethod(this, &ImportSeedDialog::seedListStep, Qt::QueuedConnection);
+}
+
+void ImportSeedDialog::seedListStep()
+{
+    if (!running_)
+        return; // closed meanwhile
+    while (pendingNext_ < pending_.size() && !pending_[pendingNext_].problem.isEmpty())
+        ++pendingNext_;
+    if (pendingNext_ >= pending_.size()) {
+        const QMap<int, QString> toFix = listToFix_;
+        stopList();
+        finishList(seedList_, toFix);
+        return;
+    }
+    wallet::SeedLine& line = pending_[pendingNext_++];
+    try {
+        wallet::WalletRequest request;
+        request.accounts = wallet::WalletStore::deriveAccounts(line.words, listPassphrase_);
+        request.label = labelFor(line.name);
+        request.line = line.number;
+        listRequests_.append(request);
+    } catch (const std::exception&) {
+        listToFix_.insert(line.number, trText(QStringLiteral("its keys could not be derived")));
+    }
+    line.wipe();
+    ++pendingDone_;
+    setStatus(status_, trText(QStringLiteral("Working out the public keys: %1 of %2")).arg(pendingDone_).arg(pendingTotal_),
+              Tone::Muted);
+    QMetaObject::invokeMethod(this, &ImportSeedDialog::seedListStep, Qt::QueuedConnection);
+}
+
+void ImportSeedDialog::addKeyList()
+{
+    listRequests_.clear();
+    QMap<int, QString> toFix;
+    const auto xpubType = listKindRow_->isVisibleTo(this) && listKind_->currentIndex() >= 0
+                              ? static_cast<chain::ScriptType>(listKind_->currentData().toInt())
+                              : chain::ScriptType::P2PKH;
+    const QList<wallet::KeyLine> lines = wallet::parseKeyLines(keyList_->toPlainText());
+    for (const wallet::KeyLine& line : lines) {
+        QString why = line.problem;
+        wallet::WalletRequest request;
+        if (why.isEmpty())
+            accountsOfLine(line, xpubType, &request.accounts, &why);
+        if (!why.isEmpty()) {
+            toFix.insert(line.number, why);
+            continue;
+        }
+        request.label = labelFor(line.name);
+        request.fromKeys = true;
+        request.line = line.number;
+        listRequests_.append(request);
+    }
+    finishList(keyList_, toFix);
+}
+
+void ImportSeedDialog::finishList(QPlainTextEdit* field, const QMap<int, QString>& toFix)
+{
+    QString error;
+    const int added = controller_->addWallets(&listRequests_, &error);
+    setBusy(false);
+    if (!error.isEmpty()) {
+        // Nothing went in: the list stays as it is for another try.
+        setStatus(status_, error, Tone::Error);
+        listRequests_.clear();
+        return;
+    }
+
+    // What went in leaves the list; what did not stays, each line with why.
+    QMap<int, QString> stays = toFix;
+    for (const wallet::WalletRequest& request : std::as_const(listRequests_)) {
+        if (!request.refused.isEmpty())
+            stays.insert(request.line, request.refused);
+    }
+    listRequests_.clear();
+    addedTotal_ += added;
+    if (addedTotal_ > 0) {
+        result_ = addedTotal_ == 1 ? trText(QStringLiteral("1 wallet added"))
+                                   : trText(QStringLiteral("%1 wallets added")).arg(addedTotal_);
+        cancel_->setText(trText(QStringLiteral("Close"))); // leaving now takes nothing back
+    }
+    if (stays.isEmpty()) {
+        accept();
+        return;
+    }
+
+    // Renumbered as the field now stands.
+    QString text = field->toPlainText();
+    QStringList lines = text.split(QLatin1Char('\n'));
+    QStringList kept;
+    QStringList notes;
+    for (auto it = stays.cbegin(); it != stays.cend(); ++it) {
+        if (it.key() < 1 || it.key() > lines.size())
+            continue;
+        kept << lines.at(it.key() - 1);
+        QString why = it.value();
+        if (why.endsWith(QLatin1Char('.')))
+            why.chop(1);
+        notes << trText(QStringLiteral("Line %1: %2")).arg(kept.size()).arg(why);
+    }
+    QString left = kept.join(QLatin1Char('\n'));
+    wipeTextEdit(field);
+    {
+        const QSignalBlocker quiet(field);
+        field->setPlainText(left);
+    }
+    // All of them can hold seed words. A line shared by both lists detaches from the
+    // first fill, so the second is what zeroes its buffer.
+    text.fill(QChar(u'\0'));
+    left.fill(QChar(u'\0'));
+    for (QString& line : lines)
+        line.fill(QChar(u'\0'));
+    for (QString& line : kept)
+        line.fill(QChar(u'\0'));
+    listReady_ = 0;
+    updateImportEnabled();
+    const QString fix = listSummary(0, QString(), QString(), notes);
+    setStatus(status_, result_.isEmpty() ? fix : result_ + QLatin1Char('\n') + fix,
+              addedTotal_ > 0 ? Tone::Warning : Tone::Error);
+}
+
+void ImportSeedDialog::chooseListFile()
+{
+    const QString path = QFileDialog::getOpenFileName(this, trText(QStringLiteral("Load a list")), QString(),
+                                                      trText(QStringLiteral("Text or CSV (*.txt *.csv);;All files (*)")));
+    if (!path.isEmpty())
+        loadListFile(path);
+}
+
+bool ImportSeedDialog::loadListFile(const QString& path)
+{
+    QPlainTextEdit* field = source() == ManyKeys ? keyList_ : seedList_;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        setStatus(status_, trText(QStringLiteral("Could not open the file: %1")).arg(file.errorString()), Tone::Error);
+        return false;
+    }
+    if (file.size() > kMaxListFileBytes) {
+        setStatus(status_, trText(QStringLiteral("That file is too large to be a list.")), Tone::Error);
+        return false;
+    }
+    QByteArray bytes = file.readAll();
+    QString text = QString::fromUtf8(bytes);
+    bytes.fill('\0');
+    text.remove(QChar(u'\r'));
+    if (text.startsWith(QChar(0xFEFF)))
+        text.remove(0, 1);
+    field->setPlainText(text); // the field's own check says what it found
+    text.fill(QChar(u'\0'));
+    return true;
 }
 
 } // namespace app::ui

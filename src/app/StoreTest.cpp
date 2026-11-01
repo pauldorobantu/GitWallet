@@ -4,6 +4,7 @@
 #include "chain/Bip32.h"
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
+#include "wallet/BulkImport.h"
 #include "wallet/Types.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
@@ -225,6 +226,69 @@ StoreTestResult runStoreTest()
               QStringLiteral("and it is the digest of the file"));
         QFile::remove(wallet::WalletStore::filePath());
 
+        // Lists: one wallet per line, whatever the form it comes in.
+        const std::string list =
+            std::string("# a comment, and a blank line after it\n\n")
+            + "Store A: " + kSecondMnemonic + "\n"                    // 3: a name
+            + kThirdMnemonic + "\n"                                   // 4: no name
+            + "12. " + kThirdMnemonic + "\n"                          // 5: a numbered list
+            + "\"Store B\",\"" + kSecondMnemonic + "\"\n"             // 6: CSV
+            + "Store C\t" + kSecondMnemonic + "\n"                    // 7: a tab
+            + "legal,winner,thank,year,wave,sausage,worth,useful,legal,winner,thank,yellow\n" // 8: commas between words
+            + "Store D: legal winner thank year wave sausage worth useful legal winner thank\n" // 9: a word short
+            + "Store E: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon\n" // 10: checksum
+            + "Store F: legal winner thank notaword wave sausage worth useful legal winner thank yellow\n" // 11: a typo
+            + "Shop 1 Shop 2 Shop 3\n"                                // 12: no phrase at all
+            + "Store G: " + kSecondMnemonic;                          // 13: no line break at the end
+        const std::vector<wallet::SeedLine> lines = wallet::parseSeedLines(list);
+        const auto lineAt = [&lines](int number) -> const wallet::SeedLine* {
+            for (const wallet::SeedLine& line : lines) {
+                if (line.number == number) return &line;
+            }
+            return nullptr;
+        };
+        const auto good = [&lineAt](int number, const QString& name) {
+            const wallet::SeedLine* line = lineAt(number);
+            return line && line->problem.isEmpty() && line->name == name && line->words.size() == 12;
+        };
+        const auto bad = [&lineAt](int number, const QString& says) {
+            const wallet::SeedLine* line = lineAt(number);
+            return line && line->problem.contains(says) && line->words.empty();
+        };
+        check(lines.size() == 11, QStringLiteral("a list skips blank lines and comments"));
+        check(good(3, QStringLiteral("Store A")), QStringLiteral("a line reads its name before a colon"));
+        check(good(4, QString()), QStringLiteral("a name is optional"));
+        check(good(5, QString()), QStringLiteral("a number in front of a line is not a name"));
+        check(good(6, QStringLiteral("Store B")), QStringLiteral("a CSV line reads as name and words"));
+        check(good(7, QStringLiteral("Store C")), QStringLiteral("a tab can part the name from the words"));
+        check(good(8, QString()), QStringLiteral("commas between the words are not a name"));
+        check(good(13, QStringLiteral("Store G")), QStringLiteral("the last line needs no line break"));
+        check(bad(9, QStringLiteral("11")), QStringLiteral("a short phrase says how many words it has, and keeps none"));
+        check(bad(10, QStringLiteral("checksum")), QStringLiteral("a wrong checksum is named, and keeps no words"));
+        check(bad(11, QStringLiteral("word 4")), QStringLiteral("a word not in the list is named by position"));
+        check(lineAt(11) && !lineAt(11)->problem.contains(QStringLiteral("notaword")),
+              QStringLiteral("and never quoted"));
+        check(bad(12, QStringLiteral("words")), QStringLiteral("a line without a phrase says so"));
+        check(lineAt(3) && lineAt(3)->words.front() == "legal" && lineAt(3)->words.back() == "yellow",
+              QStringLiteral("the words of a line are the phrase, in order"));
+
+        const QList<wallet::KeyLine> keyLines = wallet::parseKeyLines(
+            QStringLiteral("# comment\nPartner A: %1\n%2 %3\n3) Partner B, %1\nno key here\n")
+                .arg(first.at(0).xpub, first.at(1).xpub, first.at(2).xpub));
+        check(keyLines.size() == 4 && keyLines.at(0).name == QStringLiteral("Partner A") && keyLines.at(0).keys.size() == 1
+                  && keyLines.at(0).number == 2,
+              QStringLiteral("a line of keys reads its name and key"));
+        check(keyLines.size() == 4 && keyLines.at(1).name.isEmpty() && keyLines.at(1).keys.size() == 2,
+              QStringLiteral("several keys on a line are one wallet"));
+        check(keyLines.size() == 4 && keyLines.at(2).name == QStringLiteral("Partner B"),
+              QStringLiteral("a numbered line of keys keeps its name"));
+        check(keyLines.size() == 4 && !keyLines.at(3).problem.isEmpty(), QStringLiteral("a line without a key says so"));
+
+        check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).left(64)),
+              QStringLiteral("a phrase cut at the longest name is still seen as one"));
+        check(!wallet::looksLikeSeedWords(QStringLiteral("Online shop main account")),
+              QStringLiteral("a real name made of list words is not"));
+
         // The address model, per wallet.
         wallet::WalletModel model;
         model.upsert(rowOf(1, 0, 1000));
@@ -335,6 +399,31 @@ StoreTestResult runStoreTest()
             done(controller.removeAllWallets(&error), QStringLiteral("every wallet can be removed"));
             check(!QFile::exists(filePath) && asideFiles().isEmpty(),
                   QStringLiteral("which leaves neither wallet.dat nor the file kept aside"));
+        }
+        {
+            // A batch: one save, the good ones in, the others say why.
+            WalletController controller;
+            wallet::WalletRequest named;
+            named.accounts = first;
+            named.label = QStringLiteral("Batch A");
+            wallet::WalletRequest unnamed;
+            unnamed.accounts = second;
+            wallet::WalletRequest again;
+            again.accounts = first;
+            again.label = QStringLiteral("Batch A again");
+            QList<wallet::WalletRequest> batch{named, unnamed, again};
+            check(controller.addWallets(&batch, &error) == 2 && error.isEmpty(), QStringLiteral("a batch adds what it can"));
+            check(batch.at(0).refused.isEmpty() && batch.at(1).refused.isEmpty()
+                      && batch.at(2).refused.contains(QStringLiteral("Batch A")),
+                  QStringLiteral("and the same seed twice in it is refused, naming the first"));
+            check(controller.store().wallets.size() == 2 && controller.store().wallets.at(1).label.startsWith(QStringLiteral("Wallet ")),
+                  QStringLiteral("a wallet without a name gets a number"));
+            wallet::WalletStore saved;
+            check(saved.load(&error) && saved.wallets.size() == 2, QStringLiteral("all of it is saved"));
+            QList<wallet::WalletRequest> twice{named};
+            check(controller.addWallets(&twice, &error) == 0 && error.isEmpty() && !twice.at(0).refused.isEmpty(),
+                  QStringLiteral("a batch of what is here already adds nothing, and says why per line"));
+            done(controller.removeAllWallets(&error), QStringLiteral("the batch can be removed"));
         }
         {
             // A file changed outside this window is not this window's to delete.

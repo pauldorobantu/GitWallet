@@ -273,8 +273,10 @@ void MainWindow::buildUi()
 
     root_->addLayout(body, 1);
 
-    connect(overview_, &OverviewPage::importRequested, this, &MainWindow::openImportDialog);
-    connect(wallets_, &WalletsPage::addRequested, this, &MainWindow::openImportDialog);
+    connect(overview_, &OverviewPage::importRequested, this, [this] { openImportDialog(false); });
+    connect(overview_, &OverviewPage::importManyRequested, this, [this] { openImportDialog(true); });
+    connect(wallets_, &WalletsPage::addRequested, this, [this] { openImportDialog(false); });
+    connect(wallets_, &WalletsPage::addManyRequested, this, [this] { openImportDialog(true); });
     connect(wallets_, &WalletsPage::showAddressesRequested, this, [this](quint32 wallet) {
         addresses_->showWallet(wallet);
         openPage(PageAddresses);
@@ -362,10 +364,16 @@ void MainWindow::openPage(int pageId)
     stack_->setCurrentIndex(pageId);
 }
 
-void MainWindow::openImportDialog()
+void MainWindow::openImportDialog(bool many)
 {
-    ImportSeedDialog dialog(controller_, this);
+    ImportSeedDialog dialog(controller_, this, many);
     dialog.exec();
+    // What was just added is on the page that lists the wallets.
+    const QString result = dialog.resultText();
+    if (result.isEmpty())
+        return;
+    openPage(PageWallets);
+    Feedback::show(this, Feedback::Type::Success, result);
 }
 
 void MainWindow::loadWallet()

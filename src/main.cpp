@@ -27,6 +27,9 @@
 #include <QTimer>
 
 #include <cstdio>
+#include <exception>
+#include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -182,6 +185,27 @@ const char* kPublicTestMnemonic =
     "abandon abandon abandon abandon abandon abandon "
     "abandon abandon abandon abandon abandon about";
 
+// Published BIP39 test vectors, for a demonstration with real addresses and real
+// network answers on a throw-away --data-dir. Anyone can spend from these: never send
+// anything to them.
+const char* const kDemoMnemonics[] = {
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+    "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic",
+    "scheme spot photo card baby mountain device kick cradle pact join borrow",
+    "cat swing flag economy stadium alone churn speed unique patch report train",
+    "vessel ladder alter error federal sibling chat ability sun glass valve picture",
+    "gravity machine north sort system female filter attitude volume fold club stay feature office ecology stable "
+    "narrow fog",
+    "horn tenant knee talent sponsor spell gate clip pulse soap slush warm silver nephew swap uncle crack brave",
+    "hamster diagram private dutch cause delay private meat slide toddler razor book happy fancy gospel tennis maple "
+    "dilemma loan word shrug inflict delay length",
+    "panda eyebrow bullet gorilla call smoke muffin taste mesh discover soft ostrich alcohol speed nation flash devote "
+    "level hobby quick inner drive ghost inside",
+};
+
 // --scan-report: every row and the totals as JSON, for comparing the scan with
 // block explorers and other wallets.
 bool writeScanReport(const QString& path, app::WalletController* c, bool timedOut)
@@ -281,7 +305,7 @@ int main(int argc, char** argv)
     // folder WalletStore actually resolved is the real wallet's after all.
     for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
                                 QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
-                                QStringLiteral("--store-test")}) {
+                                QStringLiteral("--store-test"), QStringLiteral("--demo-wallets")}) {
         if (!args.contains(name)) continue;
         if (dataDir.isEmpty() || sameFolder(wallet::WalletStore::dataDir(), realDataDir())) {
             attachParentConsole();
@@ -347,7 +371,8 @@ int main(int argc, char** argv)
     // One window per wallet folder: a second start brings the open one to the
     // front instead (WalletController's lock already keeps a second window from
     // writing). Test runs and --page open their own window on a throw-away
-    // folder, often beside a normal one, so they skip this.
+    // folder, often beside a normal one, so they skip this. --demo-wallets does not:
+    // its shortcut, started twice, should raise the demo it already opened.
     bool singleWindow = true;
     for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
                                 QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
@@ -376,6 +401,35 @@ int main(int argc, char** argv)
             if (!controller->addMnemonicWallet(chain::bip39::split(kPublicTestMnemonic), {},
                                                QStringLiteral("Test"), &error))
                 qWarning().noquote() << "[test] import failed:" << error;
+        });
+    }
+
+    // --demo-wallets: the published test seeds as wallets, on a throw-away --data-dir
+    // (checked above), so the app can be seen working on real data without a real seed.
+    if (args.contains(QStringLiteral("--demo-wallets"))) {
+        QTimer::singleShot(0, controller, [&window, controller] {
+            if (controller->hasWallet()) return;
+            QList<wallet::WalletRequest> requests;
+            try {
+                int number = 0;
+                for (const char* mnemonic : kDemoMnemonics) {
+                    wallet::WalletRequest request;
+                    const std::vector<std::string> words = chain::bip39::split(mnemonic);
+                    if (!chain::bip39::validate(words)) {
+                        qWarning().noquote() << "[demo] not a valid phrase:" << mnemonic;
+                        continue;
+                    }
+                    request.accounts = wallet::WalletStore::deriveAccounts(words, {});
+                    request.label = QStringLiteral("Demo %1").arg(++number);
+                    requests.append(request);
+                }
+            } catch (const std::exception& e) {
+                qWarning().noquote() << "[demo] could not derive the keys:" << e.what();
+            }
+            QString error;
+            if (controller->addWallets(&requests, &error) == 0)
+                qWarning().noquote() << "[demo] not added:" << error;
+            window.showPage(QStringLiteral("wallets"));
         });
     }
 

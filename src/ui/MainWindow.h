@@ -87,7 +87,7 @@ private:
     QWidget* buildNoticeBar();
     void refreshFrame();
     void openPage(int pageId); // highlights the sidebar item and shows its page
-    void openImportDialog();
+    void openImportDialog(bool many); // `many`: on the list of seeds rather than one seed
     void loadWallet();
     void refreshStatus(); // statusChanged / walletChanged
     // errorOccurred

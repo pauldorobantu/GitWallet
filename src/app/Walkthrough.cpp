@@ -45,6 +45,12 @@ const QString kSecondTestMnemonic = QStringLiteral(
     "legal winner thank year wave sausage worth useful legal winner thank yellow");
 const char* const kThirdTestMnemonic =
     "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+const QString kListMnemonicA = QStringLiteral("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+const QString kListMnemonicB =
+    QStringLiteral("ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic");
+const char* const kKeyListMnemonicA = "scheme spot photo card baby mountain device kick cradle pact join borrow";
+const char* const kKeyListMnemonicB = "cat swing flag economy stadium alone churn speed unique patch report train";
+const char* const kKeyListMnemonicC = "vessel ladder alter error federal sibling chat ability sun glass valve picture";
 
 const QString kFirstName = QStringLiteral("Online shop");
 const QString kSecondName = QStringLiteral("Warehouse");
@@ -149,12 +155,30 @@ void Walkthrough::buildSteps()
     };
     auto typeKeys = [importDialog](const QString& text) {
         if (auto* source = importDialog() ? importDialog()->findChild<QComboBox*>(QStringLiteral("walletSource")) : nullptr)
-            source->setCurrentIndex(1);
+            source->setCurrentIndex(2);
         if (auto* edit = importDialog() ? importDialog()->findChild<QPlainTextEdit*>(QStringLiteral("publicKeys")) : nullptr)
             edit->setPlainText(text);
     };
+    auto typeSeedList = [importDialog](const QString& text) {
+        if (auto* edit = importDialog() ? importDialog()->findChild<QPlainTextEdit*>(QStringLiteral("seedList")) : nullptr)
+            edit->setPlainText(text);
+    };
+    auto typeKeyList = [importDialog](const QString& text) {
+        if (auto* source = importDialog() ? importDialog()->findChild<QComboBox*>(QStringLiteral("walletSource")) : nullptr)
+            source->setCurrentIndex(3);
+        if (auto* edit = importDialog() ? importDialog()->findChild<QPlainTextEdit*>(QStringLiteral("keyList")) : nullptr)
+            edit->setPlainText(text);
+    };
+    auto listField = [importDialog](const char* name) {
+        auto* edit = importDialog() ? importDialog()->findChild<QPlainTextEdit*>(QLatin1String(name)) : nullptr;
+        return edit ? edit->toPlainText() : QString();
+    };
     auto importEnabled = [this, importDialog] {
         QWidget* b = findButton(importDialog(), QStringLiteral("Add wallet"));
+        return b && b->isEnabled();
+    };
+    auto listEnabled = [this, importDialog] {
+        QWidget* b = findButton(importDialog(), QStringLiteral("Add wallets"));
         return b && b->isEnabled();
     };
     // Asynchronous click: the dialog runs its own event loop (exec), inside
@@ -177,6 +201,10 @@ void Walkthrough::buildSteps()
     auto openAddDialog = [this, walletsPage, clickLater] {
         window_->showPage(QStringLiteral("wallets"));
         clickLater(findButton(walletsPage(), QStringLiteral("Add wallet")));
+    };
+    auto openManyDialog = [this, walletsPage, clickLater] {
+        window_->showPage(QStringLiteral("wallets"));
+        clickLater(findButton(walletsPage(), QStringLiteral("Add many")));
     };
     auto namedDialog = [this](const char* name) -> QWidget* {
         auto* d = window_ ? window_->findChild<QDialog*>(QLatin1String(name)) : nullptr;
@@ -202,6 +230,11 @@ void Walkthrough::buildSteps()
     // zpub, ypub, xpub (legacy), xpub (Ethereum) of a seed no step adds as words.
     const QList<wallet::AccountKey> thirdKeys =
         wallet::WalletStore::deriveAccounts(chain::bip39::split(kThirdTestMnemonic), {});
+    const QString listZpub = wallet::WalletStore::deriveAccounts(chain::bip39::split(kKeyListMnemonicA), {}).value(0).xpub;
+    const QString listLegacyXpub =
+        wallet::WalletStore::deriveAccounts(chain::bip39::split(kKeyListMnemonicB), {}).value(2).xpub;
+    const QString listEthereumXpub =
+        wallet::WalletStore::deriveAccounts(chain::bip39::split(kKeyListMnemonicC), {}).value(3).xpub;
 
     steps_ = {
         {QStringLiteral("empty-state"), nullptr, nullptr, 5000,
@@ -209,6 +242,8 @@ void Walkthrough::buildSteps()
              expect(!controller()->hasWallet(), QStringLiteral("first start: no wallet"));
              expect(findButton(window_, QStringLiteral("Add wallet")) != nullptr,
                     QStringLiteral("the Overview offers \"Add wallet\""));
+             expect(findButton(window_, QStringLiteral("Add many")) != nullptr,
+                    QStringLiteral("and \"Add many\" beside it"));
              const QRect room = QGuiApplication::primaryScreen()->availableGeometry();
              const QRect placed = window_->frameGeometry();
              expect(room.contains(placed), QStringLiteral("the window fits the screen (%1x%2 on %3x%4)")
@@ -702,6 +737,195 @@ void Walkthrough::buildSteps()
                     QStringLiteral("after removing one, status: ") + controller()->statusText());
          },
          nullptr},
+        // Many at once: the list opens from its own button, reads a file and a paste,
+        // takes the good lines together and leaves only what needs the user.
+        {QStringLiteral("many-dialog"), openManyDialog, [importDialog] { return importDialog() != nullptr; }, 5000,
+         [this, listEnabled] {
+             QWidget* focus = window_->findChild<ui::ImportSeedDialog*>()->focusWidget();
+             expect(focus && focus->objectName() == QStringLiteral("seedList"),
+                    QStringLiteral("Add many opens on the list of seeds, ready for a paste"));
+             expect(!listEnabled(), QStringLiteral("Add wallets is disabled while the list is empty"));
+         },
+         importDialog},
+        {QStringLiteral("many-file"),
+         [this] {
+             // As Notepad saves it: a byte-order mark, Windows line ends, public seeds only.
+             const QString path = outDir_ + QStringLiteral("/seed-list.txt");
+             QFile file(path);
+             if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                 file.write("\xEF\xBB\xBF"
+                            + QStringLiteral("# shops\r\nFrom file: %1\r\n%2\r\n")
+                                  .arg(kSecondTestMnemonic, kListMnemonicA)
+                                  .toUtf8());
+                 file.close();
+             }
+             if (auto* dialog = window_->findChild<ui::ImportSeedDialog*>())
+                 dialog->loadListFile(path);
+             QFile::remove(path);
+         },
+         nullptr, 3000,
+         [this, listEnabled, listField, importDialog] {
+             expect(visibleText(importDialog()).contains(QStringLiteral("2 seeds ready")),
+                    QStringLiteral("a list file reads as 2 seeds, whatever Notepad saved it with"));
+             expect(listEnabled(), QStringLiteral("and enables Add wallets"));
+             const QString text = listField("seedList");
+             expect(text.startsWith(QStringLiteral("# shops\n")) && !text.contains(QChar(u'\r')),
+                    QStringLiteral("the file lands in the field, without its mark and line ends"));
+         },
+         importDialog},
+        {QStringLiteral("many-typed"),
+         [typeName, typeSeedList, twelveAbandon] {
+             typeName(QStringLiteral("Shop"));
+             typeSeedList(QStringLiteral("# named, not named, numbered, wrong, here already\nBranch A: %1\n%2\n3. %3\nBroken: %4\n%5")
+                              .arg(kSecondTestMnemonic, kListMnemonicA, kListMnemonicB, twelveAbandon, kPublicTestMnemonic));
+         },
+         nullptr, 3000,
+         [this, listEnabled, importDialog] {
+             const QString shown = visibleText(importDialog());
+             expect(shown.contains(QStringLiteral("4 seeds ready")), QStringLiteral("a list says how many lines can go in"));
+             expect(shown.contains(QStringLiteral("Line 5: the checksum")),
+                    QStringLiteral("and names the wrong one by its line"));
+             expect(!shown.contains(QStringLiteral("abandon")), QStringLiteral("without quoting its words"));
+             expect(listEnabled(), QStringLiteral("one wrong line does not hold the others back"));
+         },
+         importDialog},
+        {QStringLiteral("many-added"),
+         [this, importDialog, clickLater] {
+             scanFinished_ = false; // the restart this add causes reports anew
+             clickLater(findButton(importDialog(), QStringLiteral("Add wallets")));
+         },
+         [controller] { return controller()->store().wallets.size() == 5; }, 20000,
+         [this, storeHas, controller, importDialog, listField, listEnabled, twelveAbandon] {
+             expect(storeHas(QStringLiteral("Branch A")), QStringLiteral("a line with a name goes by that name"));
+             expect(storeHas(QStringLiteral("Shop 1")) && storeHas(QStringLiteral("Shop 2")),
+                    QStringLiteral("lines without one are numbered after the field, list numbers aside"));
+             const wallet::WalletEntry last = controller()->store().wallets.last();
+             expect(!last.fromKeys && last.accounts.size() == 4, QStringLiteral("a seed in a list is a whole seed wallet"));
+             const QString shown = visibleText(importDialog());
+             expect(shown.contains(QStringLiteral("3 wallets added")), QStringLiteral("the dialog says what went in"));
+             expect(shown.contains(QStringLiteral("Line 1: the checksum")),
+                    QStringLiteral("what stays is renumbered, each line with why"));
+             expect(shown.contains(QStringLiteral("Line 2: wallet “%1” already has these keys").arg(kFirstName)),
+                    QStringLiteral("a seed already here names the wallet that has it"));
+             expect(listField("seedList") == QStringLiteral("Broken: %1\n%2").arg(twelveAbandon, kPublicTestMnemonic),
+                    QStringLiteral("only what did not go in stays in the field"));
+             expect(!listEnabled(), QStringLiteral("and Add wallets waits for a change"));
+             expect(findButton(importDialog(), QStringLiteral("Close")) != nullptr,
+                    QStringLiteral("Cancel now reads Close: what went in stays"));
+             QFile f(wallet::WalletStore::filePath());
+             const QByteArray raw = f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+             expect(!raw.isEmpty() && !raw.contains("zoo zoo") && !raw.contains("ozone"),
+                    QStringLiteral("wallet.dat holds none of the words"));
+         },
+         importDialog},
+        {QStringLiteral("many-closed"),
+         [this, importDialog, clickLater] { clickLater(findButton(importDialog(), QStringLiteral("Close"))); },
+         [importDialog] { return !importDialog(); }, 3000,
+         [this, walletsTable] {
+             expect(walletsTable() && walletsTable()->isVisible() && walletsTable()->model()->rowCount() == 5,
+                    QStringLiteral("closing it leaves the Wallets page listing all 5"));
+         },
+         nullptr},
+        {QStringLiteral("many-scanned"), nullptr,
+         [this, controller] { return scanFinished_ && controller()->balancesComplete(); }, 600000,
+         [this, controller, walletsTable] {
+             expect(controller()->balancesComplete(), QStringLiteral("a list scans like any wallet, status: ") + controller()->statusText());
+             const wallet::WalletModel* m = controller()->model();
+             for (const wallet::WalletEntry& w : controller()->store().wallets)
+                 expect(m->counts(w.id).rows > 0, QStringLiteral("“%1” has its addresses").arg(w.label));
+             expect(walletCell(walletsTable(), QStringLiteral("Shop 2"), QStringLiteral("State")).contains(QStringLiteral("Up to date")),
+                    QStringLiteral("and reads as up to date: ")
+                        + walletCell(walletsTable(), QStringLiteral("Shop 2"), QStringLiteral("State")));
+         },
+         nullptr},
+        {QStringLiteral("many-keys-dialog"), openManyDialog, [importDialog] { return importDialog() != nullptr; }, 5000,
+         nullptr, importDialog},
+        {QStringLiteral("many-keys-seed"), [typeKeyList] { typeKeyList(kSecondTestMnemonic); }, nullptr, 3000,
+         [this, listField, listEnabled, importDialog] {
+             expect(listField("keyList").isEmpty(), QStringLiteral("seed words in the list of keys are not kept"));
+             expect(visibleText(importDialog()).contains(QStringLiteral("look like seed words")),
+                    QStringLiteral("and the status says why"));
+             expect(!listEnabled(), QStringLiteral("and Add wallets stays disabled"));
+         },
+         importDialog},
+        {QStringLiteral("many-keys-type"),
+         [typeKeyList, listZpub, listLegacyXpub] {
+             typeKeyList(QStringLiteral("Partner 2: %1\nnot a key\n%2").arg(listZpub, listLegacyXpub));
+         },
+         nullptr, 3000,
+         [this, listEnabled, importDialog] {
+             expect(!listEnabled(), QStringLiteral("an xpub in a list does not say its type: Add wallets waits"));
+             expect(visibleText(importDialog()).contains(QStringLiteral("Choose what an xpub here is")),
+                    QStringLiteral("the status asks for the type"));
+         },
+         importDialog},
+        {QStringLiteral("many-keys-typed"),
+         [importDialog] {
+             if (auto* kind = importDialog() ? importDialog()->findChild<QComboBox*>(QStringLiteral("listKind")) : nullptr)
+                 kind->setCurrentIndex(2); // Legacy
+         },
+         nullptr, 3000,
+         [this, listEnabled, importDialog] {
+             const QString shown = visibleText(importDialog());
+             expect(shown.contains(QStringLiteral("2 wallets ready")) && shown.contains(QStringLiteral("Line 2:")),
+                    QStringLiteral("the type chosen: 2 wallets ready, line 2 to fix"));
+             expect(listEnabled(), QStringLiteral("and Add wallets enabled"));
+         },
+         importDialog},
+        {QStringLiteral("many-keys-added"),
+         [this, importDialog, clickLater] {
+             scanFinished_ = false; // the restart this add causes reports anew
+             clickLater(findButton(importDialog(), QStringLiteral("Add wallets")));
+         },
+         [controller] { return controller()->store().wallets.size() == 7; }, 20000,
+         [this, controller, storeHas, listField, importDialog] {
+             expect(visibleText(importDialog()).contains(QStringLiteral("2 wallets added")),
+                    QStringLiteral("the dialog says what went in"));
+             expect(storeHas(QStringLiteral("Partner 2")), QStringLiteral("a line of keys goes by its name"));
+             const wallet::WalletEntry last = controller()->store().wallets.last();
+             expect(last.fromKeys && last.accounts.size() == 1 && last.accounts.first().type == chain::ScriptType::P2PKH,
+                    QStringLiteral("watch only, and an xpub of the type chosen"));
+             expect(last.label.startsWith(QStringLiteral("Wallet ")), QStringLiteral("a line with no name gets a number"));
+             expect(listField("keyList") == QStringLiteral("not a key"), QStringLiteral("only the wrong line stays"));
+         },
+         importDialog},
+        {QStringLiteral("many-keys-eth"),
+         [typeKeyList, listEthereumXpub, importDialog] {
+             typeKeyList(QStringLiteral("Partner ETH, ") + listEthereumXpub);
+             if (auto* kind = importDialog() ? importDialog()->findChild<QComboBox*>(QStringLiteral("listKind")) : nullptr)
+                 kind->setCurrentIndex(3); // Ethereum
+         },
+         nullptr, 3000,
+         [this, listEnabled, importDialog] {
+             expect(visibleText(importDialog()).contains(QStringLiteral("1 wallet ready")),
+                    QStringLiteral("an Ethereum key on its own line: 1 wallet ready"));
+             expect(listEnabled(), QStringLiteral("and Add wallets enabled"));
+         },
+         importDialog},
+        {QStringLiteral("many-keys-all-in"),
+         [this, importDialog, clickLater] {
+             scanFinished_ = false;
+             clickLater(findButton(importDialog(), QStringLiteral("Add wallets")));
+         },
+         [controller, importDialog] { return controller()->store().wallets.size() == 8 && !importDialog(); }, 20000,
+         [this, controller] {
+             const wallet::WalletEntry last = controller()->store().wallets.last();
+             expect(last.label == QStringLiteral("Partner ETH") && last.fromKeys && last.accounts.size() == 1
+                        && last.accounts.first().type == chain::ScriptType::EthAccount,
+                    QStringLiteral("it is an Ethereum wallet, watch only"));
+             expect(true, QStringLiteral("and with nothing left in the list the dialog closes"));
+         },
+         nullptr},
+        {QStringLiteral("many-keys-scanned"), nullptr,
+         [this, controller] { return scanFinished_ && controller()->balancesComplete(); }, 600000,
+         [this, controller, storeHas] {
+             expect(controller()->balancesComplete(), QStringLiteral("the keys scan too, status: ") + controller()->statusText());
+             const wallet::WalletModel* m = controller()->model();
+             for (const wallet::WalletEntry& w : controller()->store().wallets)
+                 expect(m->counts(w.id).rows > 0, QStringLiteral("“%1” has its addresses").arg(w.label));
+             expect(storeHas(kFirstName), QStringLiteral("and the wallets from before are all still here"));
+         },
+         nullptr},
         {QStringLiteral("remove-all-confirm"),
          [this, settingsPage] {
              window_->showPage(QStringLiteral("settings"));
@@ -732,6 +956,24 @@ void Walkthrough::buildSteps()
          [this] {
              expect(findButton(window_, QStringLiteral("Add wallet")) != nullptr,
                     QStringLiteral("the Overview offers \"Add wallet\" again"));
+         },
+         nullptr},
+        {QStringLiteral("empty-many-dialog"),
+         [this, clickLater] { clickLater(findButton(window_, QStringLiteral("Add many"))); },
+         [importDialog] { return importDialog() != nullptr; }, 5000,
+         [this] {
+             QWidget* focus = window_->findChild<ui::ImportSeedDialog*>()->focusWidget();
+             expect(focus && focus->objectName() == QStringLiteral("seedList"),
+                    QStringLiteral("the empty Overview's Add many opens the list of seeds"));
+         },
+         importDialog},
+        {QStringLiteral("empty-many-cancelled"),
+         [this, importDialog, clickLater] { clickLater(findButton(importDialog(), QStringLiteral("Cancel"))); },
+         [importDialog] { return !importDialog(); }, 3000,
+         [this, controller] {
+             expect(!controller()->hasWallet(), QStringLiteral("cancelled, it adds nothing"));
+             expect(findButton(window_, QStringLiteral("Add many")) != nullptr,
+                    QStringLiteral("and the Overview stays as it was"));
          },
          nullptr},
     };
