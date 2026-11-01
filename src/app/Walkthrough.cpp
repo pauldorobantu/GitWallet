@@ -19,12 +19,14 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QScreen>
 #include <QSpinBox>
 #include <QTableView>
 #include <QTimer>
@@ -207,6 +209,15 @@ void Walkthrough::buildSteps()
              expect(!controller()->hasWallet(), QStringLiteral("first start: no wallet"));
              expect(findButton(window_, QStringLiteral("Add wallet")) != nullptr,
                     QStringLiteral("the Overview offers \"Add wallet\""));
+             const QRect room = QGuiApplication::primaryScreen()->availableGeometry();
+             const QRect placed = window_->frameGeometry();
+             expect(room.contains(placed), QStringLiteral("the window fits the screen (%1x%2 on %3x%4)")
+                                               .arg(placed.width())
+                                               .arg(placed.height())
+                                               .arg(room.width())
+                                               .arg(room.height()));
+             const QPoint off = placed.center() - room.center();
+             expect(off.manhattanLength() <= 2, QStringLiteral("and opens in its middle"));
          },
          nullptr},
         {QStringLiteral("import-dialog"),

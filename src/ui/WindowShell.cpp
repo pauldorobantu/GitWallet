@@ -3,6 +3,7 @@
 #include "ui/PageKit.h"
 
 #include <QByteArray>
+#include <QGuiApplication>
 #include <QLayout>
 #include <QScreen>
 #include <QWidget>
@@ -22,10 +23,12 @@ void initShellWindow(QWidget* window)
 {
     window->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     // Never larger than the screen: a frameless window has its Close button and
-    // the pages' action bars at its far edges.
-    const QSize room = window->screen()->availableGeometry().size();
-    window->setMinimumSize(page::kWindowMinSize.boundedTo(room));
-    window->resize(page::kWindowSize.boundedTo(room));
+    // the pages' action bars at its far edges. Centred in what the taskbar leaves.
+    const QRect room = QGuiApplication::primaryScreen()->availableGeometry();
+    const QSize size = page::kWindowSize.boundedTo(room.size());
+    window->setMinimumSize(page::kWindowMinSize.boundedTo(room.size()));
+    window->resize(size);
+    window->move(room.x() + (room.width() - size.width()) / 2, room.y() + (room.height() - size.height()) / 2);
 }
 
 ShellPlacement shellPlacement(const QWidget* window)
