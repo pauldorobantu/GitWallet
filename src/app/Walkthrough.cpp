@@ -19,6 +19,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -56,6 +57,37 @@ QString totalsText(const WalletController* c)
         parts << a.symbol + QLatin1Char('=')
                      + QString::fromStdString(c->model()->total(a.asset).format(a.decimals, a.decimals));
     return parts.join(QStringLiteral(", "));
+}
+
+// The used addresses a fresh scan finds at these gaps. Walking each chain up from
+// index 0, it stops where more unused addresses than the gap follow the last used
+// one: rows a larger gap found earlier stay in the model but not in the next scan.
+int usedWithinGaps(const WalletController* c)
+{
+    const wallet::WalletModel* m = c->model();
+    const wallet::ScanSettings& s = c->store().settings;
+    QHash<QString, QList<quint32>> chains;
+    QHash<QString, int> gaps;
+    for (int i = 0; i < m->size(); ++i) {
+        const wallet::AddressRow& r = m->at(i);
+        if (!r.used)
+            continue;
+        const QString key = QStringLiteral("%1/%2/%3/%4").arg(r.wallet).arg(int(r.type)).arg(r.account).arg(r.change);
+        chains[key].append(r.index);
+        gaps[key] = !r.isBitcoin() ? s.ethGap : r.change == 0 ? s.btcReceiveGap : s.btcChangeGap;
+    }
+    int found = 0;
+    for (auto it = chains.begin(); it != chains.end(); ++it) {
+        std::sort(it->begin(), it->end());
+        qint64 last = -1;
+        for (const quint32 index : std::as_const(*it)) {
+            if (qint64(index) > last + gaps.value(it.key()))
+                break;
+            ++found;
+            last = index;
+        }
+    }
+    return found;
 }
 
 template <typename T>
@@ -507,7 +539,9 @@ void Walkthrough::buildSteps()
          nullptr},
         {QStringLiteral("reopened"),
          [this, controller] {
-             rowsBeforeReopen_ = controller()->model()->usedCount();
+             // Before the gap came down to 100 a second seed's address at index
+             // 150 was found: the reopened window's scan rightly stops short of it.
+             rowsBeforeReopen_ = usedWithinGaps(controller());
              totalsBeforeReopen_ = totalsText(controller());
              scanFinished_ = false;
              // Close the window like the user would, then start a fresh one:
