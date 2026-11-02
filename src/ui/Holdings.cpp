@@ -86,6 +86,7 @@ public:
             emit dataChanged(index(0, 0), index(int(lines_.size()) - 1, ColumnCount - 1));
     }
     void repaintHeaders() { emit headerDataChanged(Qt::Horizontal, 0, ColumnCount - 1); }
+    QString pricesLine; // where the prices come from and how old they are, on the columns they make
     const QList<Line>& lines() const { return lines_; }
 
     int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : int(lines_.size()); }
@@ -99,6 +100,8 @@ public:
             return QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
         if (role == Qt::ToolTipRole && section == ColAddresses)
             return trText(QStringLiteral("Addresses that hold some of it"));
+        if (role == Qt::ToolTipRole && (section == ColPrice || section == ColValue))
+            return pricesLine;
         if (role != Qt::DisplayRole)
             return {};
         switch (section) {
@@ -126,7 +129,11 @@ public:
             case ColPrice: return h.price > 0.0 ? formatUsd(h.price) : dash();
             case ColAmount: return h.amountText();
             case ColValue: return h.usdText();
-            case ColShare: return line.share >= 0.0 ? QStringLiteral("%1%").arg(line.share * 100.0, 0, 'f', 1) : dash();
+            case ColShare:
+                if (line.share < 0.0)
+                    return dash();
+                // What holds something is no 0.0%.
+                return line.share > 0.0 && line.share < 0.0005 ? QStringLiteral("<0.1%") : QStringLiteral("%1%").arg(line.share * 100.0, 0, 'f', 1);
             case ColAddresses: return h.holdersText();
             case ColGo: return line.chosen ? QStringLiteral("›") : QString();
             default: return {};
@@ -308,13 +315,94 @@ Coverage coverageOf(const WalletController* controller, wallet::Network network,
 
 // ---------------------------------------------------------------- the figures ----
 
+namespace {
+
+// How current what is known of a network is. Empty: it is.
+QString networkNote(const WalletController* controller, wallet::Network network, bool complete)
+{
+    const wallet::NetworkStatus status = controller->networkStatus(network);
+    if ((status.wrongChain || status.failing || status.connecting) && status.balancesAt.isValid())
+        return trText(QStringLiteral("as of %1")).arg(status.balancesAt.toLocalTime().toString(QStringLiteral("d MMM HH:mm")));
+    if (status.wrongChain)
+        return trText(QStringLiteral("server on another chain"));
+    if (status.failing)
+        return trText(QStringLiteral("lookups failing"));
+    if (complete && status.scanning)
+        return controller->showingSaved() ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning"));
+    return QString();
+}
+
+QString incomingNote(const wallet::AssetInfo& coin, qint64 units)
+{
+    return trText(QStringLiteral("%1 not in a block yet")).arg(figures::formatAmount(chain::Amount::fromU64(quint64(units)), coin) + QLatin1Char(' ') + coin.symbol);
+}
+
+} // namespace
+
+QStringList walletNotes(const WalletController* controller, quint32 wallet)
+{
+    QStringList parts;
+    QStringList unpriced;
+    const auto add = [&parts](const QString& part) {
+        if (!part.isEmpty() && !parts.contains(part))
+            parts << part;
+    };
+    if (controller->loadingSaved())
+        add(trText(QStringLiteral("saved figures still being read")));
+    for (const wallet::AssetInfo& info : wallet::assets()) {
+        const Holding holding = holdingOf(controller, info.asset, wallet);
+        if (holding.unread)
+            add(trText(QStringLiteral("a key this version cannot read")));
+        if (!holding.watched)
+            continue;
+        if (holding.incoming > 0)
+            add(incomingNote(info, holding.incoming));
+        if (holding.missing && holding.pending == 0)
+            add(trText(QStringLiteral("not all checked yet")));
+        if (controller->addressLimitReached())
+            add(trText(QStringLiteral("address limit reached")));
+        add(networkNote(controller, info.network, holding.complete));
+        if (holding.holds()) {
+            if (holding.price <= 0.0)
+                unpriced << info.symbol;
+            else
+                add(controller->priceNote(info.asset));
+        }
+    }
+    if (!unpriced.isEmpty())
+        parts << trText(QStringLiteral("no price for %1")).arg(unpriced.join(QStringLiteral(", ")));
+    return parts;
+}
+
+QStringList addressNotes(const WalletController* controller, const wallet::AddressRow& row)
+{
+    QStringList parts;
+    const wallet::AssetInfo& coin = wallet::assetInfo(wallet::networkInfo(row.network).coin);
+    if (row.isUtxo() && row.unconfirmed > 0)
+        parts << incomingNote(coin, row.unconfirmed);
+    const QString current = networkNote(controller, row.network, row.checked);
+    if (!current.isEmpty())
+        parts << current;
+    row.forEachBalance([&](wallet::Asset asset, const chain::Amount&) {
+        const QString price = controller->priceNote(asset);
+        if (!price.isEmpty() && !parts.contains(price))
+            parts << price;
+    });
+    return parts;
+}
+
 QString holdingNote(const WalletController* controller, const Holding& holding)
 {
     const wallet::AssetInfo& info = wallet::assetInfo(holding.asset);
     const wallet::NetworkInfo& network = wallet::networkInfo(info.network);
-    if (!holding.watched)
+    if (!holding.watched) {
+        if (holding.unread)
+            return trText(QStringLiteral("a key this version cannot read"));
         return (holding.oneWallet ? trText(QStringLiteral("This wallet has no key on %1")) : trText(QStringLiteral("No wallet has a key on %1"))).arg(network.name);
+    }
     QStringList parts;
+    if (holding.incoming > 0)
+        parts << incomingNote(info, holding.incoming);
     if (controller->loadingSaved())
         parts << trText(QStringLiteral("saved figures still being read"));
     if (holding.pending > 0)
@@ -326,15 +414,14 @@ QString holdingNote(const WalletController* controller, const Holding& holding)
         parts << trText(QStringLiteral("a key this version cannot read"));
     if (controller->addressLimitReached())
         parts << trText(QStringLiteral("address limit reached"));
-    const wallet::NetworkStatus status = controller->networkStatus(info.network);
-    if ((status.wrongChain || status.failing || status.connecting) && status.balancesAt.isValid())
-        parts << trText(QStringLiteral("as of %1")).arg(status.balancesAt.toLocalTime().toString(QStringLiteral("d MMM HH:mm")));
-    else if (status.wrongChain)
-        parts << trText(QStringLiteral("server on another chain"));
-    else if (status.failing)
-        parts << trText(QStringLiteral("lookups failing"));
-    else if (holding.complete && status.scanning)
-        parts << (controller->showingSaved() ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning")));
+    const QString current = networkNote(controller, info.network, holding.complete);
+    if (!current.isEmpty())
+        parts << current;
+    if (holding.holds() && holding.price > 0.0) {
+        const QString price = controller->priceNote(holding.asset);
+        if (!price.isEmpty())
+            parts << price;
+    }
     return parts.join(QStringLiteral(" · "));
 }
 
@@ -349,6 +436,7 @@ Holding holdingAt(const WalletController* controller, const wallet::AddressRow& 
     h.complete = row.checked;
     h.pending = row.checked ? 0 : 1;
     h.holders = h.holds() ? 1 : 0;
+    h.incoming = row.isUtxo() && row.unconfirmed > 0 && asset == wallet::networkInfo(row.network).coin ? row.unconfirmed : 0;
     h.price = controller && controller->prices() ? controller->prices()->usd(asset) : 0.0;
     try {
         h.usd = h.amount.toDouble(info.decimals) * h.price;
@@ -376,6 +464,8 @@ Holding holdingOf(const WalletController* controller, wallet::Asset asset, quint
     h.unread = wallet != 0 ? (entry && !entry->keptAccounts.isEmpty()) : controller->hasUnreadKeys();
     h.complete = h.watched && h.pending == 0 && !coverage.missing && !controller->addressLimitReached() && !controller->loadingSaved() && !h.unread;
     h.holders = wallet != 0 ? model->holders(asset, wallet) : model->holders(asset);
+    if (asset == wallet::networkInfo(info.network).coin)
+        h.incoming = wallet != 0 ? model->incoming(info.network, wallet) : model->incoming(info.network);
     h.price = controller->prices() ? controller->prices()->usd(asset) : 0.0;
     h.amount = wallet != 0 ? model->total(asset, wallet) : model->total(asset);
     try {
@@ -428,8 +518,11 @@ ScopeTotal totalOf(const WalletController* controller, quint32 wallet)
     bool anyPrice = false;
     for (const wallet::AssetInfo& info : wallet::assets()) {
         const Holding h = holdingOf(controller, info.asset, wallet);
-        if (!h.watched)
+        if (!h.watched) {
+            // A key nobody here can read holds something nobody here knows of.
+            total.complete = total.complete && !h.unread;
             continue;
+        }
         anyWatched = true;
         if (!h.readable || (h.holds() && h.price <= 0.0))
             total.known = false;
@@ -681,7 +774,7 @@ int HoldingsTable::rowsHolding() const
 bool HoldingsTable::allFinal() const
 {
     const QList<Line>& lines = ui_->model->lines();
-    return std::all_of(lines.cbegin(), lines.cend(), [](const Line& line) { return !line.holding.watched || line.holding.complete; });
+    return std::all_of(lines.cbegin(), lines.cend(), [](const Line& line) { return line.holding.watched ? line.holding.complete : !line.holding.unread; });
 }
 
 int HoldingsTable::rowsTotal() const
@@ -757,12 +850,13 @@ void HoldingsTable::refresh()
     bool every = true;
     for (Line& line : lines) {
         all += line.holding.usd;
-        every = every && (!line.holding.watched || (line.holding.complete && line.holding.readable && (!line.holding.holds() || line.holding.price > 0.0)));
+        every = every && (line.holding.watched ? line.holding.complete && line.holding.readable && (!line.holding.holds() || line.holding.price > 0.0) : !line.holding.unread);
         // What keeps it from final can be read without hovering, under its name.
         line.note = holdingNote(controller_, line.holding);
         if (!line.note.isEmpty() && line.holding.watched)
             line.sub += QStringLiteral(" · ") + line.note;
     }
+    ui_->model->pricesLine = controller_->pricesLine();
     ui_->sharesKnown = all > 0.0 && every;
     for (Line& line : lines) {
         if (ui_->sharesKnown && line.holding.watched)

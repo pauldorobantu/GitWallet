@@ -31,6 +31,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -881,8 +882,9 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
             for (const Row& row : std::as_const(it->rows)) {
                 cut = cut || qint64(row.index) > last + gap;
                 if (!cut) {
+                    // What was given out holds the window whatever was found before it.
                     if (row.found)
-                        last = row.index;
+                        last = qMax(last, qint64(row.index));
                     Row reached = row;
                     reached.pastGap = qint64(row.index) >= gap;
                     reach.rows.append(reached);
@@ -1011,6 +1013,10 @@ void WalletController::refresh()
 
 bool WalletController::isScanning() const
 {
+    if (statusForTest_) {
+        const QList<wallet::NetworkInfo>& all = wallet::networks();
+        return std::any_of(all.cbegin(), all.cend(), [this](const wallet::NetworkInfo& network) { return networkStatus(network.network).scanning; });
+    }
     return scheduler_->isScanning();
 }
 
@@ -1021,7 +1027,10 @@ bool WalletController::addressLimitReached() const
 
 wallet::NetworkStatus WalletController::networkStatus(wallet::Network network) const
 {
-    return scheduler_->status(network);
+    wallet::NetworkStatus status = scheduler_->status(network);
+    if (statusForTest_)
+        statusForTest_(status);
+    return status;
 }
 
 bool WalletController::balancesComplete() const
@@ -1111,6 +1120,21 @@ QString WalletController::statusText() const
         break;
     }
     return QStringLiteral("Up to date · %1 · %2 funded").arg(rows, grouped(model_->fundedCount()));
+}
+
+QString WalletController::priceNote(wallet::Asset asset) const
+{
+    if (prices_->inDoubt(asset))
+        return ui::trText(QStringLiteral("sources disagree on its price"));
+    const QDateTime at = prices_->oldest({asset});
+    if (at.isValid() && at.secsTo(QDateTime::currentDateTimeUtc()) > kPricesOldSeconds)
+        return ui::trText(QStringLiteral("price from %1")).arg(at.toLocalTime().toString(QStringLiteral("d MMM HH:mm")));
+    return QString();
+}
+
+int WalletController::balancesInDoubt() const
+{
+    return status() == Status::DoNotAddUp ? differingAddresses() : 0;
 }
 
 QString WalletController::pricesLine() const
@@ -1537,6 +1561,18 @@ const wallet::AccountKey* WalletController::receiveKey(quint32 wallet, wallet::N
     return lowest;
 }
 
+const wallet::AccountKey* WalletController::keyOf(const wallet::AddressRow& row) const
+{
+    const wallet::WalletEntry* entry = store_.find(row.wallet);
+    if (entry) {
+        for (const wallet::AccountKey& key : entry->accounts) {
+            if (key.type == row.type && key.account == row.account && key.serves(row.network))
+                return &key;
+        }
+    }
+    return nullptr;
+}
+
 QString WalletController::checkedAddress(const wallet::AddressRow& row) const
 {
     const wallet::WalletEntry* entry = store_.find(row.wallet);
@@ -1566,21 +1602,27 @@ wallet::ReceiveOffer WalletController::nextReceive(quint32 wallet, wallet::Netwo
     offer.state = wallet::ReceiveOffer::State::Checking;
     if (waitingForLedger_)
         return offer; // what the database kept says what has been used
+    const wallet::NetworkStatus status = networkStatus(network);
     for (quint32 index = key->given.nextFree(0);; index = key->given.nextFree(index + 1)) {
         const int position = model_->find(wallet, network, type, key->account, 0, index);
         if (position < 0) {
             // No row, and none is on its way: nobody is being waited for.
-            if (scheduler_->status(network).limit) {
+            if (status.limit) {
                 offer.state = wallet::ReceiveOffer::State::Failed;
-                offer.why = QStringLiteral("The next unused address lies past the most GitWallet follows. The limit rises with the gaps in Settings, and falls with fewer wallets.");
+                offer.why = QStringLiteral("The next unused address lies past the most GitWallet follows. A server that calls every address used does that, so try another one in Settings; fewer wallets also leave more room.");
             }
             return offer;
         }
         const wallet::AddressRow& row = model_->at(position);
         if (row.used || row.state() == wallet::AddressState::Funded)
             continue;
-        if (!row.checked)
-            return offer;
+        if (!row.checked) {
+            // A scan on its way answers for this one soon. One that has ended has given up on it, as no
+            // server will say: it is not offered, and it stops nothing that has answered after it.
+            if (status.scanning || status.connecting || !status.watched)
+                return offer;
+            continue;
+        }
         offer.account = key->account;
         offer.index = index;
         offer.path = row.path();
@@ -1599,8 +1641,8 @@ bool WalletController::isGivenOut(const wallet::AddressRow& row) const
 {
     if (row.change != 0)
         return false;
-    const wallet::AccountKey* key = receiveKey(row.wallet, row.network, row.type);
-    return key && key->account == row.account && key->given.contains(row.index);
+    const wallet::AccountKey* key = keyOf(row);
+    return key && key->given.contains(row.index);
 }
 
 bool WalletController::markGivenOut(const wallet::AddressRow& row, QString* error)
@@ -1608,12 +1650,13 @@ bool WalletController::markGivenOut(const wallet::AddressRow& row, QString* erro
     setError(error, QString());
     if (row.change != 0 || row.used || row.state() == wallet::AddressState::Funded)
         return true;
-    auto* key = const_cast<wallet::AccountKey*>(receiveKey(row.wallet, row.network, row.type));
-    if (!key || key->account != row.account || key->given.contains(row.index))
+    auto* key = const_cast<wallet::AccountKey*>(keyOf(row));
+    if (!key || key->given.contains(row.index))
         return true;
     key->given.add(row.index);
     const wallet::AccountKey marked = *key;
     scheduler_->noteGiven(marked, row.index);
+    emit rowGivenOut(model_->find(row.wallet, row.network, row.type, row.account, 0, row.index));
     emit givenOutChanged();
     return saveGivenOut(error);
 }
@@ -1638,17 +1681,35 @@ bool WalletController::saveGivenOut(QString* error)
 QList<int> WalletController::givenOutRows(quint32 wallet, wallet::Network network, chain::ScriptType type, int limit) const
 {
     QList<int> out;
-    const wallet::AccountKey* key = receiveKey(wallet, network, type);
-    if (!key)
+    const wallet::WalletEntry* entry = store_.find(wallet);
+    if (!entry)
         return out;
-    for (auto run = key->given.runs.crbegin(); run != key->given.runs.crend(); ++run) {
-        for (quint32 index = run->to; index > run->from && out.size() < limit; --index) {
-            const int position = model_->find(wallet, network, type, key->account, 0, index - 1);
-            if (position >= 0)
-                out.append(position);
+    for (const wallet::AccountKey& key : entry->accounts) {
+        if (key.type != type || !key.serves(network))
+            continue;
+        for (auto run = key.given.runs.crbegin(); run != key.given.runs.crend(); ++run) {
+            for (quint32 index = run->to; index > run->from && out.size() < limit; --index) {
+                const int position = model_->find(wallet, network, type, key.account, 0, index - 1);
+                if (position >= 0)
+                    out.append(position);
+            }
         }
     }
     return out;
+}
+
+int WalletController::givenOutCount(quint32 wallet, wallet::Network network, chain::ScriptType type) const
+{
+    qint64 count = 0;
+    if (const wallet::WalletEntry* entry = store_.find(wallet)) {
+        for (const wallet::AccountKey& key : entry->accounts) {
+            if (key.type != type || !key.serves(network))
+                continue;
+            for (const wallet::GivenOut::Run& run : key.given.runs)
+                count += run.to - run.from;
+        }
+    }
+    return int(qMin(count, qint64(std::numeric_limits<int>::max())));
 }
 
 int WalletController::givenOutWaiting(quint32 wallet) const

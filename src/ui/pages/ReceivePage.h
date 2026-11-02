@@ -30,6 +30,9 @@ public:
     void showAddress(const wallet::AddressRow& row);
     // Writes the QR code to a file, as Save QR does once a file is chosen.
     bool saveQrAs(const QString& path);
+    // The reader is going elsewhere. A label or an amount typed says it is for someone, so what is on
+    // screen counts as given out; with nothing typed it does not, as a scan cannot be seen from here.
+    void leaving();
 
     // What is on screen, for tests.
     QString shownAddress() const;
@@ -56,6 +59,7 @@ private:
     void saveQr();
     bool keepLabel();     // false + a line on screen when the label cannot be kept
     int shownPosition() const; // of what is on screen in the model; -1 if it has gone
+    bool notCurrent(wallet::Network network, QString* since) const; // no server is answering for it now
     QString payload() const;
     wallet::Network chosenNetwork() const;
     chain::ScriptType chosenType() const;

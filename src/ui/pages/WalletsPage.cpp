@@ -6,6 +6,7 @@
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
 #include "ui/Figures.h"
+#include "ui/Holdings.h"
 #include "ui/HoverRowTable.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
@@ -169,11 +170,6 @@ public:
         const wallet::WalletCounts counts = model->counts(entry.id);
         const Shown shown = shown_.value(entry.id);
         const RowState state = stateOf(counts, shown);
-        // A figure reads plain only once every balance behind it has answered and
-        // the scan reached all it should: a zero with an address nobody looked at
-        // behind it is no answer. Figures from an earlier moment (LastKnown) stay
-        // plain, and the State column says so, as on the Overview.
-        const bool complete = state == RowState::LastKnown || state == RowState::UpToDate;
 
         // Amounts format through chain::Amount (Botan): nothing may throw out of
         // a model call into Qt's painting or sorting.
@@ -227,22 +223,14 @@ public:
             if (const wallet::AssetInfo* info = assetOf(column)) {
                 if (!watches(shown, *info))
                     return dash(); // no key on this chain: not a zero
-                const chain::Amount amount = model->total(info->asset, entry.id);
-                if (complete)
-                    return formatAmount(amount, *info);
-                return amount.isZero() ? dash() : atLeast(formatAmount(amount, *info));
+                // By the rule every other page goes by, without the symbol its column has.
+                const Holding holding = holdingOf(controller_, info->asset, entry.id);
+                if (holding.complete)
+                    return formatAmount(holding.amount, *info);
+                return holding.holds() ? atLeast(formatAmount(holding.amount, *info)) : dash();
             }
-            if (column == usdColumn()) {
-                // An asset with a balance but no price would make the sum too low.
-                for (const wallet::AssetInfo& info : wallet::assets()) {
-                    if (!model->total(info.asset, entry.id).isZero() && controller_->prices()->usd(info.asset) <= 0.0)
-                        return dash();
-                }
-                const double usd = controller_->totalUsd(entry.id);
-                if (complete)
-                    return formatUsd(usd);
-                return usd > 0.0 ? atLeast(formatUsd(usd)) : dash();
-            }
+            if (column == usdColumn())
+                return totalOf(controller_, entry.id).text();
             if (column == stateColumn()) {
                 switch (state) {
                 case RowState::Limit: return trText(QStringLiteral("Address limit reached"));
@@ -584,24 +572,24 @@ void WalletsPage::confirmRemoveSelected()
     box->setTextFormat(Qt::PlainText); // a name is never markup
     box->setInformativeText(
         (entry->fromKeys
-            ? QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
-                             "wallets stay as they are. Nothing changes on the blockchain, but this PC has "
-                             "no seed for it: to add it back you need these keys, which Public keys shows now.")
-            : QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
-                             "wallets stay as they are. Nothing changes on the blockchain: adding its seed "
-                             "again shows the same addresses."))
+            ? trText(QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
+                                    "wallets stay as they are. Nothing changes on the blockchain, but this PC has "
+                                    "no seed for it: to add it back you need these keys, which Public keys shows now."))
+            : trText(QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
+                                    "wallets stay as they are. Nothing changes on the blockchain: adding its seed "
+                                    "again shows the same addresses.")))
             + (controller_->walletFilesKeptAside() > 0
-                   ? QStringLiteral(" An older wallet file kept beside wallet.dat may still hold its keys, until Remove "
-                                    "all wallets in Settings.")
+                   ? QLatin1Char(' ') + trText(QStringLiteral("An older wallet file kept beside wallet.dat may still hold its keys, until Remove "
+                                                              "all wallets in Settings."))
                    : QString())
             + (controller_->labelCount(id) > 0
-                   ? QStringLiteral(" Its %1 labels and notes go too, for good: only this PC has them, and no seed brings "
-                                    "them back. Keep a copy first, under Labels and notes in Settings.")
-                         .arg(controller_->labelCount(id))
+                   ? QLatin1Char(' ') + trText(QStringLiteral("Its %1 labels and notes go too, for good: only this PC has them, and no seed brings "
+                                                              "them back. Keep a copy first, under Labels and notes in Settings."))
+                                            .arg(controller_->labelCount(id))
                    : QString())
             + (controller_->givenOutWaiting(id) > 0
-                   ? QStringLiteral(" %1 of the addresses it gave out have had nothing come in yet. If its seed is added again, they will be offered to someone else: only this PC knows they were given out.")
-                         .arg(controller_->givenOutWaiting(id))
+                   ? QLatin1Char(' ') + trText(QStringLiteral("%1 of the addresses it gave out have had nothing come in yet. If its seed is added again, they will be offered to someone else: only this PC knows they were given out."))
+                                            .arg(controller_->givenOutWaiting(id))
                    : QString()));
     QPushButton* remove = box->addButton(QStringLiteral("Remove wallet"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));

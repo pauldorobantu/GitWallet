@@ -120,7 +120,6 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
     title_ = new MiddleLabel(card);
     title_->setObjectName(QStringLiteral("placeTitle"));
     title_->setTextFormat(Qt::PlainText);
-    title_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     // On a narrow window the text is cut, never a button.
     title_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     detail_ = new QLabel(card);
@@ -153,18 +152,8 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
     margins->addWidget(tabs_);
 
     connect(copy_, &QPushButton::clicked, this, [this] {
-        if (!place_.address || !controller_)
-            return;
-        // What may go to someone who is to pay: what the key gives, not what is kept, and marked.
-        const wallet::AddressRow row = currentRow();
-        const QString address = controller_->checkedAddress(row);
-        if (address.isEmpty()) {
-            Feedback::show(copy_, Feedback::Type::Error, trText(QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.")));
-            return;
-        }
-        QString error;
-        controller_->markGivenOut(row, &error); // what fails is said on its own, and tried again
-        copyTextToClipboard(copy_, address, trText(QStringLiteral("Address copied")));
+        if (place_.address && controller_)
+            copyAddress(copy_, controller_, currentRow());
     });
     connect(explorer_, &QPushButton::clicked, this, [this] {
         if (!place_.address)
@@ -199,6 +188,7 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
         connect(controller_, &WalletController::statusChanged, this, queue);
         connect(controller_, &WalletController::labelsChanged, this, queue);
         connect(controller_, &WalletController::walletChanged, this, queue);
+        connect(controller_, &WalletController::givenOutChanged, this, queue);
     }
     if (controller_) {
         // The last step may be its name.
@@ -400,23 +390,31 @@ void PlaceBar::refresh()
         detail << row.path();
         if (const wallet::WalletEntry* own = controller_->store().find(row.wallet))
             detail << own->label;
-        // The same figures as the table under it: an address nobody answered for holds no zero.
-        double usd = 0.0;
-        bool priced = true;
-        bool any = false;
-        for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
-            const Holding holding = holdingAt(controller_, row, asset);
-            if (holding.holds() || (row.checked && asset == wallet::networkInfo(row.network).coin)) {
-                detail << holding.amountText();
-                any = true;
+        if (controller_->model()->find(row.wallet, row.network, row.type, row.account, row.change, row.index) < 0) {
+            // What it last said is no figure of an address nothing reads any more.
+            detail << trText(QStringLiteral("No scan follows this address now"));
+        } else {
+            // The same figures as the table under it: an address nobody answered for holds no zero.
+            double usd = 0.0;
+            bool priced = true;
+            bool any = false;
+            for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
+                const Holding holding = holdingAt(controller_, row, asset);
+                if (holding.holds() || (row.checked && asset == wallet::networkInfo(row.network).coin)) {
+                    detail << holding.amountText();
+                    any = true;
+                }
+                priced = priced && holding.readable && (holding.price > 0.0 || !holding.holds());
+                usd += holding.usd;
             }
-            priced = priced && holding.readable && (holding.price > 0.0 || !holding.holds());
-            usd += holding.usd;
+            if (!row.checked && !any)
+                detail << trText(QStringLiteral("Not checked yet"));
+            else if (priced && any)
+                detail << (row.checked ? figures::formatUsd(usd) : figures::atLeast(figures::formatUsd(usd)));
+            if (!row.used && row.state() != wallet::AddressState::Funded && controller_->isGivenOut(row))
+                detail << trText(QStringLiteral("Given out"));
+            detail << addressNotes(controller_, row);
         }
-        if (!row.checked && !any)
-            detail << trText(QStringLiteral("Not checked yet"));
-        else if (priced && any)
-            detail << (row.checked ? figures::formatUsd(usd) : figures::atLeast(figures::formatUsd(usd)));
     } else if (place_.asset) {
         const wallet::AssetInfo& info = wallet::assetInfo(*place_.asset);
         const Holding holding = holdingOf(controller_, *place_.asset, place_.wallet);
@@ -437,9 +435,11 @@ void PlaceBar::refresh()
         title = totalOf(controller_, entry->id).text();
         detail << entry->label;
         const wallet::WalletCounts counts = controller_->model()->counts(entry->id);
-        detail << trText(QStringLiteral("%1 funded of %2 addresses")).arg(figures::formatCount(counts.funded), figures::formatCount(counts.rows));
+        if (counts.rows > 0)
+            detail << trText(QStringLiteral("%1 funded of %2 addresses")).arg(figures::countSoFar(counts.funded, counts.checked == counts.rows), figures::formatCount(counts.rows));
         if (counts.checked < counts.rows)
             detail << trText(counts.rows - counts.checked == 1 ? QStringLiteral("%1 address not checked yet") : QStringLiteral("%1 addresses not checked yet")).arg(figures::formatCount(counts.rows - counts.checked));
+        detail << walletNotes(controller_, entry->id);
     }
     mark_->setPixmap(icon.pixmap(QSize(kMarkSize, kMarkSize)));
     static_cast<MiddleLabel*>(title_)->setFull(title);

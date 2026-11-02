@@ -5,6 +5,8 @@
 #include <QList>
 #include <QString>
 
+#include "wallet/Types.h"
+
 namespace app {
 class WalletController;
 }
@@ -24,6 +26,7 @@ public:
         StateRole,                   // int(wallet::AddressState)
         AddressRole,                 // the full address (copy)
         WalletRole,                  // wallet::AddressRow::wallet
+        GivenOutRole,                // handed to someone, with no history yet
     };
 
     explicit AddressTableModel(WalletController* controller, QObject* parent = nullptr);
@@ -43,6 +46,22 @@ private:
     void resetRows();
     void refreshPrices();   // repaints Balance / USD when a price changed
     void refreshLabels();   // the wallets' names, read per cell and per sort comparison
+    bool waitingForPayment(const wallet::AddressRow& row) const; // given out, with no history yet
+
+    // A key by what tells it apart, cheap to hash: a lookup per row when the list sorts or filters by state.
+    struct KeyId {
+        quint32 wallet = 0;
+        quint32 account = 0;
+        quint8 type = 0;
+        quint16 network = 0; // of a Bitcoin kind of key; an account's address is the same on all networks
+        bool operator==(const KeyId& other) const = default;
+    };
+    friend size_t qHash(const KeyId& key, size_t seed)
+    {
+        return qHashMulti(seed, key.wallet, key.account, key.type, key.network);
+    }
+    mutable QHash<KeyId, wallet::GivenOut> given_; // read from the store once something was given out
+    mutable bool givenStale_ = true;
 
     QHash<quint32, QString> labels_;
     int rows_ = 0;                // the row count the views know (moves only inside begin/endInsertRows)

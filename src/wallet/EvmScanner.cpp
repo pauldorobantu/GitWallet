@@ -783,12 +783,31 @@ void EvmScanner::startPass()
     deriveWindows();
 }
 
-bool EvmScanner::hotRow(const AccountState& account, const AddressRow& row) const
+qint64 EvmScanner::hotEnd(const AccountState& account) const
+{
+    // The first unused ones after the last used, which nobody has been given yet; what was given out
+    // among them comes along. One given out far past them says nothing of those before it.
+    qint64 left = kHotAhead;
+    qint64 index = qMax(account.lastUsed, account.savedUsed) + 1;
+    for (const GivenOut::Run& run : account.key.given.runs) {
+        if (qint64(run.to) <= index)
+            continue;
+        const qint64 free = qint64(run.from) - index;
+        if (free >= left)
+            break;
+        if (free > 0)
+            left -= free;
+        index = run.to;
+    }
+    return index + left - 1;
+}
+
+bool EvmScanner::hotRow(const AccountState& account, const AddressRow& row, qint64 end) const
 {
     const qint64 index = row.index;
     // What was given out and has not been paid yet, wherever it lies, then the unused ones after that.
     const qint64 last = qMax(account.lastUsed, account.savedUsed);
-    return !row.balances.isEmpty() || (!row.used && account.key.given.contains(row.index)) || (index > last && index <= qMax(last, qint64(account.key.given.end()) - 1) + kHotAhead);
+    return !row.balances.isEmpty() || (!row.used && account.key.given.contains(row.index)) || (index > last && index <= end);
 }
 
 void EvmScanner::noteGiven(const AccountKey& key, quint32 index)
@@ -820,12 +839,15 @@ void EvmScanner::queueHotRound()
     QHash<QPair<quint32, quint32>, int> positions;
     for (int i = 0; i < acc_.size(); ++i)
         positions.insert({acc_.at(i).key.wallet, acc_.at(i).key.account}, i);
+    QList<qint64> ends;
+    for (const AccountState& account : std::as_const(acc_))
+        ends.append(hotEnd(account));
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
         if (row.network != network_)
             continue;
         const auto found = positions.constFind({row.wallet, row.account});
-        if (found != positions.cend() && hotRow(acc_.at(*found), row))
+        if (found != positions.cend() && hotRow(acc_.at(*found), row, ends.at(*found)))
             hotQueue_.append(Slot{*found, row.index, QString()});
     }
     hotRows_ = int(hotQueue_.size());

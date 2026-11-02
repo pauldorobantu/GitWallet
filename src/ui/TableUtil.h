@@ -10,6 +10,14 @@ class QAbstractItemView;
 class QTableWidgetItem;
 class QWidget;
 
+namespace wallet {
+struct AddressRow;
+}
+
+namespace app {
+class WalletController;
+}
+
 namespace app::ui {
 
 // Standard table cell (read-only; optional muted foreground; tooltip
@@ -25,6 +33,12 @@ QString shortTimestamp(const QString& raw);
 // On Windows the copy is kept out of clipboard history and cloud clipboard sync.
 void copyTextToClipboard(QWidget* host, const QString& text,
                          const QString& label = QString());
+
+// An address going where someone may pay to it, as asked for by a button or a key: what its key gives,
+// marked as given out, and the reader told what is not plain about it. False if it did not go.
+bool copyAddress(QWidget* host, WalletController* controller, const wallet::AddressRow& row);
+// What is not plain about handing that one out; empty: nothing.
+QString handOutNote(const WalletController* controller, const wallet::AddressRow& row);
 
 // Click-to-copy, OPT-IN pe coloane: doar coloanele cu valori-rezultat pe care
 // utilizatorul chiar le lipește în altă parte (e-mail, IP, URL, endpoint, cod

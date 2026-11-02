@@ -37,6 +37,8 @@ void WalletModel::resetCounts()
     walletUnchecked_.clear();
     holders_.clear();
     walletHolders_.clear();
+    incoming_.clear();
+    walletIncoming_.clear();
 }
 
 void WalletModel::clear()
@@ -238,6 +240,17 @@ int WalletModel::holders(Asset a, quint32 wallet) const
     return own == walletHolders_.cend() ? 0 : own->value(a);
 }
 
+qint64 WalletModel::incoming(Network network) const
+{
+    return incoming_.value(network);
+}
+
+qint64 WalletModel::incoming(Network network, quint32 wallet) const
+{
+    const auto own = walletIncoming_.constFind(wallet);
+    return own == walletIncoming_.cend() ? 0 : own->value(network);
+}
+
 void WalletModel::addLookups(const AddressRow& row, int index)
 {
     // Account rows have no scripthash; an empty key would make every one of them collide.
@@ -281,6 +294,10 @@ void WalletModel::countRow(const AddressRow& row, int sign)
 
 bool WalletModel::addToTotals(const AddressRow& row)
 {
+    if (row.isUtxo() && row.unconfirmed > 0) {
+        incoming_[row.network] += row.unconfirmed;
+        walletIncoming_[row.wallet][row.network] += row.unconfirmed;
+    }
     bool holds = false;
     row.forEachBalance([&](Asset asset, const chain::Amount& amount) {
         holds = true;
@@ -294,6 +311,10 @@ bool WalletModel::addToTotals(const AddressRow& row)
 
 bool WalletModel::takeFromTotals(const AddressRow& row)
 {
+    if (row.isUtxo() && row.unconfirmed > 0) {
+        incoming_[row.network] -= row.unconfirmed;
+        walletIncoming_[row.wallet][row.network] -= row.unconfirmed;
+    }
     bool holds = false;
     row.forEachBalance([&](Asset asset, const chain::Amount& amount) {
         holds = true;

@@ -2754,6 +2754,7 @@ void testWindow(const Check& check, const wallet::AccountKey& key)
         page.showPlace(0, key.network, first.scripthash, first.address);
         check(lines->rowCount() == 3 && period->currentIndex() == 0 && type->currentIndex() == 0, QStringLiteral("an address opens to all of its own"));
         page.clearPlace();
+        page.becomeWhole(); // as it does when it next shows
         check(lines->rowCount() == 4, QStringLiteral("and leaving it to all there is"));
     }
 

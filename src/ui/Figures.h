@@ -23,4 +23,7 @@ QString formatCount(int n);
 // Dust that only reads "<0.000001" or "<$0.01" becomes "> 0" / "> $0".
 QString atLeast(const QString& figure);
 
+// A count of what has answered so far: plain once all of it has, "≥ 3" before that, "—" for none yet.
+QString countSoFar(int count, bool complete);
+
 } // namespace app::ui::figures

@@ -61,6 +61,10 @@ public:
     int uncheckedOn(Network network, quint32 wallet) const; // those of one wallet
     int holders(Asset a) const;             // rows that hold some of it
     int holders(Asset a, quint32 wallet) const;
+    // Coming in on a Bitcoin kind of network and in no block yet, in smallest units: it counts in the
+    // totals, and can still be replaced.
+    qint64 incoming(Network network) const;
+    qint64 incoming(Network network, quint32 wallet) const;
 
 signals:
     void rowsAppended(int first, int last);
@@ -109,6 +113,8 @@ private:
     QHash<quint32, QHash<Network, int>> walletUnchecked_;
     QHash<Asset, int> holders_;
     QHash<quint32, QHash<Asset, int>> walletHolders_;
+    QHash<Network, qint64> incoming_;
+    QHash<quint32, QHash<Network, qint64>> walletIncoming_;
 };
 
 } // namespace wallet

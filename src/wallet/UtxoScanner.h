@@ -115,6 +115,8 @@ private:
         int savedUsed = -1;   // highest index the rows in the model say is used: only says what to follow first
         GivenOut given;       // receive rows given out: a payment comes to those
         int issued = 0;       // one past the highest of them: they count as used for the window
+        mutable int nextEndOf = -2; // the last used index nextEnd() went by; given out since: asked again
+        mutable int nextEndIs = 0;
         bool reuse = true;    // the rows already in the model came from this xpub
 
         int window() const;   // max(floor, the later of lastUsed + 1 and issued, + gap); may exceed what may be derived
@@ -198,13 +200,16 @@ private:
     int placesNow() const;            // what this connection takes
     void rebalanceLive();             // every row's place, once, when who deserves one changed
     int hotAhead(const Chain& c) const; // unused addresses after the last used one a chain keeps live
+    int nextEnd(const Chain& c) const;  // the last of those, past what was given out among them
     bool isNext(const Chain& c, int index) const; // one of those
     bool waitingForPayment(const Chain& c, int index, const AddressRow& row) const; // given out, and no history yet
     bool wantsLive(const Chain& c, int index, const AddressRow& row) const;
-    bool mayGoLive(Tracked& tracked, const Chain& c, int index); // there is a place for it: takes it
+    bool mayGoLive(Tracked& tracked, const Chain& c, int index, const AddressRow& row); // there is a place for it: takes it
     void placeRow(const QString& scripthash, const Chain& c, int index, const AddressRow& row);
     void reconsider(const QString& scripthash); // its status or balance moved: its place may have too
     void reconsiderRange(int chainIndex, int from, int to);
+    void leaveLive(const QString& scripthash, Tracked& tracked); // read in rounds from now on
+    void makeRoom();                  // every place is taken, and what was given out needs one: another gives way
     void freeCoinPlace(Tracked& tracked);
     void enterRounds(const QString& scripthash, Tracked& tracked);
     void dropRowsPastWindows(); // once this run knows its windows

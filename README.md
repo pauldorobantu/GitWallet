@@ -76,12 +76,17 @@ something is still being read a figure says so: "≥" for what is known so far, 
    as a QR code; on Bitcoin an amount can go into the code (BIP 21). Copying it or saving its code marks
    it as given out, and it is never offered again; **New address** goes on to the next. A label says who
    it is for and stays on this PC, out of the code. What was given out is listed under it with what came
-   of it. An address is derived from the key each time it is shown, and if what is kept says another, none
-   is offered. Those given out count as used for the gap and are followed ahead of the rest, so a payment to
-   one shows as soon as any. No address is offered until a server has said it has no history; once that
-   was said in an earlier run it is offered with a note, as the servers may not have answered yet. Copying
-   an address anywhere in the app marks it the same way. Removing a wallet forgets what it gave out, and
-   the dialog says how many of those are still waiting for a payment.
+   of it, and on the Addresses page, where State finds all of them. An address is derived from the key each
+   time it is shown, and if what is kept says another, none is offered. Those given out count as used for the
+   gap and are followed ahead of the rest, so a payment to one shows as soon as any. No address is offered
+   until a server has said it has no history; once that was said in an earlier run it is offered with a note,
+   as the servers may not have answered yet. **Copy address** or Ctrl+C on the Addresses page and on an
+   address's own page mark it the same way, and say so if it was given out before; a click only chooses a row.
+   A code scanned off the screen cannot be seen from here, so the page says to press New address after it;
+   going elsewhere with a label or an amount typed counts as given out. While no server answers, or what shows
+   was only saved, the page says that rather than "nothing has come in", and what is in no block yet reads
+   as that, not as received. Removing a wallet forgets what it gave out, and the dialog says how many of those
+   are still waiting for a payment.
 4. **Send BTC** *(later)* — sweep selected or all addresses into one transaction.
 5. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
    needs one transaction per address; gas is funded automatically for tokens).

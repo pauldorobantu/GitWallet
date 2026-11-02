@@ -580,8 +580,8 @@ void SettingsPage::confirmRemove()
     const int waiting = controller_->givenOutWaiting();
     if (waiting > 0) {
         detail += QLatin1Char(' ')
-                  + QStringLiteral("%1 of the addresses they gave out have had nothing come in yet. If those seeds are added again, they "
-                                   "will be offered to someone else: only this PC knows they were given out.")
+                  + trText(QStringLiteral("%1 of the addresses they gave out have had nothing come in yet. If those seeds are added again, they "
+                                          "will be offered to someone else: only this PC knows they were given out."))
                         .arg(waiting);
     }
     const int databases = controller_->databasesKeptAside();

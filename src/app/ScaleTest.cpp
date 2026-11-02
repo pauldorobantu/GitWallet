@@ -206,7 +206,14 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
                 ++holding;
         }
         clock.restart();
-        page->showPlace(1, token);
+        {
+            // As the window opens one, so that leaving it below goes the way the window goes.
+            ui::Place place;
+            place.root = ui::Place::Root::Wallets;
+            place.wallet = 1;
+            place.asset = token;
+            window->goTo(place, ui::Place::Tab::Addresses);
+        }
         settle();
         const qint64 narrowing = clock.elapsed();
         say(QStringLiteral("opening a coin of a wallet on its addresses"), narrowing);
@@ -216,7 +223,6 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
             report += QStringLiteral("FAIL  the place shows %1 rows, not %2\n").arg(table->model()->rowCount()).arg(holding);
         clock.restart();
         window->showPage(QStringLiteral("settings"));
-        page->clearPlace();
         settle();
         const qint64 leaving = clock.elapsed();
         say(QStringLiteral("leaving it for another page"), leaving);
@@ -416,7 +422,12 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
         if (lines->rowCount() != book->addressAt(book->findAddress(wanted)).txs.size())
             report += QStringLiteral("FAIL  one address shows %1 lines, not %2\n").arg(lines->rowCount()).arg(book->addressAt(book->findAddress(wanted)).txs.size());
         clock.restart();
-        history->clearPlace();
+        if (history->isVisible()) {
+            history->clearPlace();
+        } else {
+            history->clearPlace();
+            history->becomeWhole();
+        }
         settle();
         say(QStringLiteral("back to all of them"), clock.elapsed());
         {

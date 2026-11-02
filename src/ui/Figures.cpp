@@ -42,6 +42,13 @@ QString formatCount(int n)
     return QLocale(QLocale::English).toString(n);
 }
 
+QString countSoFar(int count, bool complete)
+{
+    if (complete)
+        return formatCount(count);
+    return count > 0 ? atLeast(formatCount(count)) : dash();
+}
+
 QString atLeast(const QString& figure)
 {
     if (figure == dash())

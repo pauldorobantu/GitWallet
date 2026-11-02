@@ -34,6 +34,7 @@ public:
     // would say otherwise goes. A network with no history here yet says so.
     void showPlace(quint32 wallet, std::optional<wallet::Network> network, const QString& scripthash, const QString& address);
     void clearPlace();
+    void becomeWhole(); // what a place left narrowed goes back
 
     // The lines the filters leave, in the table's order, at once. False + a sentence on failure.
     bool exportCsvNow(const QString& path, QString* error);

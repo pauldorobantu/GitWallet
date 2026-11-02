@@ -574,20 +574,10 @@ void UtxoScanner::adoptModelRows()
         if (!c.reuse) {
             c.floor = rowsEnd[ci];
             c.savedUsed = -1;
-            continue;
-        }
-        // Not through track(): no progress() while start() is half done.
-        for (const QString& sh : std::as_const(funded[ci])) {
-            if (tracked_.contains(sh)) continue;
-            const int pos = model_->findByScripthash(network_, sh);
-            if (pos < 0) continue;
-            const AddressRow& row = model_->at(pos);
-            tracked_.insert(sh, Tracked());
-            placeRow(sh, c, int(row.index), row);
         }
     }
     // What was given out and not paid yet goes first, the latest first, wherever it lies: one of those
-    // is what a payment comes to.
+    // is what a payment comes to. Not through track(): no progress() while start() is half done.
     for (int ci = 0; ci < chains_.size(); ++ci) {
         const Chain& c = chains_.at(ci);
         if (!c.reuse) continue;
@@ -603,11 +593,24 @@ void UtxoScanner::adoptModelRows()
             }
         }
     }
+    for (int ci = 0; ci < chains_.size(); ++ci) {
+        const Chain& c = chains_.at(ci);
+        if (!c.reuse) continue;
+        for (const QString& sh : std::as_const(funded[ci])) {
+            if (tracked_.contains(sh)) continue;
+            const int pos = model_->findByScripthash(network_, sh);
+            if (pos < 0) continue;
+            const AddressRow& row = model_->at(pos);
+            tracked_.insert(sh, Tracked());
+            placeRow(sh, c, int(row.index), row);
+        }
+    }
     // The addresses a payment comes to next, as far as the rows say which they are.
     for (int ci = 0; ci < chains_.size(); ++ci) {
         const Chain& c = chains_.at(ci);
         if ((c.savedUsed < 0 && c.issued == 0) || !c.reuse) continue;
-        for (int index = c.savedUsed + 1; index <= std::max(c.savedUsed, c.issued - 1) + hotAhead(c); ++index) {
+        const int end = nextEnd(c);
+        for (int index = c.savedUsed + 1; index <= end; ++index) {
             const int pos = model_->find(c.wallet, network_, c.type, c.account, c.change, quint32(index));
             if (pos < 0) continue;
             const AddressRow& row = model_->at(pos);
@@ -1080,11 +1083,30 @@ int UtxoScanner::hotAhead(const Chain& c) const
     return c.change == 0 ? hotReceive_ : std::min(hotReceive_, kHotAheadOnChange);
 }
 
+int UtxoScanner::nextEnd(const Chain& c) const
+{
+    // The first unused ones after the last used, which nobody has been given yet: what is offered next.
+    // What was given out among them comes along; one given out far past them says nothing of those
+    // before it, and is followed for its own sake.
+    const int last = std::max(c.lastUsed, c.savedUsed);
+    if (c.nextEndOf == last) return c.nextEndIs;
+    int left = hotAhead(c);
+    qint64 index = qint64(last) + 1;
+    for (const GivenOut::Run& run : c.given.runs) {
+        if (qint64(run.to) <= index) continue;
+        const qint64 free = qint64(run.from) - index;
+        if (free >= left) break;
+        if (free > 0) left -= int(free);
+        index = run.to;
+    }
+    c.nextEndOf = last;
+    c.nextEndIs = int(std::min<qint64>(index + left - 1, kMaxChainRows));
+    return c.nextEndIs;
+}
+
 bool UtxoScanner::isNext(const Chain& c, int index) const
 {
-    // What was given out and has not been paid yet, then the unused ones after that.
-    const int last = std::max(c.lastUsed, c.savedUsed);
-    return index > last && index <= std::max(last, c.issued - 1) + hotAhead(c);
+    return index > std::max(c.lastUsed, c.savedUsed) && index <= nextEnd(c);
 }
 
 bool UtxoScanner::waitingForPayment(const Chain& c, int index, const AddressRow& row) const
@@ -1097,10 +1119,10 @@ bool UtxoScanner::wantsLive(const Chain& c, int index, const AddressRow& row) co
     return !tiered() || isNext(c, index) || row.confirmed != 0 || row.unconfirmed != 0 || waitingForPayment(c, index, row);
 }
 
-bool UtxoScanner::mayGoLive(Tracked& tracked, const Chain& c, int index)
+bool UtxoScanner::mayGoLive(Tracked& tracked, const Chain& c, int index, const AddressRow& row)
 {
     if (tracked.viaRead || liveCount_ >= placesNow()) return false;
-    if (!tiered() || isNext(c, index) || c.given.contains(quint32(index))) return true;
+    if (!tiered() || isNext(c, index) || waitingForPayment(c, index, row)) return true;
     // Holding coins: within what the next unused addresses leave, however many hold some.
     if (coinPlaces_ >= placesNow() - hotPlaces()) return false;
     ++coinPlaces_;
@@ -1111,7 +1133,7 @@ bool UtxoScanner::mayGoLive(Tracked& tracked, const Chain& c, int index)
 void UtxoScanner::placeRow(const QString& scripthash, const Chain& c, int index, const AddressRow& row)
 {
     const auto it = tracked_.find(scripthash);
-    const bool live = it != tracked_.end() && wantsLive(c, index, row) && mayGoLive(*it, c, index);
+    const bool live = it != tracked_.end() && wantsLive(c, index, row) && mayGoLive(*it, c, index, row);
     (live ? subQueue_ : readQueue_).append(scripthash);
 }
 
@@ -1124,20 +1146,65 @@ void UtxoScanner::reconsider(const QString& scripthash)
     const int ci = pos >= 0 ? findChain(model_->at(pos)) : -1;
     if (ci < 0) return;
     const Chain& c = chains_.at(ci);
-    const int index = int(model_->at(pos).index);
-    const bool wants = wantsLive(c, index, model_->at(pos));
-    if (wants && it->sub == SubState::Rounds && mayGoLive(*it, c, index)) {
+    const AddressRow& row = model_->at(pos);
+    const int index = int(row.index);
+    const bool wants = wantsLive(c, index, row);
+    const bool forItself = isNext(c, index) || waitingForPayment(c, index, row);
+    if (wants && it->sub == SubState::Rounds && mayGoLive(*it, c, index, row)) {
         it->sub = SubState::Queued; // rounds_ skips it from now on
         if (roundsCount_ > 0) --roundsCount_;
         roundFailed_.remove(scripthash); // the subscribe answers for it
         subQueue_.append(scripthash);
         schedulePump();
-    } else if (!wants && it->sub == SubState::Live && tiered()) {
-        client_->unsubscribeScripthash(scripthash);
-        if (liveCount_ > 0) --liveCount_;
-        freeCoinPlace(*it);
-        enterRounds(scripthash, *it);
+    } else if (it->sub == SubState::Queued && tiered() && forItself && mayGoLive(*it, c, index, row)) {
+        // Its first read waits behind every other, which at this size can be half an hour: this goes
+        // ahead of it, and the read is passed over when its turn comes.
+        subQueue_.append(scripthash);
         schedulePump();
+    } else if (it->sub == SubState::Live && tiered()) {
+        if (!wants) {
+            leaveLive(scripthash, *it);
+        } else if (!forItself && !it->forCoins) {
+            // Live for what it holds, without having taken one of the places for that: it got there while
+            // everything fit, or while it was one of the next.
+            if (coinPlaces_ < placesNow() - hotPlaces()) {
+                ++coinPlaces_;
+                it->forCoins = true;
+            } else {
+                leaveLive(scripthash, *it);
+            }
+        }
+    }
+}
+
+void UtxoScanner::leaveLive(const QString& scripthash, Tracked& tracked)
+{
+    client_->unsubscribeScripthash(scripthash);
+    if (liveCount_ > 0) --liveCount_;
+    freeCoinPlace(tracked);
+    enterRounds(scripthash, tracked);
+    schedulePump();
+}
+
+void UtxoScanner::makeRoom()
+{
+    if (liveCount_ < placesNow() || placesNow() <= 0) return;
+    // One of those kept for coins first, as a payment comes to what was given out.
+    for (auto it = tracked_.begin(); it != tracked_.end(); ++it) {
+        if (it->sub == SubState::Live && it->forCoins) {
+            leaveLive(it.key(), *it);
+            return;
+        }
+    }
+    // Then one that is only next, which rounds still read.
+    for (auto it = tracked_.begin(); it != tracked_.end(); ++it) {
+        if (it->sub != SubState::Live) continue;
+        const int pos = model_->findByScripthash(network_, it.key());
+        const int ci = pos >= 0 ? findChain(model_->at(pos)) : -1;
+        if (ci >= 0 && !waitingForPayment(chains_.at(ci), int(model_->at(pos).index), model_->at(pos))) {
+            leaveLive(it.key(), *it);
+            return;
+        }
     }
 }
 
@@ -1207,9 +1274,10 @@ void UtxoScanner::pumpRequests()
         // at the pace reads keep: first reads, what failed, then the round.
         // A wallet this large asks for a balance per used address at every start: those
         // keep the pace of reads, and a pause a server asked for.
+        // What is to be followed live does not wait for them: there may be an hour's worth of those, and
+        // an address just given out among these.
         const bool paced = tiered();
-        if (!balanceQueue_.isEmpty() && !(paced && readsPaused())) {
-            if (paced && !takeReadToken()) break;
+        if (!balanceQueue_.isEmpty() && !(paced && readsPaused()) && (!paced || takeReadToken())) {
             sendBalance(balanceQueue_.takeFirst());
         } else if (!subQueue_.isEmpty()) {
             sendSubscribe(subQueue_.takeFirst());
@@ -1794,12 +1862,13 @@ void UtxoScanner::noteUsed(int chainIndex, int index)
     Chain& c = chains_[chainIndex];
     if (index <= c.lastUsed || index >= kMaxChainRows) return;
     const int oldLast = std::max(c.lastUsed, c.savedUsed);
+    const int oldEnd = nextEnd(c);
     c.lastUsed = index;
     noteTiered();
     // The next addresses move on with it: those it passed first, for the places they leave.
     if (tiered()) {
-        reconsiderRange(chainIndex, oldLast + 1, oldLast + hotAhead(c));
-        reconsiderRange(chainIndex, oldLast + hotAhead(c) + 1, std::max(c.lastUsed, c.savedUsed) + hotAhead(c));
+        reconsiderRange(chainIndex, oldLast + 1, oldEnd);
+        reconsiderRange(chainIndex, oldEnd + 1, nextEnd(c));
     }
     // The window always ends `gap` past the last used address, also after the
     // initial scan: a payment to any subscribed address can reveal more.
@@ -1813,14 +1882,20 @@ void UtxoScanner::noteGiven(const AccountKey& key, quint32 index)
     const int ci = chainByKey_.value(ChainKey{key.wallet, key.account, quint8(key.type), 0}, -1);
     if (ci < 0) return;
     Chain& c = chains_[ci];
+    const int oldEnd = nextEnd(c);
     c.given = key.given;
-    const int oldEnd = std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c);
+    c.nextEndOf = -2;
     c.issued = std::max(c.issued, int(std::min<quint32>(key.given.end(), quint32(kMaxChainRows))));
     noteTiered();
     if (tiered()) {
         // That one, wherever it lies, then those the next unused addresses moved on to.
-        reconsiderRange(ci, int(std::min<quint32>(index, quint32(kMaxChainRows))), int(std::min<quint32>(index, quint32(kMaxChainRows))));
-        reconsiderRange(ci, oldEnd + 1, std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c));
+        const int at = int(std::min<quint32>(index, quint32(kMaxChainRows)));
+        const int pos = model_->find(c.wallet, network_, c.type, c.account, c.change, quint32(at));
+        const auto own = pos >= 0 ? tracked_.constFind(model_->at(pos).scripthash.toLower()) : tracked_.cend();
+        if (own != tracked_.cend() && (own->sub == SubState::Rounds || own->sub == SubState::Queued) && !own->viaRead)
+            makeRoom();
+        reconsiderRange(ci, at, at);
+        reconsiderRange(ci, oldEnd + 1, nextEnd(c));
     }
     if (c.next < c.window()) scheduleDerive();
 }

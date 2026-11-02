@@ -122,6 +122,14 @@ public:
         return std::any_of(subscribed_.cbegin(), subscribed_.cend(), [&scripthash](const QSet<QString>& set) { return set.contains(scripthash); });
     }
 
+    // Every connection cut, and the next is answered as before.
+    void dropConnections()
+    {
+        const QList<QTcpSocket*> peers = server_.findChildren<QTcpSocket*>();
+        for (QTcpSocket* peer : peers)
+            peer->abort();
+    }
+
     // Gone: every connection cut, and nobody answers again.
     void closeAll()
     {
@@ -1431,17 +1439,26 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         key.given.add(50);
         run.scanner.noteGiven(key, 50);
         check(waitFor([&again, &key] { return again.follows(scripthashOf(key, 0, 50)); }, 3000), QStringLiteral("until it is given out: then it goes live at once, past the places for coins"));
+        // A new connection keeps it so.
+        again.dropConnections();
+        check(waitFor([&again, &key] { return !again.follows(scripthashOf(key, 0, 50)); }, 3000), QStringLiteral("the connection goes"));
+        check(waitFor([&again, &key] { return again.follows(scripthashOf(key, 0, 50)); }, 30000), QStringLiteral("and with the next it is followed again"));
         run.scanner.stop();
         wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
     }
-    // More addresses next than places, starting from what was saved: what was given out comes first.
+    // Every place spoken for, starting from what was saved: what was given out comes first.
     {
         wallet::UtxoScanner::setLivePlacesForTest(40);
         wallet::UtxoScanner::setPacesForTest(300, 200, 100);
         wallet::AccountKey key = segwit;
-        key.given.add(70);
+        key.given.add(52); // below the last used, and not paid
+        const auto fundAll = [&key](FakeElectrum& server) {
+            for (quint32 index = 0; index <= 55; index += 5)
+                server.fund(scripthashOf(key, 0, index), 500);
+            server.fund(scripthashOf(key, 1, 0), 100); // so that the change chain's next are known from the start too
+        };
         FakeElectrum server;
-        server.fund(scripthashOf(key, 0, 0), 500);
+        fundAll(server);
         wallet::WalletModel model;
         {
             UtxoRun first(&model, server, key, 100, 5);
@@ -1449,12 +1466,94 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
             first.scanner.stop();
         }
         FakeElectrum again;
-        again.fund(scripthashOf(key, 0, 0), 500);
+        fundAll(again);
         UtxoRun second(&model, again, key, 100, 5);
         check(waitFor([&second] { return second.finished; }, 30000), QStringLiteral("and starts again from what was saved"));
         check(second.scanner.tiers().live == 40, QStringLiteral("with every place taken (%1)").arg(second.scanner.tiers().live));
-        check(again.follows(scripthashOf(key, 0, 70)), QStringLiteral("and the one given out among them, though those before it are also next"));
+        check(again.follows(scripthashOf(key, 0, 52)), QStringLiteral("and the one given out among them"));
         second.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
+    // Rows that got a place while everything fit, or as the next ones, keep to the places for coins.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(600000, 200, 10);
+        wallet::AccountKey key = segwit;
+        FakeElectrum server;
+        for (quint32 index = 0; index <= 76; index += 4)
+            server.fund(scripthashOf(key, 0, index), 100);
+        wallet::WalletModel model;
+        UtxoRun run(&model, server, key, 5, 5);
+        check(waitFor([&run] { return run.finished; }, 30000), QStringLiteral("twenty that hold coins, found as they come"));
+        check(run.scanner.tiers().live == 20, QStringLiteral("ten of them live and the next ones: %1").arg(run.scanner.tiers().live));
+        run.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
+    // What was given out and has been paid holds coins like any other: it takes a place for that.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(600000, 200, 10);
+        wallet::AccountKey key = segwit;
+        for (quint32 index = 0; index < 40; ++index)
+            key.given.add(index);
+        const auto fundAll = [&key](FakeElectrum& server) {
+            for (quint32 index = 0; index < 40; ++index)
+                server.fund(scripthashOf(key, 0, index), 100);
+        };
+        FakeElectrum server;
+        fundAll(server);
+        wallet::WalletModel model;
+        {
+            UtxoRun first(&model, server, key, 5, 5);
+            check(waitFor([&first] { return first.finished; }, 30000), QStringLiteral("forty given out and paid"));
+            first.scanner.stop();
+        }
+        FakeElectrum again;
+        fundAll(again);
+        UtxoRun second(&model, again, key, 5, 5);
+        check(waitFor([&second] { return second.finished; }, 30000), QStringLiteral("from what was saved"));
+        check(second.scanner.tiers().live == 20, QStringLiteral("ten of them live, and the next ones: %1").arg(second.scanner.tiers().live));
+        second.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
+    // Every place taken: one kept for coins gives way to what was given out just now.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(600000, 200, 10);
+        wallet::AccountKey key = segwit;
+        const auto fundAll = [&key](FakeElectrum& server) {
+            for (quint32 index = 0; index <= 220; index += 20)
+                server.fund(scripthashOf(key, 0, index), 100);
+        };
+        FakeElectrum server;
+        fundAll(server);
+        wallet::WalletModel model;
+        UtxoRun run(&model, server, key, 30, 5);
+        check(waitFor([&run] { return run.finished; }, 30000), QStringLiteral("a wallet that fills its places"));
+        check(run.scanner.tiers().live == 40, QStringLiteral("does: %1").arg(run.scanner.tiers().live));
+        check(!server.follows(scripthashOf(key, 0, 110)), QStringLiteral("and an unused one below the last used has none"));
+        key.given.add(110);
+        run.scanner.noteGiven(key, 110);
+        check(waitFor([&server, &key] { return server.follows(scripthashOf(key, 0, 110)); }, 3000), QStringLiteral("until it is given out"));
+        check(run.scanner.tiers().live == 40, QStringLiteral("and the others stay within them: %1").arg(run.scanner.tiers().live));
+        run.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
+    // Given out while its first read waits behind thousands: it does not wait for them.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(600000, 200, 10);
+        wallet::AccountKey key = segwit;
+        FakeElectrum server;
+        wallet::WalletModel model;
+        UtxoRun run(&model, server, key, 3000, 5);
+        check(waitFor([&model, &key] { return model.find(key.wallet, key.network, key.type, 0, 0, 2500) >= 0; }, 15000), QStringLiteral("a window of thousands, read at a pace"));
+        check(!server.follows(scripthashOf(key, 0, 2500)), QStringLiteral("nothing follows one that far along"));
+        key.given.add(2500);
+        run.scanner.noteGiven(key, 2500);
+        check(waitFor([&server, &key] { return server.follows(scripthashOf(key, 0, 2500)); }, 3000), QStringLiteral("given out, it is followed at once"));
+        check(!server.follows(scripthashOf(key, 0, 1000)), QStringLiteral("and what lies before it that nobody was given has no claim on a place for that"));
+        run.scanner.stop();
         wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
     }
     {
@@ -1468,6 +1567,20 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         key.given.add(11);
         run.scanner.noteGiven(key, 11);
         check(waitFor([&model] { return model.size() == 17 && model.checkedCount() == 17; }, 10000), QStringLiteral("given out while it runs, its rows come and are read without waiting for a refresh (%1)").arg(model.size()));
+        run.scanner.stop();
+    }
+    // Given out during a long pass: the rows come when it ends, without waiting for a refresh.
+    {
+        wallet::AccountKey key = account;
+        FakeRpc rpc;
+        rpc.delayMs = 50;
+        wallet::WalletModel model;
+        EvmRun run(&model, {rpc.url()}, key, 1500);
+        check(waitFor([&model] { return model.size() >= 1500; }, 15000), QStringLiteral("a long pass is under way"));
+        check(!run.finished, QStringLiteral("and has not ended"));
+        key.given.add(1600);
+        run.scanner.noteGiven(key, 1600);
+        check(waitFor([&model] { return model.size() == 3101; }, 60000), QStringLiteral("what was given out past it comes, with its gap: %1").arg(model.size()));
         run.scanner.stop();
     }
     // A pass longer than the refresh: what was given out goes ahead of it too, wherever it lies.

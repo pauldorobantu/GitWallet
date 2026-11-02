@@ -444,10 +444,13 @@ void MainWindow::showPage(const QString& name)
 
 void MainWindow::openPage(int pageId)
 {
-    leavePlace();
-    // SideNav::select() only moves the highlight; the page is switched here.
+    if (stack_->currentWidget() == receive_)
+        receive_->leaving();
+    // SideNav::select() only moves the highlight; the page is switched here. The place goes after it: a
+    // page that is no longer on screen has no reason to go over its rows for it now.
     nav_->select(pageId);
     stack_->setCurrentIndex(pageId);
+    leavePlace();
     if (pageId == PageReceive)
         receive_->showFor(0, std::nullopt); // what is next, rather than the one last looked at
 }
@@ -493,8 +496,17 @@ void MainWindow::openRoot(Place::Root root)
     }
 }
 
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    if (stack_->currentWidget() == receive_)
+        receive_->leaving();
+    QWidget::closeEvent(event);
+}
+
 void MainWindow::goTo(Place place, Place::Tab tab)
 {
+    if (stack_->currentWidget() == receive_)
+        receive_->leaving();
     // One wallet: a step through it says nothing.
     const QList<wallet::WalletEntry>& wallets = controller_->store().wallets;
     if (place.asset && place.wallet == 0 && wallets.size() == 1) {

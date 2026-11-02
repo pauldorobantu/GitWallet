@@ -15,9 +15,10 @@ namespace app::ui {
 // The Addresses page: every derived address of every wallet in one table (wallet,
 // chain, type, path, address, balance, USD, state), with a search field, a wallet
 // filter, a chain filter (All / Bitcoin / Ethereum), a state filter (All / Funded
-// / Used), click-to-copy on the address column and a CSV export of what the
-// filters leave. Shows the kit's empty / no-results states. New addresses appear
-// as the scanners add them. A double click opens an address.
+// / Used / Given out) and a CSV export of what the filters leave. Shows the kit's
+// empty / no-results states. New addresses appear as the scanners add them. One
+// click chooses a row and a double click opens it; Copy address or Ctrl+C hands it
+// out, which marks it, so that nothing else may.
 class AddressesPage : public QWidget
 {
     Q_OBJECT
@@ -34,6 +35,8 @@ public:
     // The rows the filters leave, in the table's order, as CSV (UTF-8 with a BOM,
     // for Excel). False + a sentence when the file cannot be written.
     bool exportCsv(const QString& path, QString* error) const;
+    // What Copy address last handed over, for tests.
+    QString lastCopied() const;
 
 signals:
     void openAddressRequested(const wallet::AddressRow& row);
@@ -56,6 +59,7 @@ private:
     void openHistoryOf(const QModelIndex& index);
     void openAddressOf(const QModelIndex& index);
     void editLabelOfSelected();
+    void copySelected();
     void keepTopRow(int first, int last);
     void scheduleUpdate();
     void updateState(); // count, enabled controls, table / empty / no-results

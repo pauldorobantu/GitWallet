@@ -120,7 +120,8 @@ private:
     void growWindows();   // during a pass, the same way
     void nextChunk();
     void queueHotRound(); // the next unused addresses and the funded ones, ahead of a long pass
-    bool hotRow(const AccountState& account, const AddressRow& row) const;
+    qint64 hotEnd(const AccountState& account) const; // the last of the next unused ones, past what was given out among them
+    bool hotRow(const AccountState& account, const AddressRow& row, qint64 end) const;
     void sendNonces();
     void onNonces(const QList<quint64>& nonces, const QList<bool>& ok, const QList<Issue>& issues);
     void sendBalances();

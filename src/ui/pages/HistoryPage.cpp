@@ -139,6 +139,7 @@ struct HistoryPage::Ui : QObject
     QString scripthash;
     QString address;
     bool inPlace = false;
+    bool wholeOwed = false; // the place has been left, and the rest comes back when the page next shows
 
     // Where the reader was, across a change of the list.
     wallet::HistoryBook* topBook = nullptr;
@@ -341,6 +342,7 @@ HistoryTableModel* HistoryPage::tableModel() const
 void HistoryPage::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
+    becomeWhole();
     ui_->model->setWatched(true);
     ui_->periodAgain->start();
     if (periodMoved())
@@ -377,12 +379,12 @@ void HistoryPage::rebuildWalletFilter()
     {
         const QSignalBlocker quiet(ui_->wallet);
         ui_->wallet->clear();
-        ui_->wallet->addItem(QStringLiteral("All wallets"), quint32(0));
+        // A name is what someone called it, so the language walk leaves this combo alone.
+        ui_->wallet->addItem(trText(QStringLiteral("All wallets")), quint32(0));
         for (const wallet::WalletEntry& w : wallets)
             ui_->wallet->addItem(w.label, w.id);
         const int keep = ui_->wallet->findData(chosen);
         ui_->wallet->setCurrentIndex(keep >= 0 ? keep : 0);
-        ui_->wallet->setProperty("i18nOrig_items", QVariant());
     }
     ui_->wallet->setVisible(wallets.size() > 1 && !ui_->inPlace);
     if (!ui_->inPlace)
@@ -432,6 +434,7 @@ void HistoryPage::showWallet(quint32 id)
 void HistoryPage::showPlace(quint32 wallet, std::optional<wallet::Network> network, const QString& scripthash, const QString& address)
 {
     ui_->inPlace = true;
+    ui_->wholeOwed = false;
     ui_->network = network;
     ui_->scripthash = scripthash;
     ui_->address = address;
@@ -451,6 +454,17 @@ void HistoryPage::clearPlace()
     if (!ui_->inPlace)
         return;
     ui_->inPlace = false;
+    // Only once it shows again: leaving for another page has no business going over every line.
+    ui_->wholeOwed = true;
+    if (isVisible())
+        becomeWhole();
+}
+
+void HistoryPage::becomeWhole()
+{
+    if (!ui_->wholeOwed)
+        return;
+    ui_->wholeOwed = false;
     showAll();
     rebuildWalletFilter();
 }
@@ -564,7 +578,7 @@ void HistoryPage::updateState()
     // A key on a network with no history yet has transactions nobody here has read.
     QStringList unread;
     if (hasWallet) {
-        const quint32 scope = ui_->inPlace ? ui_->model->filter().wallet : 0;
+        const quint32 scope = ui_->model->filter().wallet;
         for (const wallet::NetworkInfo& network : wallet::networks()) {
             if (controller_->historyOf(network.network) || (ui_->network && *ui_->network != network.network))
                 continue;
@@ -597,7 +611,7 @@ void HistoryPage::updateState()
     // Only a network with no book in what the place covers: nothing below could say anything of it.
     bool anyBook = false;
     if (hasWallet) {
-        const quint32 scope = ui_->inPlace ? ui_->model->filter().wallet : 0;
+        const quint32 scope = ui_->model->filter().wallet;
         for (const wallet::UtxoHistory* history : controller_->histories()) {
             if (ui_->network && history->network() != *ui_->network)
                 continue;
@@ -607,7 +621,7 @@ void HistoryPage::updateState()
             }
         }
     }
-    const bool notRead = ui_->inPlace && hasWallet && !anyBook && !unread.isEmpty();
+    const bool notRead = hasWallet && !anyBook && !unread.isEmpty();
     ui_->notRead->setVisible(notRead);
     for (QWidget* control : std::initializer_list<QWidget*>{ui_->search, ui_->type, ui_->state, ui_->period, ui_->count})
         control->setVisible(!notRead && (control != ui_->count || hasWallet));

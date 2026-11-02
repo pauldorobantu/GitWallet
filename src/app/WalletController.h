@@ -185,17 +185,25 @@ public:
     // it only says which index is next, and if it says another address for that index, none is offered.
     wallet::ReceiveOffer nextReceive(quint32 wallet, wallet::Network network, chain::ScriptType type) const;
     // That address left this PC's screen for someone who is to pay: it is not offered again, and it is
-    // followed ahead of others until it is paid. Only a receive address of one of those keys with no
-    // history counts: others are no one's to be given. It holds for this session in any case; false +
-    // why when it cannot be written down, and then that is tried again until it is.
+    // followed ahead of others until it is paid. Only a receive address with no history counts, of any
+    // account of the wallet's: a change address is no one's to be given. It holds for this session in
+    // any case; false + why when it cannot be written down, and then that is tried again until it is.
     bool markGivenOut(const wallet::AddressRow& row, QString* error);
     bool isGivenOut(const wallet::AddressRow& row) const;
-    // Positions in the model of what was given out on that key, the latest first, at most `limit`.
+    // Positions in the model of what was given out on that kind of key, the latest first, at most `limit`.
     QList<int> givenOutRows(quint32 wallet, wallet::Network network, chain::ScriptType type, int limit) const;
+    int givenOutCount(quint32 wallet, wallet::Network network, chain::ScriptType type) const; // all of those
     // Addresses given out with nothing come in yet, of one wallet or all: removed, they would be
     // offered again if the seed comes back.
     int givenOutWaiting(quint32 wallet = 0) const;
     bool givenOutOwed() const { return givenOwed_; } // what was given out has yet to reach the file
+    // The screens are tried with no server: what a network's status then says, as a test wants it.
+    void setStatusForTest(const std::function<void(wallet::NetworkStatus&)>& adjust) { statusForTest_ = adjust; }
+    void setShowingSavedForTest(bool saved) { showingSaved_ = saved; }
+    // What is not plain about one asset's price; empty: nothing.
+    QString priceNote(wallet::Asset asset) const;
+    // Addresses whose transactions do not add up to their balance, when that is what stands out now.
+    int balancesInDoubt() const;
 
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
@@ -205,6 +213,7 @@ signals:
     void walletChanged();  // loaded / imported / removed
     void statusChanged();  // statusText() or any of the scan states above changed
     void givenOutChanged(); // an address was given out
+    void rowGivenOut(int row); // which, in the model
     void historyProgress(); // how far a history has got moved
     void labelsChanged();  // an address's label
     void totalsChanged();  // balances or prices changed
@@ -217,6 +226,7 @@ signals:
 private:
     // --- implementation (WalletController.cpp may add private members) ---
     const wallet::AccountKey* receiveKey(quint32 wallet, wallet::Network network, chain::ScriptType type) const; // the one Receive goes by
+    const wallet::AccountKey* keyOf(const wallet::AddressRow& row) const; // the one that row comes from
     bool saveGivenOut(QString* why);
     // What statusText() leads with, the most pressing first.
     enum class Status {
@@ -284,6 +294,7 @@ private:
     QTimer* timesTimer_ = nullptr;
     QTimer* ledgerRetry_ = nullptr; // the data folder is held: asks again until it is free
     int ledgerRetries_ = 0;
+    std::function<void(wallet::NetworkStatus&)> statusForTest_;
     QTimer* givenRetry_ = nullptr;  // what was given out did not reach the file: asks again until it does
     bool givenOwed_ = false;
     int rowsBeforeLedger_ = 0;      // rows with an answer in the model when the database was opened

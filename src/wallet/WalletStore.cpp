@@ -447,6 +447,15 @@ bool readAccounts(const QJsonValue& value, quint32 wallet, bool keepUnknown, QLi
                 k.given.runs.append(run);
                 last = run.to;
             }
+        } else if (o.contains(QStringLiteral("issued"))) {
+            // Two builds wrote format 3 with one stretch. It may take in some that were passed over as used,
+            // which is no harm: only what has no history counts as waiting.
+            GivenOut::Run run;
+            if (!readAccountIndex(o.value(QStringLiteral("issued")), &run.to)
+                || (o.contains(QStringLiteral("issuedFrom")) && !readAccountIndex(o.value(QStringLiteral("issuedFrom")), &run.from)) || run.from > run.to)
+                return fail(why, QStringLiteral("an account has an invalid number"));
+            if (run.from < run.to)
+                k.given.runs.append(run);
         }
         out->append(k);
     }

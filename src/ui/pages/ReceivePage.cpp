@@ -26,6 +26,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSignalBlocker>
@@ -48,6 +49,17 @@ constexpr int kUpdateMs = 400;    // a scan signals per address
 constexpr int kLabelChars = 1024; // as the Addresses page takes them
 
 enum ListColumn { ListAddress, ListLabel, ListPath, ListBalance, ListUsd, ListState, ListColumns };
+constexpr int kAccountRole = Qt::UserRole + 1; // of a line of the list; UserRole has its index
+
+// To a button the second press of a double click is a press like any other: each would give out an address.
+class SingleClickButton : public QPushButton
+{
+public:
+    using QPushButton::QPushButton;
+
+protected:
+    void mouseDoubleClickEvent(QMouseEvent* event) override { event->accept(); }
+};
 
 QString typeName(chain::ScriptType type)
 {
@@ -105,6 +117,7 @@ struct ReceivePage::Ui : QObject
     QLabel* mark = nullptr;
     QLabel* addressLine = nullptr;
     QLabel* state = nullptr;
+    QLabel* notCounted = nullptr;
     QLabel* only = nullptr;
     QLabel* status = nullptr;
     QLabel* owed = nullptr;
@@ -194,7 +207,6 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     ui_->addressLine = new QLabel(card);
     ui_->addressLine->setObjectName(QStringLiteral("receiveAddress"));
     ui_->addressLine->setTextFormat(Qt::PlainText);
-    ui_->addressLine->setTextInteractionFlags(Qt::TextSelectableByMouse);
     ui_->addressLine->setWordWrap(true);
     addressRow->addWidget(ui_->addressLine, 1);
     right->addLayout(addressRow);
@@ -204,6 +216,13 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     ui_->state->setTextFormat(Qt::PlainText);
     ui_->state->setWordWrap(true);
     right->addWidget(ui_->state);
+    ui_->notCounted = new QLabel(QStringLiteral("A scan cannot be seen from here: once it has been scanned, press New address, so that it is not offered again."), card);
+    ui_->notCounted->setObjectName(QStringLiteral("receiveNotCounted"));
+    ui_->notCounted->setTextFormat(Qt::PlainText);
+    ui_->notCounted->setWordWrap(true);
+    setTone(ui_->notCounted, Tone::Muted);
+    ui_->notCounted->hide();
+    right->addWidget(ui_->notCounted);
     ui_->only = new QLabel(card);
     ui_->only->setTextFormat(Qt::PlainText);
     ui_->only->setWordWrap(true);
@@ -228,7 +247,7 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     buttons->addStretch(1);
     ui_->save = new QPushButton(QStringLiteral("Save QR"), card);
     ui_->copy = new QPushButton(QStringLiteral("Copy address"), card);
-    ui_->next = new QPushButton(QStringLiteral("New address"), card);
+    ui_->next = new SingleClickButton(QStringLiteral("New address"), card);
     ui_->next->setObjectName(QStringLiteral("primaryButton"));
     ui_->next->setToolTip(trText(QStringLiteral("This one counts as given out, and the next unused one comes up")));
     buttons->addWidget(ui_->save);
@@ -309,12 +328,10 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     const auto rowOfCell = [this](int row) {
         // By what tells it apart, and only if that is still what the line says: rows move.
         const QTableWidgetItem* cell = ui_->list->item(row, ListAddress);
-        const QList<wallet::AccountKey> keys = ui_->coin->count() > 0 ? controller_->receiveKeys(ui_->wallet->currentData().toUInt(), chosenNetwork()) : QList<wallet::AccountKey>();
-        const auto key = std::find_if(keys.cbegin(), keys.cend(), [this](const wallet::AccountKey& k) { return k.type == chosenType(); });
-        if (!cell || key == keys.cend())
+        if (!cell || ui_->coin->count() == 0)
             return -1;
         const wallet::WalletModel* model = controller_->model();
-        const int position = model->find(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType(), key->account, 0, cell->data(Qt::UserRole).toUInt());
+        const int position = model->find(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType(), cell->data(kAccountRole).toUInt(), 0, cell->data(Qt::UserRole).toUInt());
         return position >= 0 && model->at(position).address == cell->text() ? position : -1;
     };
     connect(list, &QTableWidget::cellClicked, this, [this, rowOfCell](int row, int) {
@@ -452,11 +469,28 @@ void ReceivePage::chosenChanged()
     updateList();
 }
 
+void ReceivePage::leaving()
+{
+    if (ui_->address.isEmpty())
+        return;
+    if ((ui_->labelTyped && !ui_->label->text().trimmed().isEmpty()) || payload() != ui_->address)
+        giveOut();
+    else
+        keepLabel(); // one taken off
+}
+
 void ReceivePage::showFor(quint32 walletId, std::optional<wallet::Asset> asset)
 {
     {
         const QSignalBlocker quiet(ui_->wallet);
-        const int index = walletId != 0 ? ui_->wallet->findData(walletId) : -1;
+        int index = walletId != 0 ? ui_->wallet->findData(walletId) : -1;
+        // Asked for a coin the wallet on screen has no key for: the first that has one, not another coin.
+        if (walletId == 0 && asset && controller_ && controller_->receiveKeys(ui_->wallet->currentData().toUInt(), wallet::assetInfo(*asset).network).isEmpty()) {
+            for (int i = 0; i < ui_->wallet->count() && index < 0; ++i) {
+                if (!controller_->receiveKeys(ui_->wallet->itemData(i).toUInt(), wallet::assetInfo(*asset).network).isEmpty())
+                    index = i;
+            }
+        }
         if (index >= 0)
             ui_->wallet->setCurrentIndex(index);
     }
@@ -542,13 +576,30 @@ void ReceivePage::offerNext()
         const wallet::WalletModel* model = controller_->model();
         ui_->row = model->at(model->find(walletId, chosenNetwork(), chosenType(), next.account, 0, next.index));
     }
-    // What was typed is for the payment, so it goes along if the address moves on by itself.
+    // What was typed is for the payment, so it goes along if the address moves on by itself. Not over a
+    // label the next one already has: that stands, and it says what became of what was typed.
     if (next.address != ui_->address) {
+        const QString typed = ui_->label->text().trimmed();
+        const QString own = controller_->addressLabel(next.address);
         ui_->address = next.address;
         ui_->labelProblem.clear();
+        if (ui_->labelTyped && !own.isEmpty() && own != typed) {
+            ui_->labelTyped = false;
+            if (!typed.isEmpty())
+                ui_->labelProblem = trText(QStringLiteral("The address moved on, and this one has a label of its own, so what was typed was not kept."));
+        }
         loadLabel();
     }
     updateShown();
+}
+
+bool ReceivePage::notCurrent(wallet::Network network, QString* since) const
+{
+    const wallet::NetworkStatus status = controller_->networkStatus(network);
+    if (!status.connecting && !status.failing && !status.wrongChain)
+        return false;
+    *since = status.balancesAt.isValid() ? status.balancesAt.toLocalTime().toString(QStringLiteral("d MMM HH:mm")) : QString();
+    return true;
 }
 
 int ReceivePage::shownPosition() const
@@ -621,6 +672,7 @@ void ReceivePage::updateShown()
         problem = trText(QStringLiteral("That amount cannot go into the QR code: write it like 0.015"));
     setStatus(ui_->status, problem, Tone::Warning);
     setStatus(ui_->owed, controller_ && controller_->givenOutOwed() ? trText(QStringLiteral("An address given out could not be written down yet, so another start may offer it again. This is tried again every half a minute.")) : QString(), Tone::Warning);
+    ui_->notCounted->hide();
 
     switch (ui_->offerState) {
     case wallet::ReceiveOffer::State::Checking:
@@ -643,6 +695,9 @@ void ReceivePage::updateShown()
     if (at >= 0) {
         const wallet::AddressRow& row = controller_->model()->at(at);
         const bool given = controller_->isGivenOut(row);
+        const bool saved = controller_->showingSaved();
+        QString since;
+        const bool stale = notCurrent(row.network, &since);
         const auto say = [&line](const QString& what) { line += QStringLiteral(" · ") + what; };
         if (row.state() == wallet::AddressState::Funded) {
             QStringList held;
@@ -651,19 +706,53 @@ void ReceivePage::updateShown()
                 const QString amountText = figures::formatAmount(value, info) + QLatin1Char(' ') + info.symbol;
                 held << (row.checked ? amountText : figures::atLeast(amountText));
             });
-            say(trText(QStringLiteral("Holds %1")).arg(held.join(QStringLiteral(", "))));
-            tone = Tone::Success;
+            const QString all = held.join(QStringLiteral(", "));
+            if (saved) {
+                say(trText(QStringLiteral("Held %1 as far as was saved, being checked")).arg(all));
+            } else if (stale) {
+                say(since.isEmpty() ? trText(QStringLiteral("Held %1 when last read; no server is answering now")).arg(all)
+                                    : trText(QStringLiteral("Held %1 as of %2; no server is answering now")).arg(all, since));
+                tone = Tone::Warning;
+            } else if (row.isUtxo() && row.unconfirmed > 0) {
+                const wallet::AssetInfo& coin = wallet::assetInfo(wallet::networkInfo(row.network).coin);
+                say(trText(QStringLiteral("Holds %1, of which %2 is not in a block yet")).arg(all, figures::formatAmount(chain::Amount::fromU64(quint64(row.unconfirmed)), coin) + QLatin1Char(' ') + coin.symbol));
+                tone = Tone::Warning;
+            } else {
+                say(trText(QStringLiteral("Holds %1")).arg(all));
+                tone = Tone::Success;
+            }
         } else if (row.used) {
-            say(row.checked ? trText(QStringLiteral("Has been used, and holds nothing now")) : trText(QStringLiteral("Has been used; what it holds is being read")));
-            tone = row.checked ? Tone::Muted : Tone::Accent;
+            if (!row.checked) {
+                say(trText(QStringLiteral("Has been used; what it holds is being read")));
+                tone = Tone::Accent;
+            } else if (saved) {
+                say(trText(QStringLiteral("Had been used, and held nothing as far as was saved, being checked")));
+            } else if (stale) {
+                say(since.isEmpty() ? trText(QStringLiteral("Had been used, and held nothing when last read; no server is answering now"))
+                                    : trText(QStringLiteral("Had been used, and held nothing as of %1; no server is answering now")).arg(since));
+                tone = Tone::Warning;
+            } else {
+                say(trText(QStringLiteral("Has been used, and holds nothing now")));
+            }
         } else if (!row.checked) {
             say(given ? trText(QStringLiteral("Given out; no server has answered for it yet")) : trText(QStringLiteral("No server has answered for it yet")));
-        } else if (controller_->showingSaved()) {
+        } else if (saved) {
             say(given ? trText(QStringLiteral("Given out; nothing had come in as far as was saved, being checked")) : trText(QStringLiteral("Unused as far as was saved, being checked")));
+        } else if (stale) {
+            if (given) {
+                say(since.isEmpty() ? trText(QStringLiteral("Given out; no server is answering now, so nothing can be said of it"))
+                                    : trText(QStringLiteral("Given out; nothing had come in as of %1, and no server is answering now")).arg(since));
+            } else {
+                say(since.isEmpty() ? trText(QStringLiteral("No server is answering now, so nothing can be said of it"))
+                                    : trText(QStringLiteral("Unused as of %1; no server is answering now")).arg(since));
+            }
+            tone = Tone::Warning;
         } else {
             say(given ? trText(QStringLiteral("Given out, nothing has come in yet")) : trText(QStringLiteral("Unused")));
             tone = given ? Tone::Accent : Tone::Muted;
         }
+        // Nobody knows if a code on the screen has been read: only the one who saw it can say.
+        ui_->notCounted->setVisible(ready && !given && !row.used && row.change == 0 && row.state() != wallet::AddressState::Funded);
     }
     setStatus(ui_->state, line, tone);
 }
@@ -681,6 +770,12 @@ void ReceivePage::updateList()
     const QList<int> rows = controller_->givenOutRows(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType(), kListedRows);
     ui_->list->setVisible(!rows.isEmpty());
     ui_->listTitle->setVisible(!rows.isEmpty());
+    const int givenAll = controller_->givenOutCount(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType());
+    ui_->listTitle->setText(givenAll > rows.size() ? trText(QStringLiteral("Given out: the latest %1 of %2")).arg(figures::formatCount(int(rows.size())), figures::formatCount(givenAll))
+                                                   : trText(QStringLiteral("Given out")));
+    const bool saved = controller_->showingSaved();
+    QString since;
+    const bool stale = notCurrent(chosenNetwork(), &since);
     ui_->filler->setVisible(rows.isEmpty());
     ui_->list->setRowCount(int(rows.size()));
     for (int i = 0; i < rows.size(); ++i) {
@@ -696,7 +791,9 @@ void ReceivePage::updateList()
             cell->setTextAlignment(alignment);
             return cell;
         };
-        put(ListAddress, row.address)->setData(Qt::UserRole, row.index);
+        QTableWidgetItem* addressCell = put(ListAddress, row.address);
+        addressCell->setData(Qt::UserRole, row.index);
+        addressCell->setData(kAccountRole, row.account);
         put(ListLabel, controller_->addressLabel(row.address));
         put(ListPath, row.path());
         QStringList held;
@@ -705,7 +802,8 @@ void ReceivePage::updateList()
         try {
             row.forEachBalance([&](wallet::Asset asset, const chain::Amount& value) {
                 const wallet::AssetInfo& info = wallet::assetInfo(asset);
-                held << figures::formatAmount(value, info) + QLatin1Char(' ') + info.symbol;
+                const QString amountText = figures::formatAmount(value, info) + QLatin1Char(' ') + info.symbol;
+                held << (row.checked ? amountText : figures::atLeast(amountText));
                 const double price = controller_->prices()->usd(asset);
                 priced = priced && price > 0.0;
                 usd += value.toDouble(info.decimals) * price;
@@ -714,15 +812,23 @@ void ReceivePage::updateList()
             priced = false;
         }
         const Qt::Alignment numbers = Qt::AlignRight | Qt::AlignVCenter;
-        put(ListBalance, held.isEmpty() ? (row.checked ? QStringLiteral("0") : figures::dash()) : held.join(QStringLiteral(" · ")), numbers);
-        put(ListUsd, row.checked && priced ? figures::formatUsd(usd) : figures::dash(), numbers);
+        // A zero that no server stands behind now is no zero.
+        const bool sureOfZero = row.checked && !saved && !stale;
+        put(ListBalance, held.isEmpty() ? (sureOfZero ? QStringLiteral("0") : figures::dash()) : held.join(QStringLiteral(" · ")), numbers);
+        put(ListUsd, row.checked && priced && (!held.isEmpty() || sureOfZero) ? figures::formatUsd(usd) : figures::dash(), numbers);
         // No more than is known of it: a figure that was only saved says so.
         QString state;
         Tone tone = Tone::Muted;
         if (!row.checked) {
             state = trText(QStringLiteral("Checking…"));
-        } else if (controller_->showingSaved()) {
+        } else if (saved) {
             state = trText(QStringLiteral("Saved, being checked"));
+        } else if (stale) {
+            state = since.isEmpty() ? trText(QStringLiteral("No server answering")) : trText(QStringLiteral("As of %1")).arg(since);
+            tone = Tone::Warning;
+        } else if (row.isUtxo() && row.unconfirmed > 0) {
+            state = trText(QStringLiteral("Not in a block yet"));
+            tone = Tone::Warning;
         } else if (row.state() == wallet::AddressState::Funded) {
             state = trText(QStringLiteral("Received"));
             tone = Tone::Success;
@@ -761,11 +867,10 @@ bool ReceivePage::giveOut()
         return true;
     const bool labelled = keepLabel();
     // As it stands now: one that has had a payment meanwhile has no need of a mark.
+    // One whose row went meanwhile counts too: that brings its row back, and a scan with it.
     const int at = shownPosition();
-    if (at >= 0) {
-        QString error;
-        controller_->markGivenOut(controller_->model()->at(at), &error); // what fails stays on screen, and is tried again
-    }
+    QString error;
+    controller_->markGivenOut(at >= 0 ? controller_->model()->at(at) : ui_->row, &error); // what fails stays on screen, and is tried again
     ui_->held = true;
     updateShown();
     updateList();

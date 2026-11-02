@@ -1,6 +1,9 @@
 #include "ui/TableUtil.h"
+#include "app/WalletController.h"
 #include "ui/PageKit.h"
 #include "ui/Feedback.h"
+#include "ui/LanguageManager.h"
+#include "wallet/Types.h"
 
 #include <QAbstractItemModel>
 #include <QAbstractItemView>
@@ -62,6 +65,38 @@ void copyTextToClipboard(QWidget* host, const QString& text, const QString& labe
     Feedback::show(host ? host->window() : nullptr, Feedback::Type::Success,
                 label.isEmpty() ? QStringLiteral("Copied: %1").arg(shown)
                                 : QStringLiteral("%1: %2").arg(label, shown));
+}
+
+QString handOutNote(const WalletController* controller, const wallet::AddressRow& row)
+{
+    if (row.used || row.state() == wallet::AddressState::Funded)
+        return trText(QStringLiteral("Copied, but it has been used before"));
+    if (controller && controller->isGivenOut(row))
+        return trText(QStringLiteral("Copied, but it was given out before, and nothing has come in yet"));
+    if (!row.checked)
+        return trText(QStringLiteral("Copied, but no server has answered for it yet: it may have been used"));
+    if (row.change != 0)
+        return trText(QStringLiteral("Copied. A change address is not kept as given out"));
+    return QString();
+}
+
+bool copyAddress(QWidget* host, WalletController* controller, const wallet::AddressRow& row)
+{
+    if (!controller)
+        return false;
+    const QString address = controller->checkedAddress(row);
+    if (address.isEmpty()) {
+        Feedback::show(host, Feedback::Type::Error, trText(QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.")));
+        return false;
+    }
+    // As it stood before this: a second payer on one address is what a reader can still stop.
+    const QString note = handOutNote(controller, row);
+    QString error;
+    controller->markGivenOut(row, &error); // what fails is said on its own, and tried again
+    copyTextToClipboard(host, address, trText(QStringLiteral("Address copied")));
+    if (!note.isEmpty())
+        Feedback::show(host, Feedback::Type::Warning, note);
+    return true;
 }
 
 namespace {

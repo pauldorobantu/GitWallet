@@ -409,6 +409,9 @@ void PortfolioPage::refreshView()
         caption << staleCaptions;
     else if (caption.isEmpty() && anyScanning)
         caption << trText(QStringLiteral("Still scanning"));
+    const int inDoubt = controller_->balancesInDoubt();
+    if (inDoubt > 0)
+        caption << trText(QStringLiteral("%1 do not add up to their transactions")).arg(formatCount(inDoubt));
     caption << controller_->pricesLine();
     pricesLabel_->setText(caption.join(QStringLiteral(" · ")));
 
@@ -436,6 +439,8 @@ void PortfolioPage::refreshView()
                 Tone::Accent);
     else if (anyIncomplete)
         setChip(scanLabel_, trText(QStringLiteral("Incomplete")), Tone::Warning);
+    else if (inDoubt > 0)
+        setChip(scanLabel_, trText(QStringLiteral("Balances in doubt")), Tone::Warning);
     else
         setChip(scanLabel_, trText(QStringLiteral("Up to date")), Tone::Success);
     const int derived = model ? model->size() : 0;
@@ -449,13 +454,15 @@ void PortfolioPage::refreshView()
                                : trText(QStringLiteral("%1 of %2"))
                                      .arg(formatCount(checked), formatCount(derived)));
     usedLabel_->setText(formatCount(model ? model->usedCount() : 0));
-    fundedLabel_->setText(formatCount(model ? model->fundedCount() : 0));
+    const bool allAnswered = derived > 0 && checked >= derived;
+    fundedLabel_->setText(figures::countSoFar(model ? model->fundedCount() : 0, allAnswered));
     const QList<wallet::NetworkInfo>& networkList = wallet::networks();
     for (qsizetype i = 0; i < networkList.size() && i < serverLabels_.size(); ++i)
         setServer(serverLabels_.at(i), states[networkList.at(i).network]);
 
-    countLabel_->setText(trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
-                             .arg(formatCount(walletCount), formatCount(model ? model->fundedCount() : 0), formatCount(derived)));
+    countLabel_->setText(derived == 0 ? trText(QStringLiteral("%1 wallets")).arg(formatCount(walletCount))
+                                      : trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
+                                            .arg(formatCount(walletCount), figures::countSoFar(model ? model->fundedCount() : 0, allAnswered), formatCount(derived)));
 }
 
 } // namespace app::ui

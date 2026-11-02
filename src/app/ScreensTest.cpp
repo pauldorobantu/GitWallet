@@ -6,10 +6,12 @@
 #include "net/PriceFeed.h"
 #include "ui/HistoryTableModel.h"
 #include "ui/Holdings.h"
+#include "ui/LanguageManager.h"
 #include "ui/MainWindow.h"
 #include "ui/AddressTableModel.h"
 #include "ui/PlaceBar.h"
 #include "ui/QrCode.h"
+#include "ui/TableUtil.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
 #include "ui/pages/HoldingsPage.h"
@@ -32,6 +34,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
@@ -561,6 +564,33 @@ void testGivenOutFile(const Check& check, const QList<wallet::AccountKey>& keys)
         wallet::WalletStore store;
         check(store.load(&error) && store.wallets.first().keptAccounts.size() == 1 && store.olderFormat() == 3, QStringLiteral("opens as older, with the key it does not know kept: %1").arg(error));
     }
+    // Two builds of that format wrote one stretch: what they gave out is still given out.
+    {
+        const auto writeIssued = [&](const QJsonValue& issued, const QJsonValue& from) {
+            QJsonObject account{{QStringLiteral("type"), QStringLiteral("p2wpkh")}, {QStringLiteral("network"), QStringLiteral("bitcoin")}, {QStringLiteral("account"), 0}, {QStringLiteral("xpub"), keys.first().xpub}, {QStringLiteral("issued"), issued}};
+            if (!from.isNull())
+                account.insert(QStringLiteral("issuedFrom"), from);
+            const QJsonObject root{{QStringLiteral("format"), QStringLiteral("gitwallet")},
+                                   {QStringLiteral("version"), 3},
+                                   {QStringLiteral("nextWalletId"), 2},
+                                   {QStringLiteral("wallets"), QJsonArray{QJsonObject{{QStringLiteral("id"), 1}, {QStringLiteral("label"), QStringLiteral("Tills")}, {QStringLiteral("accounts"), QJsonArray{account}}}}},
+                                   {QStringLiteral("settings"), QJsonObject{}}};
+            return wallet::WalletStore::writeRawForTest(QJsonDocument(root).toJson(QJsonDocument::Compact), &error);
+        };
+        check(writeIssued(400, 2), QStringLiteral("a file with what was given out as one stretch"));
+        wallet::WalletStore store;
+        check(store.load(&error) && store.wallets.first().accounts.first().given.contains(2) && store.wallets.first().accounts.first().given.contains(399) && !store.wallets.first().accounts.first().given.contains(1) && store.wallets.first().accounts.first().given.end() == 400,
+              QStringLiteral("loses none of it: %1").arg(error));
+        check(store.save(&error), QStringLiteral("and is written again"));
+        wallet::WalletStore again;
+        check(again.load(&error) && again.olderFormat() == 0 && again.wallets.first().accounts.first().given.end() == 400, QStringLiteral("in the new format, the same"));
+        writeIssued(0, QJsonValue());
+        wallet::WalletStore none;
+        check(none.load(&error) && none.wallets.first().accounts.first().given.isEmpty(), QStringLiteral("none given out is none"));
+        writeIssued(4, 9);
+        wallet::WalletStore bad;
+        check(!bad.load(&error), QStringLiteral("and a stretch that ends before it begins is damage"));
+    }
     QFile::remove(wallet::WalletStore::filePath());
 }
 
@@ -880,12 +910,34 @@ void testFiguresHonest(const Check& check, const QList<wallet::AccountKey>& keys
         check(total->text() == QStringLiteral("—"), QStringLiteral("but no sum that would leave the other out (%1)").arg(total->text()));
         check(cellOf(coins, etherRow(), QStringLiteral("Value")) == QStringLiteral("—"), QStringLiteral("and the other says nothing of its worth"));
         check(cellOf(coins, bitcoinRow(), QStringLiteral("Share")) == QStringLiteral("—") && portfolio->table()->parts().isEmpty(), QStringLiteral("and no share, nor a bar, of what is not known"));
+        const auto allocation = [&]() -> ui::AllocationBar* {
+            for (QWidget* each : portfolio->findChildren<QWidget*>()) {
+                if (auto* bar = dynamic_cast<ui::AllocationBar*>(each))
+                    return bar;
+            }
+            return nullptr;
+        };
+        check(!allocation()->isVisible(), QStringLiteral("and the bar on the page is gone"));
+        {
+            bool says = false;
+            for (const QLabel* label : portfolio->findChildren<QLabel*>())
+                says = says || (label->isVisible() && label->text().contains(QLatin1String("no price for ETH")));
+            check(says, QStringLiteral("and it says which has no price"));
+        }
         // Every price.
         setPrices(controller);
         controller->refresh();
         check(waitFor([&] { return total->text() == QStringLiteral("$102,000.00"); }, 3000), QStringLiteral("with all of them the sum is whole (%1)").arg(total->text()));
         pause(350);
         check(cellOf(coins, bitcoinRow(), QStringLiteral("Share")) == QStringLiteral("98.0%") && !portfolio->table()->parts().isEmpty(), QStringLiteral("with its shares and bar"));
+        check(allocation()->isVisible() && allocation()->parts().size() == 2, QStringLiteral("and the bar on the page shows both"));
+        // What holds something is no 0.0%, however small beside the rest.
+        row = model->at(model->find(shop, ethereum, chain::ScriptType::EthAccount, 0, 0, 0));
+        row.setBalance(eth, chain::Amount::fromU64(10000000000000ULL));
+        model->upsert(row);
+        check(waitFor([&] { return cellOf(coins, etherRow(), QStringLiteral("Share")) == QStringLiteral("<0.1%"); }, 3000), QStringLiteral("a share too small to read says so: %1").arg(cellOf(coins, etherRow(), QStringLiteral("Share"))));
+        row.setBalance(eth, chain::Amount::fromU64(1000000000000000000ULL));
+        model->upsert(row);
 
         // A wallet with only an Ethereum key: its history says it is not read.
         const QList<wallet::AccountKey> second = wallet::WalletStore::deriveAccounts(chain::bip39::split("legal winner thank year wave sausage worth useful legal winner thank yellow"), {});
@@ -919,6 +971,17 @@ void testFiguresHonest(const Check& check, const QList<wallet::AccountKey>& keys
         window.showPage(QStringLiteral("history"));
         pause(300);
         check(!saysNotRead(), QStringLiteral("and all of it shows its list"));
+        {
+            // Chosen there, the same wallet says the same.
+            auto* combo = history->findChild<QComboBox*>(QStringLiteral("historyWallet"));
+            combo->setCurrentIndex(combo->findData(etherOnly));
+            pause(300);
+            check(saysNotRead(), QStringLiteral("and choosing that wallet there says it is not read, rather than no results"));
+            check(combo->isVisible(), QStringLiteral("with the way back to the others still there"));
+            combo->setCurrentIndex(0);
+            pause(300);
+            check(!saysNotRead(), QStringLiteral("and the others read as before"));
+        }
         check(controller->removeAllWallets(&error), QStringLiteral("they go: %1").arg(error));
     }
     pause(100);
@@ -956,6 +1019,21 @@ void testFiguresHonest(const Check& check, const QList<wallet::AccountKey>& keys
         const ui::Holding its = ui::holdingOf(controller.get(), btc, newer);
         check(!its.complete && its.unread, QStringLiteral("nor that of the wallet with that key"));
         check(ui::holdingNote(controller.get(), its).contains(QLatin1String("cannot read")), QStringLiteral("which says why: %1").arg(ui::holdingNote(controller.get(), its)));
+        controller.reset();
+        // All of that wallet's keys are of that kind.
+        {
+            wallet::WalletStore store;
+            check(store.load(&error), QStringLiteral("the file reads again: %1").arg(error));
+            store.wallets[1].accounts.clear();
+            check(store.save(&error), QStringLiteral("and takes a wallet of nothing but that: %1").arg(error));
+        }
+        controller = std::make_unique<WalletController>();
+        controller->prices()->useTestServer(QStringLiteral("http://127.0.0.1:1"));
+        check(controller->loadExisting(&error), QStringLiteral("it opens: %1").arg(error));
+        const ui::Holding unreadOnly = ui::holdingOf(controller.get(), btc, newer);
+        check(!unreadOnly.watched && unreadOnly.unread && ui::holdingNote(controller.get(), unreadOnly).contains(QLatin1String("cannot read")), QStringLiteral("it does not say it has no key: %1").arg(ui::holdingNote(controller.get(), unreadOnly)));
+        check(!ui::totalOf(controller.get(), newer).complete, QStringLiteral("and its total is not whole"));
+        waitFor([&] { return !controller->loadingSaved(); }, 15000);
         check(controller->removeAllWallets(&error), QStringLiteral("they go: %1").arg(error));
     }
 }
@@ -968,6 +1046,8 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
     window.resize(1280, 800); // the least the window goes to, on any screen with room for it
     WalletController* controller = window.controller();
     offline(controller);
+    // As with a server that answers: without one each line below says so, which is tried on its own.
+    controller->setStatusForTest([](wallet::NetworkStatus& status) { status.connecting = false; });
     auto* stack = window.findChild<QStackedWidget*>();
     auto* portfolio = window.findChild<ui::PortfolioPage*>();
     auto* holdings = window.findChild<ui::HoldingsPage*>();
@@ -1193,13 +1273,6 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
     pause(QApplication::doubleClickInterval() + 50);
     clickCell(inside, rowNamed(inside, QStringLiteral("Shop")));
     check(bar->pathTexts().size() == 3, QStringLiteral("and a click after that opens what it is on"));
-    {
-        // Nor does it reach the Addresses list that just came up.
-        const QStringList before = bar->pathTexts();
-        clickCell(addressTable, 0, ui::AddressTableModel::ColAddress);
-        check(controller->givenOutRows(shop, bitcoin, chain::ScriptType::P2WPKH, 100).isEmpty(), QStringLiteral("the second click does not copy an address nobody chose"));
-        check(bar->pathTexts() == before, QStringLiteral("nor open one"));
-    }
 
     // An address: all it holds, in its own coin.
     row = model->at(model->find(shop, ethereum, chain::ScriptType::EthAccount, 0, 0, 1));
@@ -1446,7 +1519,7 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
         model->upsert(paid);
         check(waitFor([&] { return line->text().contains(QLatin1String("being read")); }, 3000), QStringLiteral("paid, it does not say it holds nothing while that is being read: %1").arg(line->text()));
         paid.checked = true;
-        paid.unconfirmed = 2000;
+        paid.confirmed = 2000;
         model->upsert(paid);
         check(waitFor([&] { return line->text().contains(QLatin1String("Holds")); }, 3000), QStringLiteral("then a payment to it shows at once"));
         check(waitFor([&] { return list->item(int(list->rowCount()) - 1, 5)->text() == QLatin1String("Received"); }, 3000), QStringLiteral("and in the list"));
@@ -1526,6 +1599,769 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
     check(receive->shownAddress().isEmpty(), QStringLiteral("and Receive has nothing to offer"));
 }
 
+// An address goes out when someone asks for that and in no other way, never twice without a word, and
+// what the screens say of it is no more than is known.
+void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
+{
+    QString error;
+    const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
+    const wallet::Network ethereum = wallet::findNetwork(QStringLiteral("ethereum"))->network;
+    const wallet::Asset btc = wallet::networkInfo(bitcoin).coin;
+    const wallet::Asset eth = wallet::networkInfo(ethereum).coin;
+    const chain::ScriptType segwit = chain::ScriptType::P2WPKH;
+    const chain::ScriptType account = chain::ScriptType::EthAccount;
+    ui::MainWindow window;
+    window.show();
+    window.resize(1280, 800);
+    WalletController* controller = window.controller();
+    offline(controller);
+    const auto answering = [](wallet::NetworkStatus& status) { status.connecting = false; };
+    controller->setStatusForTest(answering);
+
+    QList<wallet::AccountKey> added;
+    for (const wallet::AccountKey& key : keys) {
+        if (key.type == segwit || key.type == account)
+            added.append(key);
+    }
+    QList<wallet::AccountKey> second = wallet::WalletStore::deriveAccounts(chain::bip39::split("legal winner thank year wave sausage worth useful legal winner thank yellow"), {});
+    second.removeIf([segwit](const wallet::AccountKey& key) { return key.type != segwit; });
+    if (!controller->addKeysWallet(added, QStringLiteral("Shop"), &error) || !controller->addKeysWallet(second, QStringLiteral("Warehouse"), &error)) {
+        check(false, QStringLiteral("wallets for the test: %1").arg(error));
+        return;
+    }
+    const quint32 shop = controller->store().wallets.at(0).id;
+    const quint32 warehouse = controller->store().wallets.at(1).id;
+    wallet::WalletModel* model = controller->model();
+    check(waitFor([&] { return !controller->loadingSaved() && model->find(shop, bitcoin, segwit, 0, 0, 19) >= 0 && model->find(shop, ethereum, account, 0, 0, 19) >= 0 && model->find(warehouse, bitcoin, segwit, 0, 0, 19) >= 0; }, 20000), QStringLiteral("they have rows"));
+    const auto rowOf = [&](quint32 wallet, quint32 index) { return model->at(model->find(wallet, bitcoin, segwit, 0, 0, index)); };
+    const auto nextOf = [&](quint32 wallet) { return controller->nextReceive(wallet, bitcoin, segwit); };
+
+    auto* portfolio = window.findChild<ui::PortfolioPage*>();
+    auto* addresses = window.findChild<ui::AddressesPage*>();
+    auto* receive = window.findChild<ui::ReceivePage*>();
+    auto* wallets = window.findChild<ui::WalletsPage*>();
+    ui::PlaceBar* bar = window.placeBar();
+    auto* detail = bar->findChild<QLabel*>(QStringLiteral("placeDetail"));
+    const auto goToWallet = [&](quint32 wallet) {
+        ui::Place place;
+        place.root = ui::Place::Root::Wallets;
+        place.wallet = wallet;
+        window.goTo(place, ui::Place::Tab::Holdings);
+    };
+    const auto goToCoin = [&](wallet::Asset asset, quint32 wallet) {
+        ui::Place place;
+        place.asset = asset;
+        place.wallet = wallet;
+        window.goTo(place, ui::Place::Tab::Addresses);
+    };
+    const auto goToAddress = [&](const wallet::AddressRow& row) {
+        ui::Place place;
+        place.root = ui::Place::Root::Addresses;
+        place.address = row;
+        window.goTo(place, ui::Place::Tab::Holdings);
+    };
+
+    // How many hold something, before anything has answered.
+    goToWallet(shop);
+    check(detail->text().contains(QStringLiteral("— funded of")), QStringLiteral("no count of what holds something while nothing has answered: %1").arg(detail->text()));
+    window.showPage(QStringLiteral("portfolio"));
+    pause(50);
+    const auto portfolioCount = [&] {
+        for (const QLabel* label : portfolio->findChildren<QLabel*>()) {
+            if (label->isVisible() && label->text().contains(QLatin1String(" funded of ")))
+                return label->text();
+        }
+        return QString();
+    };
+    check(portfolioCount().contains(QStringLiteral("— funded of")), QStringLiteral("on the Portfolio neither: %1").arg(portfolioCount()));
+
+    // What every other page says of one coin of a wallet, the Wallets page says too.
+    {
+        wallet::AddressRow one = rowOf(shop, 0);
+        one.checked = true;
+        one.used = true;
+        one.confirmed = 100000000;
+        model->upsert(one);
+        for (int i = 0; i < model->size(); ++i) {
+            if (model->at(i).network != bitcoin || model->at(i).checked)
+                continue;
+            wallet::AddressRow each = model->at(i);
+            each.checked = true;
+            model->upsert(each);
+        }
+        window.showPage(QStringLiteral("wallets"));
+        auto* table = wallets->findChild<QTableView*>();
+        check(waitFor([&] { return cellOf(table, rowNamed(table, QStringLiteral("Shop")), QStringLiteral("BTC")) == QStringLiteral("1"); }, 3000), QStringLiteral("Bitcoin answered, its figure on the Wallets page is plain though Ethereum has not: %1").arg(cellOf(table, rowNamed(table, QStringLiteral("Shop")), QStringLiteral("BTC"))));
+        check(cellOf(table, rowNamed(table, QStringLiteral("Shop")), QStringLiteral("ETH")) == QStringLiteral("—"), QStringLiteral("and Ethereum says nothing yet"));
+        check(cellOf(table, rowNamed(table, QStringLiteral("Warehouse")), QStringLiteral("USD")) == QStringLiteral("—"), QStringLiteral("with no price a wallet of nothing has no $0.00 there either: %1").arg(cellOf(table, rowNamed(table, QStringLiteral("Warehouse")), QStringLiteral("USD"))));
+    }
+    answerAll(model, shop);
+    answerAll(model, warehouse);
+    auto* holdingsPage = window.findChild<ui::HoldingsPage*>();
+    const auto countUnder = [&] {
+        for (const QLabel* each : holdingsPage->findChildren<QLabel*>()) {
+            if (each->isVisible() && each->text().contains(QLatin1String("hold something")))
+                return each->text();
+        }
+        return QString();
+    };
+
+    // A wallet of nothing, every row answered, with Hide zero on: a page with nothing on it would say nothing.
+    window.showPage(QStringLiteral("portfolio"));
+    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
+    goToWallet(warehouse);
+    pause(50);
+    holdingsPage->table()->refresh();
+    check(holdingsPage->table()->rowsShown() == 1 && holdingsPage->table()->rowsHolding() == 0, QStringLiteral("what it has a key for stays, known to hold nothing (%1)").arg(holdingsPage->table()->rowsShown()));
+    check(countUnder() == QStringLiteral("0 of 1 hold something"), QStringLiteral("with a count that says so: %1").arg(countUnder()));
+
+    // An old price says it is old, wherever it makes a figure.
+    {
+        net::PriceQuote old;
+        old.asset = btc;
+        old.usd = 50000.0;
+        old.at = QDateTime::currentDateTimeUtc().addSecs(-7200);
+        old.source = QStringLiteral("Test");
+        controller->prices()->restore({old});
+        check(controller->priceNote(btc).contains(QLatin1String("price from")), QStringLiteral("a price two hours old says so: %1").arg(controller->priceNote(btc)));
+        goToCoin(btc, 0);
+        check(detail->text().contains(QLatin1String("price from")), QStringLiteral("on a coin: %1").arg(detail->text()));
+        goToWallet(shop);
+        check(detail->text().contains(QLatin1String("price from")), QStringLiteral("on a wallet: %1").arg(detail->text()));
+        goToAddress(rowOf(shop, 0));
+        check(detail->text().contains(QLatin1String("price from")), QStringLiteral("and on an address: %1").arg(detail->text()));
+        setPrices(controller);
+        check(controller->priceNote(btc).isEmpty(), QStringLiteral("one just read does not"));
+        goToWallet(shop);
+        check(!detail->text().contains(QLatin1String("price from")), QStringLiteral("nor does what it makes"));
+    }
+
+    // A figure goes by its own scope, and in its own coin's digits.
+    {
+        wallet::AddressRow half = rowOf(warehouse, 0);
+        half.used = true;
+        half.confirmed = 50000000;
+        model->upsert(half);
+        const wallet::Asset usdt = wallet::findAsset(QStringLiteral("ethereum/usdt"))->asset;
+        wallet::AddressRow dollars = model->at(model->find(shop, ethereum, account, 0, 0, 5));
+        dollars.setBalance(usdt, chain::Amount::fromU64(5000000));
+        model->upsert(dollars);
+        const ui::Holding five = ui::holdingOf(controller, usdt, shop);
+        check(five.amountText() == QStringLiteral("5.00 USDT") && five.usd == 5.0, QStringLiteral("six decimals are six: %1").arg(five.amountText()));
+        goToWallet(warehouse);
+        auto* title = bar->findChild<QLabel*>(QStringLiteral("placeTitle"));
+        check(title->text() == QStringLiteral("$50,000.00"), QStringLiteral("a wallet's page has its own total, not all of them: %1").arg(title->text()));
+        check(countUnder() == QStringLiteral("1 of 1 hold something"), QStringLiteral("and its own count: %1").arg(countUnder()));
+        ui::Place place;
+        place.asset = btc;
+        window.goTo(place, ui::Place::Tab::Holdings);
+        pause(50);
+        holdingsPage->table()->refresh();
+        QTableView* wallets = holdingsPage->table()->view();
+        check(cellOf(wallets, rowNamed(wallets, QStringLiteral("Shop")), QStringLiteral("Share")) == QStringLiteral("66.7%"), QStringLiteral("a coin's wallets have their shares of it: %1").arg(cellOf(wallets, rowNamed(wallets, QStringLiteral("Shop")), QStringLiteral("Share"))));
+        half.used = false;
+        half.confirmed = 0;
+        model->upsert(half);
+        dollars.setBalance(usdt, chain::Amount());
+        model->upsert(dollars);
+    }
+
+    // Receive: what it says of what is on screen.
+    window.showPage(QStringLiteral("receive"));
+    receive->showFor(shop, btc);
+    pause(50);
+    auto* line = receive->findChild<QLabel*>(QStringLiteral("receiveState"));
+    auto* notCounted = receive->findChild<QLabel*>(QStringLiteral("receiveNotCounted"));
+    auto* label = receive->findChild<QLineEdit*>(QStringLiteral("receiveLabel"));
+    auto* amount = receive->findChild<QLineEdit*>(QStringLiteral("receiveAmount"));
+    auto* list = receive->findChild<QTableWidget*>(QStringLiteral("receiveList"));
+    auto* status = receive->findChild<QLabel*>(QStringLiteral("receiveStatus"));
+    auto* walletCombo = receive->findChild<QComboBox*>(QStringLiteral("receiveWallet"));
+    auto* coinCombo = receive->findChild<QComboBox*>(QStringLiteral("receiveCoin"));
+    check(!(receive->findChild<QLabel*>(QStringLiteral("receiveAddress"))->textInteractionFlags() & Qt::TextSelectableByMouse), QStringLiteral("the address on Receive cannot be selected past its Copy button"));
+    check(notCounted->isVisible(), QStringLiteral("what nobody has been given says a scan cannot be seen, and what to do"));
+    {
+        const quint32 first = nextOf(shop).index;
+        window.showPage(QStringLiteral("portfolio"));
+        window.showPage(QStringLiteral("receive"));
+        pause(50);
+        check(nextOf(shop).index == first && receive->shownAddress() == nextOf(shop).address, QStringLiteral("going elsewhere with nothing typed marks nothing"));
+        amount->setText(QStringLiteral("abc"));
+        window.showPage(QStringLiteral("portfolio"));
+        check(nextOf(shop).index == first, QStringLiteral("nor does what is no amount"));
+        window.showPage(QStringLiteral("receive"));
+        pause(50);
+
+        // A label says who it is for.
+        const QString typedFor = receive->shownAddress();
+        label->insert(QStringLiteral("Order 7"));
+        window.showPage(QStringLiteral("portfolio"));
+        check(controller->addressLabel(typedFor) == QLatin1String("Order 7") && controller->isGivenOut(rowOf(shop, first)), QStringLiteral("a label typed goes with it, and it counts as given out"));
+        window.showPage(QStringLiteral("receive"));
+        pause(50);
+        check(receive->shownAddress() != typedFor && label->text().isEmpty(), QStringLiteral("and the next one comes up clean"));
+
+        // So does an amount, also when the way out is Receive itself.
+        const wallet::ReceiveOffer asked = nextOf(shop);
+        amount->setText(QStringLiteral("0.5"));
+        window.showPage(QStringLiteral("receive"));
+        pause(50);
+        check(controller->isGivenOut(rowOf(shop, asked.index)) && receive->shownAddress() != asked.address && amount->text().isEmpty(), QStringLiteral("an amount says the same"));
+
+        // Copy counts, and the page stops asking.
+        buttonNamed(receive, QStringLiteral("Copy address"))->click();
+        check(!notCounted->isVisible() && !nextOf(shop).address.isEmpty(), QStringLiteral("once copied, that line goes"));
+        // Of what stays on screen, a label is kept as the field is left.
+        const QString held = receive->shownAddress();
+        label->insert(QStringLiteral("Order 8"));
+        emit label->editingFinished();
+        check(controller->addressLabel(held) == QLatin1String("Order 8"), QStringLiteral("a label for what stays on screen is kept as the field is left"));
+        buttonNamed(receive, QStringLiteral("New address"))->click();
+    }
+
+    // What is copied from an address's own page counts, and Show QR brings up that one as it stands.
+    {
+        const wallet::ReceiveOffer offered = nextOf(shop);
+        goToAddress(rowOf(shop, offered.index));
+        buttonNamed(bar, QStringLiteral("Show QR"))->click();
+        pause(50);
+        check(receive->shownAddress() == offered.address && !controller->isGivenOut(rowOf(shop, offered.index)), QStringLiteral("Show QR brings up that address, and marks nothing"));
+        goToAddress(rowOf(shop, offered.index));
+        buttonNamed(bar, QStringLiteral("Copy address"))->click();
+        check(controller->isGivenOut(rowOf(shop, offered.index)), QStringLiteral("Copy address on its page marks it"));
+        window.showPage(QStringLiteral("receive"));
+        pause(50);
+    }
+
+    // A double click on New address is one.
+    {
+        const int before = controller->givenOutCount(shop, bitcoin, segwit);
+        QPushButton* next = buttonNamed(receive, QStringLiteral("New address"));
+        const QPoint at = next->rect().center();
+        const auto send = [&](QEvent::Type type, Qt::MouseButtons buttons) {
+            QMouseEvent event(type, at, next->mapToGlobal(at), Qt::LeftButton, buttons, Qt::NoModifier);
+            QApplication::sendEvent(next, &event);
+        };
+        send(QEvent::MouseButtonPress, Qt::LeftButton);
+        send(QEvent::MouseButtonRelease, Qt::NoButton);
+        send(QEvent::MouseButtonDblClick, Qt::LeftButton);
+        send(QEvent::MouseButtonRelease, Qt::NoButton);
+        check(controller->givenOutCount(shop, bitcoin, segwit) == before + 1, QStringLiteral("a double click on New address gives out one (%1 from %2)").arg(controller->givenOutCount(shop, bitcoin, segwit)).arg(before));
+    }
+
+    // A label typed for one is not put over another's when the offer moves on by itself.
+    {
+        window.showPage(QStringLiteral("receive"));
+        pause(50);
+        const wallet::ReceiveOffer offered = nextOf(shop);
+        const wallet::AddressRow after = rowOf(shop, offered.index + 1);
+        check(controller->setAddressLabel(after.address, QStringLiteral("Till 3"), &error), QStringLiteral("the one after it has a label of its own"));
+        label->insert(QStringLiteral("Order 1"));
+        wallet::AddressRow paid = rowOf(shop, offered.index);
+        paid.used = true;
+        paid.confirmed = 500;
+        model->upsert(paid);
+        check(waitFor([&] { return receive->shownAddress() == after.address; }, 3000), QStringLiteral("the one on screen is paid, and the offer moves on"));
+        check(label->text() == QLatin1String("Till 3"), QStringLiteral("what it is called stands: %1").arg(label->text()));
+        check(status->isVisible() && status->text().contains(QLatin1String("moved on")), QStringLiteral("and it says what became of what was typed: %1").arg(status->text()));
+        buttonNamed(receive, QStringLiteral("Copy address"))->click();
+        check(controller->addressLabel(after.address) == QLatin1String("Till 3"), QStringLiteral("so Copy leaves it"));
+        buttonNamed(receive, QStringLiteral("New address"))->click();
+    }
+
+    // The Addresses list: a click chooses, two open, and only asking hands out.
+    {
+        window.showPage(QStringLiteral("addresses"));
+        addresses->showWallet(shop);
+        pause(50);
+        auto* table = addresses->findChild<QTableView*>();
+        const int addressColumn = ui::AddressTableModel::ColAddress;
+        const auto rowInTable = [&](const QString& address) {
+            for (int row = 0; row < table->model()->rowCount(); ++row) {
+                if (table->model()->index(row, addressColumn).data().toString() == address) {
+                    table->scrollTo(table->model()->index(row, addressColumn));
+                    return row;
+                }
+            }
+            return -1;
+        };
+        const wallet::ReceiveOffer free = nextOf(shop);
+        check(ui::handOutNote(controller, rowOf(shop, free.index)).isEmpty(), QStringLiteral("nothing to say of handing out one nobody has had"));
+        int at = rowInTable(free.address);
+        clickCell(table, at, addressColumn);
+        check(!controller->isGivenOut(rowOf(shop, free.index)) && addresses->lastCopied().isEmpty(), QStringLiteral("a click on an address chooses it, and hands nothing out"));
+        {
+            const QPoint point = table->visualRect(table->model()->index(at, addressColumn)).center();
+            const auto send = [&](QEvent::Type type, Qt::MouseButtons buttons) {
+                QMouseEvent event(type, point, table->viewport()->mapToGlobal(point), Qt::LeftButton, buttons, Qt::NoModifier);
+                QApplication::sendEvent(table->viewport(), &event);
+            };
+            send(QEvent::MouseButtonPress, Qt::LeftButton);
+            send(QEvent::MouseButtonRelease, Qt::NoButton);
+            send(QEvent::MouseButtonDblClick, Qt::LeftButton);
+            send(QEvent::MouseButtonRelease, Qt::NoButton);
+        }
+        check(bar->isVisible() && !controller->isGivenOut(rowOf(shop, free.index)), QStringLiteral("nor does opening it with a double click"));
+        check(!(bar->findChild<QLabel*>(QStringLiteral("placeTitle"))->textInteractionFlags() & Qt::TextSelectableByMouse), QStringLiteral("and its address there cannot be selected past Copy address either"));
+        window.showPage(QStringLiteral("addresses"));
+        addresses->showWallet(shop);
+        pause(50);
+        at = rowInTable(free.address);
+        clickCell(table, at, addressColumn);
+        pause(150); // the button goes by what is chosen, a few times a second
+        buttonNamed(addresses, QStringLiteral("Copy address"))->click();
+        check(controller->isGivenOut(rowOf(shop, free.index)) && addresses->lastCopied() == free.address, QStringLiteral("Copy address hands it out, and marks it"));
+        at = rowInTable(free.address);
+        check(cellOf(table, at, QStringLiteral("State")) == QStringLiteral("Given out"), QStringLiteral("and the list then says so: %1").arg(cellOf(table, at, QStringLiteral("State"))));
+        check(ui::handOutNote(controller, rowOf(shop, free.index)).contains(QLatin1String("given out before")), QStringLiteral("and a second time it says it was: %1").arg(ui::handOutNote(controller, rowOf(shop, free.index))));
+        goToAddress(rowOf(shop, free.index));
+        check(detail->text().contains(QLatin1String("Given out")), QStringLiteral("as does its own page: %1").arg(detail->text()));
+        window.showPage(QStringLiteral("addresses"));
+        addresses->showWallet(shop);
+        pause(50);
+
+        // Ctrl+C is the same.
+        const wallet::ReceiveOffer then = nextOf(shop);
+        clickCell(table, rowInTable(then.address), addressColumn);
+        QKeyEvent copy(QEvent::KeyPress, Qt::Key_C, Qt::ControlModifier);
+        QApplication::sendEvent(table, &copy);
+        check(controller->isGivenOut(rowOf(shop, then.index)) && addresses->lastCopied() == then.address, QStringLiteral("Ctrl+C hands it out the same way"));
+
+        // All of them, past what the list on Receive holds.
+        auto* state = addresses->findChild<QComboBox*>(QStringLiteral("stateFilter"));
+        state->setCurrentIndex(3);
+        pause(50);
+        bool all = table->model()->rowCount() > 0;
+        for (int row = 0; row < table->model()->rowCount(); ++row)
+            all = all && cellOf(table, row, QStringLiteral("State")) == QStringLiteral("Given out");
+        check(all, QStringLiteral("State finds what was given out and is still waiting (%1)").arg(table->model()->rowCount()));
+        state->setCurrentIndex(0);
+
+        // What else a copy has to say.
+        check(ui::handOutNote(controller, rowOf(shop, 0)).contains(QLatin1String("used before")), QStringLiteral("one with history is said to have it"));
+        wallet::AddressRow unanswered = rowOf(shop, 19);
+        unanswered.checked = false;
+        check(ui::handOutNote(controller, unanswered).contains(QLatin1String("no server")), QStringLiteral("one nobody has answered for is said not to be known"));
+        wallet::AddressRow change = model->at(model->find(shop, bitcoin, segwit, 0, 1, 0));
+        check(ui::handOutNote(controller, change).contains(QLatin1String("change address")), QStringLiteral("and a change address is said not to be kept"));
+    }
+
+    // Asked for a coin the wallet on screen has no key for, it goes to one that has.
+    {
+        window.showPage(QStringLiteral("receive"));
+        walletCombo->setCurrentIndex(walletCombo->findData(warehouse));
+        pause(50);
+        {
+            ui::Place place;
+            place.asset = eth;
+            window.goTo(place, ui::Place::Tab::Holdings);
+            buttonNamed(bar, QStringLiteral("Receive"))->click();
+        }
+        pause(50);
+        check(walletCombo->currentData().toUInt() == shop && coinCombo->currentData().toInt() == int(eth), QStringLiteral("Receive on a coin comes up on that coin, of a wallet that has it"));
+        check(receive->shownAddress() == controller->nextReceive(shop, ethereum, account).address, QStringLiteral("with its address: %1").arg(receive->shownAddress()));
+        receive->showFor(shop, btc);
+        pause(50);
+    }
+
+    // Down from where the reader is: a double click keeps the way there, and leaving lets go of it.
+    {
+        ui::Place place;
+        place.root = ui::Place::Root::Wallets;
+        place.wallet = shop;
+        place.asset = btc;
+        window.goTo(place, ui::Place::Tab::Addresses);
+        pause(150);
+        auto* table = addresses->findChild<QTableView*>();
+        check(table->model()->rowCount() >= 1, QStringLiteral("a coin of a wallet has what holds it (%1)").arg(table->model()->rowCount()));
+
+        // What it exports is what it shows.
+        const QString file = QDir(wallet::WalletStore::dataDir()).filePath(QStringLiteral("place.csv"));
+        check(addresses->exportCsv(file, &error), QStringLiteral("it exports: %1").arg(error));
+        {
+            QFile read(file);
+            read.open(QIODevice::ReadOnly);
+            const int lines = int(read.readAll().count('\n'));
+            check(lines == table->model()->rowCount() + 1, QStringLiteral("only what the place shows (%1 lines for %2 rows)").arg(lines).arg(table->model()->rowCount()));
+        }
+        QFile::remove(file);
+
+        const QPoint point = table->visualRect(table->model()->index(0, ui::AddressTableModel::ColAddress)).center();
+        const auto send = [&](QEvent::Type type, Qt::MouseButtons buttons) {
+            QMouseEvent event(type, point, table->viewport()->mapToGlobal(point), Qt::LeftButton, buttons, Qt::NoModifier);
+            QApplication::sendEvent(table->viewport(), &event);
+        };
+        send(QEvent::MouseButtonPress, Qt::LeftButton);
+        send(QEvent::MouseButtonRelease, Qt::NoButton);
+        send(QEvent::MouseButtonDblClick, Qt::LeftButton);
+        send(QEvent::MouseButtonRelease, Qt::NoButton);
+        const QStringList path = bar->pathTexts();
+        check(path.size() == 4 && path.at(0) == QLatin1String("Wallets") && path.at(1) == QLatin1String("Shop") && path.at(2) == QLatin1String("Bitcoin"), QStringLiteral("a double click goes on down: %1").arg(path.join(QLatin1Char('>'))));
+
+        // Left from its Addresses tab, for a page that has no list.
+        window.goTo(place, ui::Place::Tab::Addresses);
+        pause(100);
+        window.showPage(QStringLiteral("settings"));
+        check(!bar->isVisible(), QStringLiteral("going elsewhere leaves the place"));
+        window.showPage(QStringLiteral("addresses"));
+        pause(150);
+        check(table->model()->rowCount() == model->size(), QStringLiteral("and the page is whole again (%1 of %2)").arg(table->model()->rowCount()).arg(model->size()));
+    }
+
+    // An address nothing reads any more says so, and handing it out brings it back under watch.
+    {
+        const wallet::AddressRow gone = rowOf(shop, 19);
+        goToAddress(gone);
+        model->dropRows([&gone](const wallet::AddressRow& row) { return !(row.wallet == gone.wallet && row.network == gone.network && row.type == gone.type && row.change == 0 && row.index == gone.index); });
+        bar->refresh();
+        check(detail->text().contains(QLatin1String("No scan follows")) && !detail->text().contains(QLatin1String("BTC")), QStringLiteral("a row that has gone shows no figure of what nothing reads: %1").arg(detail->text()));
+        auto* holdings = window.findChild<ui::HoldingsPage*>();
+        holdings->table()->refresh();
+        check(holdings->table()->rowsTotal() == 0, QStringLiteral("and the table under it has none"));
+        bool counted = false;
+        for (const QLabel* each : holdings->findChildren<QLabel*>())
+            counted = counted || (each->isVisible() && each->text().contains(QLatin1String("hold something")));
+        check(!counted, QStringLiteral("nor a count of nothing"));
+        window.showPage(QStringLiteral("receive"));
+        receive->showAddress(gone);
+        pause(50);
+        buttonNamed(receive, QStringLiteral("Copy address"))->click();
+        check(controller->isGivenOut(gone) && receive->lastCopied() == gone.address, QStringLiteral("copied all the same, it counts as given out, row or none"));
+        receive->showFor(shop, btc);
+        pause(50);
+    }
+
+    // With no server answering, nothing says what it cannot know.
+    {
+        const QDateTime earlier = QDateTime::currentDateTime().addSecs(-3600);
+        controller->setStatusForTest([earlier](wallet::NetworkStatus& status) {
+            status.connecting = true;
+            status.balancesAt = earlier;
+        });
+        window.showPage(QStringLiteral("receive"));
+        receive->showFor(shop, btc);
+        pause(50);
+        check(line->text().contains(QLatin1String("no server is answering")), QStringLiteral("what is offered says no server answers: %1").arg(line->text()));
+        int waitingRow = -1;
+        for (int row = 0; row < list->rowCount() && waitingRow < 0; ++row) {
+            if (list->item(row, 3)->text() != QLatin1String("0") && !list->item(row, 3)->text().contains(QLatin1String("BTC")))
+                waitingRow = row;
+        }
+        check(waitingRow >= 0 && list->item(waitingRow, 3)->text() == QStringLiteral("—") && list->item(waitingRow, 4)->text() == QStringLiteral("—"), QStringLiteral("what was given out has no zero nobody stands behind"));
+        check(waitingRow >= 0 && list->item(waitingRow, 5)->text().startsWith(QLatin1String("As of")), QStringLiteral("and says as of when: %1").arg(waitingRow >= 0 ? list->item(waitingRow, 5)->text() : QString()));
+        emit list->cellClicked(waitingRow, 0);
+        check(line->text().contains(QLatin1String("nothing had come in as of")), QStringLiteral("shown, it says the same: %1").arg(line->text()));
+        goToWallet(shop);
+        check(detail->text().contains(QLatin1String("as of")), QStringLiteral("a wallet's page says as of when: %1").arg(detail->text()));
+        goToAddress(rowOf(shop, 0));
+        check(detail->text().contains(QLatin1String("as of")), QStringLiteral("and an address's: %1").arg(detail->text()));
+        window.showPage(QStringLiteral("portfolio"));
+        pause(50);
+        {
+            bool bitcoinSaid = false;
+            bool etherSaid = false;
+            for (const QLabel* each : portfolio->findChildren<QLabel*>()) {
+                if (!each->isVisible())
+                    continue;
+                bitcoinSaid = bitcoinSaid || each->text().contains(QLatin1String("BTC balances from"));
+                etherSaid = etherSaid || each->text().contains(QLatin1String("ETH balances from"));
+            }
+            check(bitcoinSaid && etherSaid, QStringLiteral("and the Portfolio says it of each"));
+        }
+        controller->setStatusForTest([](wallet::NetworkStatus& status) { status.connecting = true; });
+        window.showPage(QStringLiteral("receive"));
+        receive->showFor(shop, btc);
+        pause(50);
+        check(line->text().contains(QLatin1String("No server is answering")), QStringLiteral("before any whole answer it says only that: %1").arg(line->text()));
+        controller->setStatusForTest(answering);
+    }
+
+    // Of what was only saved, the same.
+    {
+        controller->setShowingSavedForTest(true);
+        receive->showAddress(rowOf(shop, 0));
+        check(line->text().contains(QLatin1String("as far as was saved")), QStringLiteral("what holds something says it was saved: %1").arg(line->text()));
+        wallet::AddressRow emptied = rowOf(shop, 0);
+        emptied.confirmed = 0;
+        model->upsert(emptied);
+        pause(500);
+        check(line->text().contains(QLatin1String("as far as was saved")) && !line->text().contains(QLatin1String("now")), QStringLiteral("what held nothing has no \"now\": %1").arg(line->text()));
+        emptied.confirmed = 100000000;
+        model->upsert(emptied);
+        controller->setShowingSavedForTest(false);
+    }
+
+    // What is in no block yet is not paid yet, wherever it shows.
+    {
+        receive->showFor(shop, btc);
+        pause(50);
+        const wallet::ReceiveOffer offered = nextOf(shop);
+        buttonNamed(receive, QStringLiteral("Copy address"))->click();
+        wallet::AddressRow paid = rowOf(shop, offered.index);
+        const qint64 before = ui::holdingOf(controller, btc, shop).incoming;
+        paid.used = true;
+        paid.unconfirmed = 2000;
+        model->upsert(paid);
+        check(ui::holdingOf(controller, btc, shop).incoming == before + 2000 && ui::holdingOf(controller, btc).incoming == before + 2000, QStringLiteral("it is counted apart"));
+        check(ui::holdingNote(controller, ui::holdingOf(controller, btc, shop)).contains(QLatin1String("not in a block yet")), QStringLiteral("and a coin says so"));
+        receive->showAddress(paid);
+        check(line->text().contains(QLatin1String("not in a block yet")), QStringLiteral("as does Receive: %1").arg(line->text()));
+        check(waitFor([&] { return list->rowCount() > 0 && list->item(0, 5)->text() == QLatin1String("Not in a block yet"); }, 3000), QStringLiteral("and its list, rather than Received: %1").arg(list->rowCount() > 0 ? list->item(0, 5)->text() : QString()));
+        goToAddress(paid);
+        check(detail->text().contains(QLatin1String("not in a block yet")), QStringLiteral("and its own page"));
+        goToWallet(shop);
+        check(detail->text().contains(QLatin1String("not in a block yet")), QStringLiteral("and its wallet"));
+        window.showPage(QStringLiteral("addresses"));
+        addresses->showWallet(shop);
+        pause(50);
+        auto* table = addresses->findChild<QTableView*>();
+        bool said = false;
+        for (int row = 0; row < table->model()->rowCount(); ++row)
+            said = said || (table->model()->index(row, ui::AddressTableModel::ColAddress).data().toString() == paid.address && cellOf(table, row, QStringLiteral("State")) == QStringLiteral("Not in a block yet"));
+        check(said, QStringLiteral("and the Addresses list"));
+        paid.unconfirmed = 0;
+        paid.confirmed = 2000;
+        model->upsert(paid);
+        check(ui::holdingOf(controller, btc, shop).incoming == before, QStringLiteral("in a block, it is no longer counted apart"));
+        window.showPage(QStringLiteral("receive"));
+        receive->showFor(shop, btc);
+        check(waitFor([&] { return list->rowCount() > 0 && list->item(0, 5)->text() == QLatin1String("Received"); }, 3000), QStringLiteral("and reads Received"));
+    }
+
+    // A row not every lookup has answered for is a lower bound in the lists too.
+    {
+        wallet::AddressRow part = model->at(model->find(shop, ethereum, account, 0, 0, 2));
+        check(controller->markGivenOut(part, &error), QStringLiteral("an Ethereum address given out"));
+        part.setBalance(eth, chain::Amount::fromU64(1000000000000000000ULL));
+        part.checked = false;
+        model->upsert(part);
+        window.showPage(QStringLiteral("addresses"));
+        addresses->showWallet(shop);
+        pause(50);
+        auto* table = addresses->findChild<QTableView*>();
+        int found = -1;
+        for (int row = 0; row < table->model()->rowCount() && found < 0; ++row) {
+            if (table->model()->index(row, ui::AddressTableModel::ColAddress).data().toString() == part.address)
+                found = row;
+        }
+        check(found >= 0 && cellOf(table, found, QStringLiteral("Balance")).startsWith(QStringLiteral("≥")) && cellOf(table, found, QStringLiteral("USD")).startsWith(QStringLiteral("≥")), QStringLiteral("on the Addresses list: %1").arg(found >= 0 ? cellOf(table, found, QStringLiteral("Balance")) : QString()));
+        window.showPage(QStringLiteral("receive"));
+        receive->showFor(shop, eth);
+        pause(50);
+        int partLine = -1;
+        for (int row = 0; row < list->rowCount() && partLine < 0; ++row) {
+            if (list->item(row, 0)->text() == part.address)
+                partLine = row;
+        }
+        check(partLine >= 0 && list->item(partLine, 3)->text().startsWith(QStringLiteral("≥")), QStringLiteral("and in what was given out: %1").arg(partLine >= 0 ? list->item(partLine, 3)->text() : QString()));
+        goToCoin(eth, 0);
+        check(bar->findChild<QLabel*>(QStringLiteral("placeTitle"))->text().startsWith(QStringLiteral("≥")), QStringLiteral("and on the coin's page"));
+        part.checked = true;
+        part.setBalance(eth, chain::Amount());
+        model->upsert(part);
+    }
+
+    // No server will say anything of one, and the scan has ended: it stops nothing after it.
+    {
+        const wallet::ReceiveOffer offered = nextOf(shop);
+        check(offered.state == wallet::ReceiveOffer::State::Ready, QStringLiteral("there is one to offer"));
+        wallet::AddressRow silent = rowOf(shop, offered.index);
+        silent.checked = false;
+        model->upsert(silent);
+        check(nextOf(shop).state == wallet::ReceiveOffer::State::Checking, QStringLiteral("while the scan is on its way, it waits for an answer"));
+        controller->setStatusForTest([](wallet::NetworkStatus& status) {
+            status.connecting = false;
+            status.scanning = false;
+        });
+        const wallet::ReceiveOffer past = nextOf(shop);
+        check(past.state == wallet::ReceiveOffer::State::Ready && past.index > offered.index, QStringLiteral("once the scan has ended, the next that has answered is offered (%1)").arg(past.index));
+        // Nor is nothing said of a coin while something has not answered.
+        const wallet::Asset usdc = wallet::findAsset(QStringLiteral("ethereum/usdc"))->asset;
+        const auto says = [&](const QString& text) {
+            for (const QLabel* each : addresses->findChildren<QLabel*>()) {
+                if (each->isVisible() && each->text() == text)
+                    return true;
+            }
+            return false;
+        };
+        wallet::AddressRow silentEther = model->at(model->find(shop, ethereum, account, 0, 0, 3));
+        silentEther.checked = false;
+        model->upsert(silentEther);
+        goToCoin(usdc, shop);
+        pause(150);
+        check(!says(QStringLiteral("Nothing here holds it")), QStringLiteral("nobody says nothing holds a coin while an address has not answered"));
+        silentEther.checked = true;
+        model->upsert(silentEther);
+        pause(150);
+        goToCoin(usdc, shop);
+        pause(150);
+        check(says(QStringLiteral("Nothing here holds it")), QStringLiteral("once all have, it can be said"));
+        // A chain chosen in a wallet's place is a filter like any other.
+        ui::Place place;
+        place.root = ui::Place::Root::Wallets;
+        place.wallet = warehouse;
+        window.goTo(place, ui::Place::Tab::Addresses);
+        pause(100);
+        QComboBox* chains = nullptr;
+        for (QComboBox* each : addresses->findChildren<QComboBox*>()) {
+            if (each->findData(int(ethereum)) >= 0)
+                chains = each;
+        }
+        chains->setCurrentIndex(chains->findData(int(ethereum)));
+        pause(150);
+        check(says(QStringLiteral("No results")) && !says(QStringLiteral("Nothing here holds it")), QStringLiteral("a chain the wallet has no key on is no results, not nothing held"));
+        chains->setCurrentIndex(0);
+        controller->setStatusForTest(answering);
+        silent.checked = true;
+        model->upsert(silent);
+    }
+
+    // A second account of one kind: what is copied of it counts too.
+    {
+        QList<wallet::AccountKey> two = wallet::WalletStore::deriveAccounts(chain::bip39::split("letter advice cage absurd amount doctor acoustic avoid letter advice cage above"), {});
+        two.removeIf([segwit](const wallet::AccountKey& key) { return key.type != segwit; });
+        QList<wallet::AccountKey> other = wallet::WalletStore::deriveAccounts(chain::bip39::split("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong"), {});
+        other.removeIf([segwit](const wallet::AccountKey& key) { return key.type != segwit; });
+        other.first().account = 1;
+        two.append(other.first());
+        if (controller->addKeysWallet(two, QStringLiteral("Two accounts"), &error)) {
+            const quint32 both = controller->store().wallets.last().id;
+            check(waitFor([&] { return model->find(both, bitcoin, segwit, 1, 0, 3) >= 0 && model->find(both, bitcoin, segwit, 0, 0, 3) >= 0; }, 15000), QStringLiteral("with rows on both accounts"));
+            answerAll(model, both);
+            const wallet::AddressRow row = model->at(model->find(both, bitcoin, segwit, 1, 0, 3));
+            check(controller->markGivenOut(row, &error) && controller->isGivenOut(row), QStringLiteral("an address of the second account is marked"));
+            check(!controller->isGivenOut(model->at(model->find(both, bitcoin, segwit, 0, 0, 3))), QStringLiteral("and the same index of the first is not"));
+            check(controller->givenOutCount(both, bitcoin, segwit) == 1 && controller->givenOutRows(both, bitcoin, segwit, 10).size() == 1, QStringLiteral("and it is listed"));
+            receive->showFor(both, btc);
+            pause(50);
+            emit list->cellClicked(0, 0);
+            check(receive->shownAddress() == row.address, QStringLiteral("and a click on that line brings up that address: %1").arg(receive->shownAddress()));
+            // Its wallet goes while that is on screen.
+            check(controller->removeWallet(both, &error), QStringLiteral("the wallet goes: %1").arg(error));
+            pause(50);
+            check(receive->shownAddress() != row.address && walletCombo->findData(both) < 0, QStringLiteral("and so does what was on screen of it"));
+        } else {
+            check(false, QStringLiteral("a wallet with two accounts: %1").arg(error));
+        }
+    }
+
+    // A name is not a word of the program's.
+    {
+        check(controller->renameWallet(warehouse, QStringLiteral("Send"), &error), QStringLiteral("a wallet named as a word the program has"));
+        const QString language = ui::LanguageManager::instance()->language();
+        ui::LanguageManager::instance()->setLanguage(QStringLiteral("es"));
+        pause(50);
+        auto* filter = addresses->findChild<QComboBox*>(QStringLiteral("walletFilter"));
+        check(walletCombo->itemText(walletCombo->findData(warehouse)) == QLatin1String("Send") && filter->itemText(filter->findData(warehouse)) == QLatin1String("Send"), QStringLiteral("keeps its name in other languages: %1").arg(walletCombo->itemText(walletCombo->findData(warehouse))));
+        check(filter->itemText(0) == QStringLiteral("Todas las billeteras"), QStringLiteral("while the words of the list are translated: %1").arg(filter->itemText(0)));
+        check(ui::trText(QStringLiteral("%1 of the addresses it gave out have had nothing come in yet. If its seed is added again, they will be offered to someone else: only this PC knows they were given out.")) != QStringLiteral("%1 of the addresses it gave out have had nothing come in yet. If its seed is added again, they will be offered to someone else: only this PC knows they were given out."), QStringLiteral("and what a removal warns of too"));
+        ui::LanguageManager::instance()->setLanguage(language);
+        pause(50);
+    }
+
+    // More than the list holds: it says so, and where the rest are.
+    {
+        QList<wallet::AccountKey> many = wallet::WalletStore::deriveAccounts(chain::bip39::split("letter advice cage absurd amount doctor acoustic avoid letter advice cage above"), {});
+        many.removeIf([segwit](const wallet::AccountKey& key) { return key.type != segwit; });
+        many.first().given.runs.append({0, 250});
+        check(controller->addKeysWallet(many, QStringLiteral("Many"), &error), QStringLiteral("a wallet that has given out 250: %1").arg(error));
+        const quint32 id = controller->store().wallets.last().id;
+        check(waitFor([&] { return model->find(id, bitcoin, segwit, 0, 0, 249) >= 0; }, 15000), QStringLiteral("with its rows"));
+        answerAll(model, id);
+        receive->showFor(id, btc);
+        window.showPage(QStringLiteral("receive"));
+        receive->showFor(id, btc);
+        pause(50);
+        bool titled = false;
+        for (const QLabel* each : receive->findChildren<QLabel*>())
+            titled = titled || (each->isVisible() && each->text() == QStringLiteral("Given out: the latest 200 of 250"));
+        check(list->rowCount() == 200 && titled, QStringLiteral("the list says it holds the latest 200 of 250 (%1)").arg(list->rowCount()));
+    }
+
+    check(controller->removeAllWallets(&error), QStringLiteral("they all go: %1").arg(error));
+    pause(100);
+}
+
+// What was given out holds a window whatever was found before it, when Settings says what a gap would cost.
+void testGapsOverGivenOut(const Check& check, const QList<wallet::AccountKey>& keys)
+{
+    QString error;
+    const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
+    auto controller = std::make_unique<WalletController>();
+    offline(controller.get());
+    wallet::AccountKey key;
+    for (const wallet::AccountKey& each : keys) {
+        if (each.type == chain::ScriptType::P2WPKH)
+            key = each;
+    }
+    wallet::ScanSettings wide = controller->store().settings;
+    wide.utxoReceiveGap = 40;
+    check(controller->applySettings(wide, &error), QStringLiteral("gaps wider than the least: %1").arg(error));
+    key.given.runs.append({0, 300});
+    QList<wallet::AccountKey> added{key};
+    if (!controller->addKeysWallet(added, QStringLiteral("Tills"), &error)) {
+        check(false, QStringLiteral("a wallet for the test: %1").arg(error));
+        return;
+    }
+    const quint32 id = controller->store().wallets.first().id;
+    check(controller->store().wallets.first().accounts.first().given.end() == 300, QStringLiteral("that has given out 300 addresses"));
+    wallet::WalletModel* model = controller->model();
+    check(waitFor([&] { return !controller->loadingSaved() && model->find(id, bitcoin, key.type, 0, 0, 299) >= 0; }, 20000), QStringLiteral("with its rows"));
+    // Nearly all of them paid, with 31 in the middle still waiting.
+    for (quint32 index = 0; index < 300; ++index) {
+        if (index >= 100 && index <= 130)
+            continue;
+        wallet::AddressRow row = model->at(model->find(id, bitcoin, key.type, 0, 0, index));
+        row.checked = true;
+        row.used = true;
+        model->upsert(row);
+    }
+    wallet::ScanSettings narrow = wide;
+    narrow.utxoReceiveGap = 20;
+    const WalletController::GapImpact impact = controller->gapImpact(narrow);
+    check(impact.used == 0, QStringLiteral("a smaller gap leaves out none of what was given out: %1").arg(impact.used));
+    check(controller->removeAllWallets(&error), QStringLiteral("it goes: %1").arg(error));
+    controller.reset();
+
+    // What could not be written is tried a last time as the window goes.
+    {
+        controller = std::make_unique<WalletController>();
+        offline(controller.get());
+        wallet::AccountKey plain = key;
+        plain.given = {};
+        QList<wallet::AccountKey> one{plain};
+        check(controller->addKeysWallet(one, QStringLiteral("Tills"), &error), QStringLiteral("a wallet for the last try: %1").arg(error));
+        wallet::WalletModel* rows = controller->model();
+        const quint32 own = controller->store().wallets.first().id;
+        check(waitFor([&] { return !controller->loadingSaved() && rows->find(own, bitcoin, plain.type, 0, 0, 3) >= 0; }, 15000), QStringLiteral("with its rows"));
+        answerAll(rows, own);
+        const QString path = wallet::WalletStore::filePath();
+        const QByteArray whole = [&path] {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+        }();
+        {
+            QFile file(path);
+            file.open(QIODevice::Append);
+            file.write("x");
+        }
+        check(!controller->markGivenOut(rows->at(rows->find(own, bitcoin, plain.type, 0, 0, 3)), &error) && controller->givenOutOwed(), QStringLiteral("a file changed outside it cannot be written"));
+        {
+            QFile file(path);
+            file.open(QIODevice::WriteOnly | QIODevice::Truncate);
+            file.write(whole);
+        }
+        controller.reset();
+        wallet::WalletStore store;
+        check(store.load(&error) && store.wallets.first().accounts.first().given.contains(3), QStringLiteral("back as it was, the last try as the window goes writes it: %1").arg(error));
+        controller = std::make_unique<WalletController>();
+        controller->prices()->useTestServer(QStringLiteral("http://127.0.0.1:1"));
+        check(controller->loadExisting(&error), QStringLiteral("it opens: %1").arg(error));
+        waitFor([&] { return !controller->loadingSaved(); }, 15000);
+        check(controller->removeAllWallets(&error), QStringLiteral("it goes: %1").arg(error));
+    }
+}
+
 } // namespace
 
 void runScreensTest(const Check& check, QString* report, const QList<wallet::AccountKey>& someKeys)
@@ -1538,6 +2374,8 @@ void runScreensTest(const Check& check, QString* report, const QList<wallet::Acc
     const QString hideZero = SettingsRepo().get(QStringLiteral("ui.hideZero"));
     testFiguresHonest(check, someKeys);
     testScreens(check, someKeys);
+    testHandingOut(check, someKeys);
+    testGapsOverGivenOut(check, someKeys);
     SettingsRepo().set(QStringLiteral("ui.hideZero"), hideZero);
 }
 
@@ -1555,6 +2393,10 @@ bool writeScreenPictures(const QString& folder)
     window.show();
     WalletController* controller = window.controller();
     offline(controller);
+    controller->setStatusForTest([](wallet::NetworkStatus& status) {
+        status.connecting = false;
+        status.scanning = false;
+    });
     struct Named {
         const char* name;
         const char* words;
@@ -1646,6 +2488,8 @@ bool writeScreenPictures(const QString& folder)
     answerAllRows();
 
     const auto picture = [&](const QString& name) {
+        answerAllRows();
+        pause(300);
         answerAllRows();
         pause(500);
         return window.grab().save(folder + QLatin1Char('/') + name + QStringLiteral(".png"));

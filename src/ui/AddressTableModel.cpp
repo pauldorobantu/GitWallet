@@ -2,11 +2,13 @@
 
 #include "app/WalletController.h"
 #include "net/PriceFeed.h"
+#include "ui/Figures.h"
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
 #include "ui/TableUtil.h"
 #include "ui/design/Style.h"
 #include "wallet/WalletModel.h"
+#include "wallet/WalletStore.h"
 
 #include <QLocale>
 #include <QStringList>
@@ -239,9 +241,19 @@ qint64 pathKey(const wallet::AddressRow& row)
            | (qint64(row.change & 1u) << 25) | index;
 }
 
-QString stateLabel(wallet::AddressState state)
+// Coming in, in no block yet: it can still be replaced.
+bool notInABlock(const wallet::AddressRow& row)
 {
-    switch (state) {
+    return row.isUtxo() && row.unconfirmed > 0;
+}
+
+QString stateLabel(const wallet::AddressRow& row, bool givenOut)
+{
+    if (givenOut && row.state() == wallet::AddressState::Unused)
+        return trText(QStringLiteral("Given out"));
+    if (notInABlock(row))
+        return trText(QStringLiteral("Not in a block yet"));
+    switch (row.state()) {
     case wallet::AddressState::Funded:
         return trText(QStringLiteral("Funded"));
     case wallet::AddressState::Used:
@@ -254,8 +266,12 @@ QString stateLabel(wallet::AddressState state)
     return trText(QStringLiteral("Checking…"));
 }
 
-QString stateTip(const wallet::AddressRow& row)
+QString stateTip(const wallet::AddressRow& row, bool givenOut)
 {
+    if (givenOut && row.state() == wallet::AddressState::Unused)
+        return trText(QStringLiteral("Handed to someone, and nothing has come in yet"));
+    if (notInABlock(row))
+        return trText(QStringLiteral("It can still be replaced: do not count it as paid yet"));
     switch (row.state()) {
     case wallet::AddressState::Funded:
         return trText(QStringLiteral("Holds a balance now"));
@@ -271,15 +287,15 @@ QString stateTip(const wallet::AddressRow& row)
 }
 
 // Funded rows first when sorted descending; rows still being checked last.
-int stateRank(wallet::AddressState state)
+int stateRank(wallet::AddressState state, bool givenOut)
 {
     switch (state) {
     case wallet::AddressState::Funded:
-        return 3;
+        return 4;
     case wallet::AddressState::Used:
-        return 2;
+        return 3;
     case wallet::AddressState::Unused:
-        return 1;
+        return givenOut ? 2 : 1;
     case wallet::AddressState::Unknown:
         break;
     }
@@ -304,6 +320,12 @@ AddressTableModel::AddressTableModel(WalletController* controller, QObject* pare
     prices_ = currentPrices(controller_);
     refreshLabels();
     connect(controller_, &WalletController::walletChanged, this, &AddressTableModel::refreshLabels);
+    connect(controller_, &WalletController::walletChanged, this, [this] { givenStale_ = true; });
+    connect(controller_, &WalletController::rowGivenOut, this, [this](int row) {
+        givenStale_ = true;
+        if (row >= 0 && row < rows_)
+            emit dataChanged(index(row, 0), index(row, ColumnCount - 1));
+    });
     connect(controller_, &WalletController::labelsChanged, this, [this] {
         if (rows_ > 0)
             emit dataChanged(index(0, ColLabel), index(rows_ - 1, ColLabel));
@@ -367,15 +389,16 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             case ColLabel:
                 return controller_ ? controller_->addressLabel(row.address) : QString();
             case ColBalance:
-                return balancePending(row) ? dash() : balanceText(row);
+                // A figure not every lookup has answered for is a lower bound, here as on its own page.
+                return balancePending(row) ? dash() : row.checked ? balanceText(row) : figures::atLeast(balanceText(row));
             case ColUsd: {
                 if (balancePending(row))
                     return dash();
                 const RowValue v = valueOf(controller_, row);
-                return v.priced ? usdText(v.usd) : dash();
+                return !v.priced ? dash() : row.checked ? usdText(v.usd) : figures::atLeast(usdText(v.usd));
             }
             case ColState:
-                return stateLabel(row.state());
+                return stateLabel(row, waitingForPayment(row));
             }
             break;
         case SortRole:
@@ -396,7 +419,7 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             case ColUsd:
                 return sortValue(controller_, row);
             case ColState:
-                return stateRank(row.state());
+                return stateRank(row.state(), waitingForPayment(row));
             }
             break;
         case NetworkRole:
@@ -407,6 +430,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             return row.address;
         case WalletRole:
             return row.wallet;
+        case GivenOutRole:
+            return waitingForPayment(row);
         case kCopyRole:
             return column == ColAddress ? QVariant(row.address) : QVariant();
         case Qt::ToolTipRole:
@@ -418,7 +443,7 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             case ColUsd:
                 return usdTip(controller_, row);
             case ColState:
-                return stateTip(row);
+                return stateTip(row, waitingForPayment(row));
             default:
                 break;
             }
@@ -434,8 +459,12 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             if (column == ColBalance || column == ColUsd)
                 return state == wallet::AddressState::Funded ? page::text() : page::muted();
             if (column == ColState) {
+                if (notInABlock(row))
+                    return toneColor(Tone::Warning);
                 if (state == wallet::AddressState::Funded)
                     return toneColor(Tone::Success);
+                if (waitingForPayment(row))
+                    return toneColor(Tone::Accent);
                 if (state != wallet::AddressState::Used)
                     return toneColor(Tone::Muted);
             }
@@ -560,6 +589,26 @@ void AddressTableModel::refreshPrices()
         if (model->at(row).state() == wallet::AddressState::Funded)
             emit dataChanged(index(row, ColBalance), index(row, ColUsd));
     }
+}
+
+bool AddressTableModel::waitingForPayment(const wallet::AddressRow& row) const
+{
+    if (row.change != 0 || row.used || row.state() == wallet::AddressState::Funded || !controller_)
+        return false;
+    if (givenStale_) {
+        givenStale_ = false;
+        given_.clear();
+        for (const wallet::WalletEntry& entry : controller_->store().wallets) {
+            for (const wallet::AccountKey& key : entry.accounts) {
+                if (!key.given.isEmpty())
+                    given_.insert(KeyId{key.wallet, key.account, quint8(key.type), chain::isUtxo(key.type) ? quint16(key.network) : quint16(0)}, key.given);
+            }
+        }
+    }
+    if (given_.isEmpty())
+        return false;
+    const auto own = given_.constFind(KeyId{row.wallet, row.account, quint8(row.type), row.isUtxo() ? quint16(row.network) : quint16(0)});
+    return own != given_.cend() && own->contains(row.index);
 }
 
 void AddressTableModel::refreshLabels()

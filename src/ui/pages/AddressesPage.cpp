@@ -6,6 +6,7 @@
 #include "ui/Csv.h"
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
+#include "ui/Holdings.h"
 #include "ui/HoverRowTable.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
@@ -26,6 +27,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
@@ -41,6 +43,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <functional>
 
 namespace app::ui {
 
@@ -49,7 +52,27 @@ namespace {
 // What the chain filter holds when it shows every network.
 constexpr int kAllChains = -1;
 // Combo indices of the state filter.
-enum StateFilter { StateAll, StateFunded, StateUsed };
+enum StateFilter { StateAll, StateFunded, StateUsed, StateGivenOut };
+
+// Ctrl+C is Copy address: Qt's own would hand out the cell as it reads, unmarked.
+class AddressView : public HoverRowTableView
+{
+public:
+    using HoverRowTableView::HoverRowTableView;
+    std::function<void()> copy;
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        if (event->matches(QKeySequence::Copy)) {
+            if (copy)
+                copy();
+            event->accept();
+            return;
+        }
+        HoverRowTableView::keyPressEvent(event);
+    }
+};
 
 // Refresh calls CoinGecko and the public RPC endpoints, which rate-limit;
 // the same pause as the Overview page's button.
@@ -123,7 +146,10 @@ protected:
             return false;
         if (chain_ != kAllChains && first.data(AddressTableModel::NetworkRole).toInt() != chain_)
             return false;
-        if (state_ != StateAll) {
+        if (state_ == StateGivenOut) {
+            if (!first.data(AddressTableModel::GivenOutRole).toBool())
+                return false;
+        } else if (state_ != StateAll) {
             const auto state =
                 static_cast<wallet::AddressState>(first.data(AddressTableModel::StateRole).toInt());
             // Used includes Funded: an address holding coins has received them.
@@ -248,6 +274,8 @@ struct AddressesPage::Ui : QObject
     QPushButton* refresh = nullptr;
     QPushButton* history = nullptr;
     QPushButton* label = nullptr;
+    QPushButton* copy = nullptr;
+    QString lastCopied;
     QWidget* noWallet = nullptr; // first run: no wallet added yet
     QWidget* waiting = nullptr;  // a wallet whose first addresses are not derived yet
     QWidget* noResults = nullptr;
@@ -257,6 +285,8 @@ struct AddressesPage::Ui : QObject
     QWidget* nothingHere = nullptr; // a place where no address holds what it is about
     bool inPlace = false;        // the wallet and chain come from the place, and their combos are gone
     int placeState = 0;          // the state a place came up on: anything else is the reader's own
+    quint32 placeWallet = 0;
+    std::optional<wallet::Asset> placeAsset;
     bool wholeOwed = false;      // the place has been left, and the rows go back when the page next shows
 };
 
@@ -274,7 +304,8 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->filter->setSortRole(AddressTableModel::SortRole);
     ui_->filter->setSortCaseSensitivity(Qt::CaseInsensitive);
 
-    auto* view = new HoverRowTableView(this);
+    auto* view = new AddressView(this);
+    view->copy = [this] { copySelected(); };
     ui_->view = view;
     view->setModel(ui_->filter);
     page::configureTable(view);
@@ -292,22 +323,6 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     header->setStretchLastSection(false);
     header->setSortIndicator(AddressTableModel::ColPath, Qt::AscendingOrder);
     view->setSortingEnabled(true);
-    // What goes on the clipboard may go to someone who is to pay: what the key gives, and marked.
-    installCopyOnClick(view, {AddressTableModel::ColAddress}, [this](const QModelIndex& index) {
-        const QModelIndex source = ui_->filter->mapToSource(index);
-        const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
-        if (!model || !source.isValid() || source.row() >= model->size())
-            return QString();
-        const wallet::AddressRow& row = model->at(source.row());
-        const QString address = controller_->checkedAddress(row);
-        if (address.isEmpty()) {
-            Feedback::show(ui_->view, Feedback::Type::Error, trText(QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.")));
-            return QString();
-        }
-        QString error;
-        controller_->markGivenOut(row, &error); // what fails is said on its own, and tried again
-        return address;
-    });
     applyColumnWidths();
     root->addWidget(view, 1);
 
@@ -337,9 +352,9 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->chain->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->state = new QComboBox(bar.widget);
     ui_->state->setObjectName(QStringLiteral("stateFilter"));
-    ui_->state->addItems({QStringLiteral("All states"), QStringLiteral("Funded"), QStringLiteral("Used")});
+    ui_->state->addItems({QStringLiteral("All states"), QStringLiteral("Funded"), QStringLiteral("Used"), QStringLiteral("Given out")});
     ui_->state->setSizeAdjustPolicy(QComboBox::AdjustToContents);
-    ui_->state->setToolTip(QStringLiteral("Funded: holds a balance now. Used: has transactions or a balance."));
+    ui_->state->setToolTip(trText(QStringLiteral("Funded: holds a balance now. Used: has transactions or a balance. Given out: handed to someone, and nothing has come in yet.")));
     ui_->count = page::makeBarCount(bar.widget);
     bar.left->addWidget(ui_->search);
     bar.left->addWidget(ui_->wallet);
@@ -355,6 +370,9 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->refresh->setToolTip(QStringLiteral("Fetch prices and read the balances that are not followed live, now"));
     page::setLabeledIcon(ui_->refresh, refreshIcon());
     bar.right->addWidget(ui_->refresh);
+    ui_->copy = new QPushButton(QStringLiteral("Copy address"), bar.widget);
+    ui_->copy->setToolTip(trText(QStringLiteral("Copies the address chosen, and counts it as given out")));
+    bar.right->addWidget(ui_->copy);
     ui_->label = new QPushButton(QStringLiteral("Label"), bar.widget);
     ui_->label->setToolTip(trText(QStringLiteral("A name for this address that only this PC knows")));
     bar.right->addWidget(ui_->label);
@@ -418,6 +436,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
             openHistoryOf(rows.first());
     });
     connect(ui_->label, &QPushButton::clicked, this, &AddressesPage::editLabelOfSelected);
+    connect(ui_->copy, &QPushButton::clicked, this, &AddressesPage::copySelected);
     connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &AddressesPage::scheduleUpdate);
 
     // Scan results arrive as inserts and single-row changes, hundreds a second:
@@ -436,6 +455,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     });
     // Header titles and the count are runtime text (trText).
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this] {
+        rebuildWalletFilter();
         applyColumnWidths();
         updateState();
     });
@@ -459,14 +479,12 @@ void AddressesPage::rebuildWalletFilter()
     {
         const QSignalBlocker quiet(ui_->wallet);
         ui_->wallet->clear();
-        ui_->wallet->addItem(QStringLiteral("All wallets"), quint32(0));
+        // A name is what someone called it, so the language walk leaves this combo alone.
+        ui_->wallet->addItem(trText(QStringLiteral("All wallets")), quint32(0));
         for (const wallet::WalletEntry& w : wallets)
             ui_->wallet->addItem(w.label, w.id);
         const int keep = ui_->wallet->findData(chosen);
         ui_->wallet->setCurrentIndex(keep >= 0 ? keep : 0); // a wallet removed: back to all
-        // LanguageManager keeps a combo's first texts and writes them back by
-        // position; these are new, and it reads them afresh.
-        ui_->wallet->setProperty("i18nOrig_items", QVariant());
     }
     ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
     ui_->wallet->setVisible(wallets.size() > 1 && !ui_->inPlace);
@@ -485,6 +503,8 @@ void AddressesPage::showPlace(quint32 wallet, std::optional<wallet::Asset> asset
     ui_->inPlace = true;
     ui_->wholeOwed = false;
     ui_->placeState = asset ? StateFunded : StateAll;
+    ui_->placeWallet = wallet;
+    ui_->placeAsset = asset;
     {
         const QSignalBlocker quietWallet(ui_->wallet);
         const QSignalBlocker quietChain(ui_->chain);
@@ -562,6 +582,26 @@ void AddressesPage::openAddressOf(const QModelIndex& index)
     emit openAddressRequested(model->at(source.row()));
 }
 
+QString AddressesPage::lastCopied() const
+{
+    return ui_->lastCopied;
+}
+
+void AddressesPage::copySelected()
+{
+    const QModelIndexList rows = ui_->view->selectionModel()->selectedRows();
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (rows.isEmpty() || !model)
+        return;
+    const QModelIndex source = ui_->filter->mapToSource(rows.first());
+    if (!source.isValid() || source.row() >= model->size())
+        return;
+    // A copy: what marking it sets off may move what is in the model.
+    const wallet::AddressRow row = model->at(source.row());
+    if (copyAddress(ui_->copy, controller_, row))
+        ui_->lastCopied = controller_->checkedAddress(row);
+}
+
 void AddressesPage::editLabelOfSelected()
 {
     const QModelIndexList rows = ui_->view->selectionModel()->selectedRows();
@@ -585,7 +625,6 @@ void AddressesPage::editLabel(const QString& address)
     page::applyDialogLayout(column);
     auto* where = new QLabel(address, dialog);
     where->setTextFormat(Qt::PlainText);
-    where->setTextInteractionFlags(Qt::TextSelectableByMouse);
     column->addWidget(where);
     auto* name = new QLineEdit(controller_->addressLabel(address), dialog);
     name->setObjectName(QStringLiteral("addressLabel"));
@@ -752,7 +791,7 @@ void AddressesPage::applyColumnWidths()
         2 * cell.averageCharWidth());
     fit(AddressTableModel::ColLabel, {QStringLiteral("A label for it")}, 0);
     fit(AddressTableModel::ColUsd, {QStringLiteral("$00,000,000.00")}, 0);
-    fit(AddressTableModel::ColState, {QStringLiteral("Checking…"), QStringLiteral("Funded")}, 0);
+    fit(AddressTableModel::ColState, {QStringLiteral("Checking…"), QStringLiteral("Not in a block yet")}, 0);
     header->setSectionResizeMode(AddressTableModel::ColBalance, QHeaderView::Stretch);
 }
 
@@ -797,6 +836,7 @@ void AddressesPage::updateState()
     const bool chosen = !ui_->view->selectionModel()->selectedRows().isEmpty();
     ui_->history->setEnabled(chosen);
     ui_->label->setEnabled(chosen);
+    ui_->copy->setEnabled(chosen);
 
     const int shown = ui_->filter->rowCount();
     // Not part of what the database kept, with nothing to say so.
@@ -823,12 +863,15 @@ void AddressesPage::updateState()
     // Without a wallet a leftover search or filter must not turn the
     // first-run state into "No results". In a place, only what the reader chose counts as a filter.
     const bool scanning = controller_ && controller_->isScanning();
-    QWidget* empty = !hasWallet ? ui_->noWallet : (ui_->inPlace && !scanning && shown == 0) ? ui_->nothingHere : ui_->waiting;
+    // Said only once all there is to ask has answered: until then nobody knows.
+    const bool nothing = hasWallet && ui_->inPlace && !scanning && shown == 0 && ui_->placeAsset && holdingOf(controller_, *ui_->placeAsset, ui_->placeWallet).complete;
+    QWidget* empty = !hasWallet ? ui_->noWallet : nothing ? ui_->nothingHere : ui_->waiting;
     for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->nothingHere}) {
         if (other != empty)
             other->hide();
     }
-    const bool narrowed = ui_->inPlace ? ui_->state->currentIndex() != ui_->placeState : ui_->filter->filtered();
+    const bool chainChosen = !ui_->placeAsset && ui_->chain->currentData().toInt() != kAllChains;
+    const bool narrowed = ui_->inPlace ? ui_->state->currentIndex() != ui_->placeState || chainChosen : ui_->filter->filtered();
     page::showListState(ui_->view, empty, ui_->noResults, shown,
                         hasWallet ? ui_->search->text().trimmed() : QString(),
                         hasWallet && narrowed);

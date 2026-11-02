@@ -48,8 +48,8 @@ void HoldingsPage::showEvent(QShowEvent* event)
 
 void HoldingsPage::updateCount()
 {
-    // No count of nothing while nothing has answered.
-    if (!table_->allFinal() && table_->rowsHolding() == 0)
+    // No count of nothing while nothing has answered, nor of no row at all.
+    if (table_->rowsTotal() == 0 || (!table_->allFinal() && table_->rowsHolding() == 0))
         count_->clear();
     else if (table_->allFinal())
         count_->setText(trText(QStringLiteral("%1 of %2 hold something")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal())));

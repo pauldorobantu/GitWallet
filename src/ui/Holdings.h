@@ -6,6 +6,7 @@
 
 #include <QColor>
 #include <QList>
+#include <QStringList>
 #include <QWidget>
 
 class QTableView;
@@ -31,6 +32,7 @@ struct Holding {
     bool readable = true;   // chain:: could convert it
     int holders = 0;        // addresses holding some
     int pending = 0;        // addresses of its network without an answer yet
+    qint64 incoming = 0;    // of its amount, what is in no block yet, in smallest units
     bool missing = false;   // an account has no rows yet
     bool unread = false;    // a key of a kind this version cannot read
     bool oneWallet = false; // of one wallet, rather than of them all
@@ -45,6 +47,9 @@ Holding holdingOf(const WalletController* controller, wallet::Asset asset, quint
 Holding holdingAt(const WalletController* controller, const wallet::AddressRow& row, wallet::Asset asset);
 // Why a figure is not final, and how current what is known of it is. Empty: nothing to say.
 QString holdingNote(const WalletController* controller, const Holding& holding);
+// The same of one wallet's total and of one address's figures: a part per thing, once each.
+QStringList walletNotes(const WalletController* controller, quint32 wallet);
+QStringList addressNotes(const WalletController* controller, const wallet::AddressRow& row);
 
 // The sum of a scope in USD. Something held without a price would make it silently too low, so
 // then there is no sum.
