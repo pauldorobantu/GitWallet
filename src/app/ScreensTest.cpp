@@ -1367,6 +1367,22 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
         check(receive->shownAddress() == list->item(0, 0)->text(), QStringLiteral("what was asked for stays through that"));
         receive->showFor(shop, btc);
         check(receive->shownAddress() == now.address, QStringLiteral("and the next one is still next"));
+        // A line that no longer says what its row says shows nothing else: rows move.
+        const QString said = list->item(0, 0)->text();
+        list->item(0, 0)->setText(QStringLiteral("something else"));
+        emit list->cellClicked(0, 0);
+        check(receive->shownAddress() == now.address && list->item(0, 0)->text() == said, QStringLiteral("a line that says something else than its row shows nothing, and is read again"));
+    }
+
+    // A label longer than the field holds, as one read from a file can be: Copy does not cut it.
+    {
+        const wallet::ReceiveOffer now = controller->nextReceive(shop, bitcoin, chain::ScriptType::P2WPKH);
+        const QString longLabel(1500, QLatin1Char('x'));
+        check(controller->setAddressLabel(now.address, longLabel, &error), QStringLiteral("a label longer than the field"));
+        receive->showFor(shop, btc);
+        buttonNamed(receive, QStringLiteral("Copy address"))->click();
+        check(controller->addressLabel(now.address) == longLabel, QStringLiteral("is left whole by what was not typed (%1)").arg(controller->addressLabel(now.address).size()));
+        receive->showFor(shop, btc);
     }
 
     // A label refused stays, with why, and New address does not move on from it.
