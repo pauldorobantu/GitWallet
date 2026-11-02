@@ -598,7 +598,8 @@ void testGivenOut(const Check& check, const QList<wallet::AccountKey>& keys)
     };
     check(waitFor([&] { return rowAt(4) >= 0; }, 10000), QStringLiteral("its rows are derived with no server"));
     const auto giveOut = [&](quint32 index) {
-        return controller->markGivenOut(model->at(rowAt(index)), &error);
+        const int at = rowAt(index);
+        return at >= 0 && controller->markGivenOut(model->at(at), &error);
     };
     wallet::ReceiveOffer offer = controller->nextReceive(id, bitcoin, chain::ScriptType::P2WPKH);
     check(offer.state == wallet::ReceiveOffer::State::Checking && offer.address.isEmpty(), QStringLiteral("with no server to answer, nobody can say one is unused, and none is offered"));
@@ -695,8 +696,10 @@ void testGivenOut(const Check& check, const QList<wallet::AccountKey>& keys)
     check(controller->markGivenOut(model->at(rowAt(0, chain::ScriptType::EthAccount)), &error) && controller->nextReceive(id, ethereum, chain::ScriptType::EthAccount).index == 1, QStringLiteral("and it moves on by itself"));
 
     // A wallet can only say that of its own key.
-    {
-        wallet::AddressRow other = model->at(rowAt(gap + 11));
+    const int further = rowAt(gap + 11);
+    check(further >= 0, QStringLiteral("the row past all of those is there"));
+    if (further >= 0) {
+        wallet::AddressRow other = model->at(further);
         other.wallet = id + 100;
         check(controller->markGivenOut(other, &error) && controller->nextReceive(id, bitcoin, chain::ScriptType::P2WPKH).index == gap + 11, QStringLiteral("a wallet that is not there moves nothing"));
     }

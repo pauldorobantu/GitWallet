@@ -1404,6 +1404,59 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         }
         wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
     }
+    // With the next round far off and every place for coins taken: only going live watches it.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(600000, 200, 10);
+        wallet::AccountKey key = segwit;
+        key.given.add(45); // past its places from the very start, so rows take places as they hold coins
+        FakeElectrum server;
+        for (quint32 index = 0; index <= 76; index += 4)
+            server.fund(scripthashOf(key, 0, index), 100);
+        wallet::WalletModel model;
+        {
+            UtxoRun first(&model, server, key, 5, 5);
+            check(waitFor([&first] { return first.finished; }, 30000), QStringLiteral("twenty that hold coins scan"));
+            first.scanner.stop();
+        }
+        // From what was saved, those rows are no next addresses, and they take the places for coins.
+        FakeElectrum again;
+        for (quint32 index = 0; index <= 76; index += 4)
+            again.fund(scripthashOf(key, 0, index), 100);
+        UtxoRun run(&model, again, key, 5, 5);
+        check(waitFor([&run] { return run.finished; }, 30000), QStringLiteral("and start again from what was saved"));
+        const wallet::ScanTiers tiers = run.scanner.tiers();
+        check(tiers.live == 21 && tiers.rounds > 0, QStringLiteral("ten of them live, with places left: %1 live, %2 in rounds").arg(tiers.live).arg(tiers.rounds));
+        check(!again.follows(scripthashOf(key, 0, 50)), QStringLiteral("an unused one below the last used is not followed"));
+        key.given.add(50);
+        run.scanner.noteGiven(key, 50);
+        check(waitFor([&again, &key] { return again.follows(scripthashOf(key, 0, 50)); }, 3000), QStringLiteral("until it is given out: then it goes live at once, past the places for coins"));
+        run.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
+    // More addresses next than places, starting from what was saved: what was given out comes first.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(300, 200, 100);
+        wallet::AccountKey key = segwit;
+        key.given.add(70);
+        FakeElectrum server;
+        server.fund(scripthashOf(key, 0, 0), 500);
+        wallet::WalletModel model;
+        {
+            UtxoRun first(&model, server, key, 100, 5);
+            check(waitFor([&first] { return first.finished; }, 30000), QStringLiteral("a window longer than its places scans"));
+            first.scanner.stop();
+        }
+        FakeElectrum again;
+        again.fund(scripthashOf(key, 0, 0), 500);
+        UtxoRun second(&model, again, key, 100, 5);
+        check(waitFor([&second] { return second.finished; }, 30000), QStringLiteral("and starts again from what was saved"));
+        check(second.scanner.tiers().live == 40, QStringLiteral("with every place taken (%1)").arg(second.scanner.tiers().live));
+        check(again.follows(scripthashOf(key, 0, 70)), QStringLiteral("and the one given out among them, though those before it are also next"));
+        second.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
     {
         wallet::AccountKey key = account;
         key.given.add(7);
