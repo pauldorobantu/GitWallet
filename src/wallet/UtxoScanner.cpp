@@ -1277,8 +1277,13 @@ void UtxoScanner::pumpRequests()
         // What is to be followed live does not wait for them: there may be an hour's worth of those, and
         // an address just given out among these.
         const bool paced = tiered();
-        if (!balanceQueue_.isEmpty() && !(paced && readsPaused()) && (!paced || takeReadToken())) {
-            sendBalance(balanceQueue_.takeFirst());
+        if (!balanceQueue_.isEmpty() && !(paced && readsPaused())) {
+            if (!paced || takeReadToken())
+                sendBalance(balanceQueue_.takeFirst());
+            else if (!subQueue_.isEmpty())
+                sendSubscribe(subQueue_.takeFirst());
+            else
+                break;
         } else if (!subQueue_.isEmpty()) {
             sendSubscribe(subQueue_.takeFirst());
         } else if (readsPaused() || (readPauseMs_ > 0 && readsOut_ > 0)) {

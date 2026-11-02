@@ -1539,6 +1539,22 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         run.scanner.stop();
         wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
     }
+    // One given out far along says nothing of those before it, which nobody was given.
+    {
+        wallet::UtxoScanner::setLivePlacesForTest(40);
+        wallet::UtxoScanner::setPacesForTest(600000, 200, 10);
+        wallet::AccountKey key = segwit;
+        key.given.add(70);
+        FakeElectrum server;
+        wallet::WalletModel model;
+        UtxoRun run(&model, server, key, 100, 5);
+        check(waitFor([&run] { return run.finished; }, 30000), QStringLiteral("an address given out far along, with nothing used"));
+        check(run.scanner.tiers().live == 31, QStringLiteral("takes one place, beside the next ones: %1").arg(run.scanner.tiers().live));
+        check(server.follows(scripthashOf(key, 0, 70)) && server.follows(scripthashOf(key, 0, 24)), QStringLiteral("it and those"));
+        check(!server.follows(scripthashOf(key, 0, 50)), QStringLiteral("and none between them"));
+        run.scanner.stop();
+        wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
+    }
     // Given out while its first read waits behind thousands: it does not wait for them.
     {
         wallet::UtxoScanner::setLivePlacesForTest(40);
