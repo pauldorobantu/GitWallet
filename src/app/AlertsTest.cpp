@@ -604,6 +604,17 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(payments->all().constLast().whileClosed, QStringLiteral("what comes up while saved figures are being checked came while it was closed"));
         pause(50);
         check(scene.window->lastPaymentAlert().contains(QStringLiteral("while GitWallet was closed")), QStringLiteral("and is told as such: %1").arg(scene.window->lastPaymentAlert()));
+        // A transaction is read a moment after its address moved, by which time the start may be over.
+        controller->setShowingSavedForTest(true);
+        scene.paid(15, QStringLiteral("c1"), 30000);
+        controller->setShowingSavedForTest(false);
+        scene.add(transaction({somewhere(20)}, {{scene.scriptOf(15), 30000}}, 20));
+        check(payments->all().constLast().whileClosed, QStringLiteral("what moved at the start came while it was closed, however late its transaction is read"));
+        pause(50);
+        scene.paid(16, QStringLiteral("c2"), 30000);
+        scene.add(transaction({somewhere(21)}, {{scene.scriptOf(16), 30000}}, 21));
+        check(!payments->all().constLast().whileClosed, QStringLiteral("what moved after it did not"));
+        pause(50);
 
         // Nothing said when it is not wanted, and the list still kept.
         const int kept2 = scene.payments();

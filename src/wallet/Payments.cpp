@@ -61,7 +61,7 @@ void PaymentBook::onRowMoved(int row, const AddressRow& before)
             return;
         const auto own = std::find_if(books_.cbegin(), books_.cend(), [&now](const HistoryBook* book) { return book->network() == now.network; });
         if (own != books_.cend() && (*own)->statusOf(now.scripthash) == before.status)
-            expecting_[now.network].insert(now.scripthash);
+            expecting_[now.network].insert(now.scripthash, hooks_.starting && hooks_.starting());
         return;
     }
     if (before.balances == now.balances)
@@ -87,18 +87,19 @@ void PaymentBook::onRowMoved(int row, const AddressRow& before)
         chain::Amount gain = is;
         gain -= was;
         if (!isDust(asset, gain, {row}))
-            record(asset, gain, now.wallet, now.address, 1, nullptr);
+            record(asset, gain, now.wallet, now.address, 1, nullptr, hooks_.starting && hooks_.starting());
     }
 }
 
 void PaymentBook::onAdded(HistoryBook* book, int position)
 {
     const TxRecord& tx = book->at(position);
-    const QSet<QString> expected = expecting_.value(book->network());
+    const QHash<QString, bool> expected = expecting_.value(book->network());
     if (expected.isEmpty() || told_.contains(tx.txid))
         return;
     qint64 received = 0;
     bool news = false;
+    bool whileClosed = false;
     QList<int> rows;
     QString first;
     bool firstIsChange = false;
@@ -112,6 +113,7 @@ void PaymentBook::onAdded(HistoryBook* book, int position)
             continue;
         const HistoryBook::AddressEntry& entry = book->addressAt(effect.address);
         news = news || expected.contains(entry.scripthash);
+        whileClosed = whileClosed || expected.value(entry.scripthash);
         received += effect.received;
         ++addresses;
         const int row = model_->findByScripthash(book->network(), entry.scripthash);
@@ -147,7 +149,7 @@ void PaymentBook::onAdded(HistoryBook* book, int position)
     if (isDust(networkInfo(book->network()).coin, amount, rows))
         return;
     told_.insert(tx.txid);
-    record(networkInfo(book->network()).coin, amount, wallet, first, addresses, &tx.txid);
+    record(networkInfo(book->network()).coin, amount, wallet, first, addresses, &tx.txid, whileClosed);
 }
 
 bool PaymentBook::isDust(Asset asset, const chain::Amount& amount, const QList<int>& rows) const
@@ -162,7 +164,7 @@ bool PaymentBook::isDust(Asset asset, const chain::Amount& amount, const QList<i
     return true;
 }
 
-void PaymentBook::record(Asset asset, const chain::Amount& amount, quint32 wallet, const QString& address, int addresses, const chain::Hash256* txid)
+void PaymentBook::record(Asset asset, const chain::Amount& amount, quint32 wallet, const QString& address, int addresses, const chain::Hash256* txid, bool whileClosed)
 {
     const AssetInfo& info = assetInfo(asset);
     Payment payment;
@@ -184,7 +186,7 @@ void PaymentBook::record(Asset asset, const chain::Amount& amount, quint32 walle
         payment.txid = *txid;
         payment.hasTx = true;
     }
-    payment.whileClosed = hooks_.starting && hooks_.starting();
+    payment.whileClosed = whileClosed;
     payments_.append(payment);
     ++unread_;
     if (payments_.size() > kMaxKept) {

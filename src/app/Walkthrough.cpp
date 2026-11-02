@@ -2,8 +2,11 @@
 
 #include "app/WalletController.h"
 #include "chain/Bip39.h"
+#include "ui/AddressTableModel.h"
+#include "ui/Figures.h"
 #include "ui/MainWindow.h"
 #include "ui/dialogs/ImportSeedDialog.h"
+#include "ui/dialogs/PaymentsDialog.h"
 #include "ui/HistoryTableModel.h"
 #include "ui/Holdings.h"
 #include "ui/PlaceBar.h"
@@ -21,6 +24,7 @@
 
 #include <QAbstractButton>
 #include <QAbstractItemModel>
+#include <QAbstractProxyModel>
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -141,6 +145,9 @@ Walkthrough::Walkthrough(WindowFactory makeWindow, const QString& outDir, QObjec
 
 void Walkthrough::start()
 {
+    // Its checks go by every row of what the public seeds hold, dust included. One step looks at dust itself.
+    hideDustWas_ = ui::figures::hideDust();
+    ui::figures::setHideDust(false);
     window_ = makeWindow_();
     connect(window_->controller(), &WalletController::scanFinished, this, [this] { scanFinished_ = true; });
     buildSteps();
@@ -914,6 +921,29 @@ void Walkthrough::buildSteps()
                         .arg(controller()->model()->fundedCount()));
          },
          nullptr},
+        // What the public seeds hold includes what strangers scattered on them.
+        {QStringLiteral("hide-dust"),
+         [this] {
+             auto* page = window_->findChild<ui::AddressesPage*>();
+             for (QComboBox* combo : page ? page->findChildren<QComboBox*>() : QList<QComboBox*>())
+                 combo->setCurrentIndex(0);
+             if (auto* hide = page ? page->findChild<QCheckBox*>(QStringLiteral("addressesHideDust")) : nullptr)
+                 hide->setChecked(true);
+         },
+         nullptr, 3000,
+         [this, controller, tableRows] {
+             auto* table = window_->findChild<ui::AddressesPage*>()->findChild<QTableView*>();
+             const auto* rows = static_cast<const QAbstractProxyModel*>(table->model());
+             const auto* source = static_cast<const ui::AddressTableModel*>(rows->sourceModel());
+             int dust = 0;
+             for (int row = 0; row < controller()->model()->size(); ++row) {
+                 if (source->isDust(row))
+                     ++dust;
+             }
+             expect(tableRows() + dust == controller()->model()->size(), QStringLiteral("Hide dust takes off what holds only dust: %1 rows and %2 of dust, of %3").arg(tableRows()).arg(dust).arg(controller()->model()->size()));
+             window_->findChild<ui::AddressesPage*>()->findChild<QCheckBox*>(QStringLiteral("addressesHideDust"))->setChecked(false);
+         },
+         nullptr},
         // The history of what those addresses did.
         {QStringLiteral("history"),
          [this] { window_->showPage(QStringLiteral("history")); },
@@ -1077,8 +1107,18 @@ void Walkthrough::buildSteps()
          nullptr, 1000,
          [this, historyLines, historyBook] { expect(historyLines() == historyBook()->lineCount(), QStringLiteral("Show all brings back every line")); },
          nullptr},
+        {QStringLiteral("payments"),
+         [this] { window_->openPayments(); },
+         nullptr, 3000,
+         [this] {
+             auto* dialog = window_->findChild<ui::PaymentsDialog*>();
+             expect(dialog && dialog->isVisible(), QStringLiteral("the bell opens what came in"));
+         },
+         nullptr},
         {QStringLiteral("settings"),
          [this] {
+             if (auto* dialog = window_->findChild<ui::PaymentsDialog*>())
+                 dialog->done(0);
              auto* page = window_->findChild<ui::AddressesPage*>();
              for (QComboBox* combo : page ? page->findChildren<QComboBox*>() : QList<QComboBox*>())
                  combo->setCurrentIndex(0);
@@ -1090,6 +1130,8 @@ void Walkthrough::buildSteps()
              expect(text.contains(QStringLiteral("3 wallets")), QStringLiteral("Settings says how many wallets"));
              expect(findButton(settingsPage(), QStringLiteral("Remove all wallets from this PC")) != nullptr,
                     QStringLiteral("Settings offers to remove them all"));
+             expect(findButton(settingsPage(), QStringLiteral("Set a password")) != nullptr, QStringLiteral("and a password"));
+             expect(findButton(settingsPage(), QStringLiteral("Make a backup")) != nullptr, QStringLiteral("and a backup"));
          },
          nullptr},
         // The second seed has a used address at index 150 of a chain whose previous
@@ -1570,6 +1612,7 @@ void Walkthrough::finish()
     // public seeds happen to hold.
     if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")); hide && hideZeroWas_)
         hide->setChecked(*hideZeroWas_);
+    ui::figures::setHideDust(hideDustWas_);
     const QJsonObject summary{{QStringLiteral("failures"), failures_}, {QStringLiteral("steps"), results_}};
     QFile f(outDir_ + QStringLiteral("/walkthrough.json"));
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))

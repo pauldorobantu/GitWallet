@@ -201,7 +201,7 @@ QToolButton#tbClose:pressed { background-color: rgba(0,0,0,0.28); color: #ffffff
     font-size: 12px; font-weight: 600; letter-spacing: 0.4px; }
 #titleBar QToolButton#tbLang:hover { background-color: rgba(%HOVER%); color: %TEXT%; }
 #titleBar QToolButton#tbLang::menu-indicator, #titleBar QToolButton#tbTheme::menu-indicator { image: none; width: 0; }
-#titleBar QToolButton#tbTheme { border-radius: %RNAV%px; }
+#titleBar QToolButton#tbTheme, #titleBar QToolButton#tbBell, #titleBar QToolButton#tbLock { border-radius: %RNAV%px; }
 
 /* ===== Sidebar MEmu-style (expanded ↔ icon-only rail) ===== */
 #sideNav { background-color: %SIDE%; border-right: 1px solid %BORDER%; }

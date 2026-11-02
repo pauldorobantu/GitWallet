@@ -67,6 +67,7 @@ private:
     int rowsBeforeReopen_ = 0;
     QString givenOutAddress_;
     std::optional<bool> hideZeroWas_;
+    bool hideDustWas_ = true;
     quint32 givenOutIndex_ = 0;
     QString totalsBeforeReopen_;
     quint32 removedWallet_ = 0;

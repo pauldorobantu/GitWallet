@@ -2364,8 +2364,9 @@ void testGapsOverGivenOut(const Check& check, const QList<wallet::AccountKey>& k
 
 } // namespace
 
-// In AlertsTest.cpp.
+// In AlertsTest.cpp and LockTest.cpp.
 void runAlertsTest(const std::function<void(bool, const QString&)>& check, const QList<wallet::AccountKey>& someKeys);
+void runLockTest(const std::function<void(bool, const QString&)>& check, QString* report, const QList<wallet::AccountKey>& someKeys);
 
 void runScreensTest(const Check& check, QString* report, const QList<wallet::AccountKey>& someKeys)
 {
@@ -2384,6 +2385,7 @@ void runScreensTest(const Check& check, QString* report, const QList<wallet::Acc
     testHandingOut(check, someKeys);
     testGapsOverGivenOut(check, someKeys);
     runAlertsTest(check, someKeys);
+    runLockTest(check, report, someKeys);
     SettingsRepo().set(QStringLiteral("ui.hideZero"), hideZero);
     SettingsRepo().set(QStringLiteral("ui.hideDust"), hideDust);
     SettingsRepo().set(QStringLiteral("ui.paymentAlerts"), alerts);

@@ -7,11 +7,11 @@ generate many addresses (e.g. a shop that makes a fresh address per order), wher
 ordinary wallets stop scanning after the first gap and miss funds further down.
 
 > **Status: view-only, on Bitcoin and Ethereum (ETH, USDT, USDC), with every Bitcoin
-> transaction in a History, and a Receive that hands out a fresh address per payment.** Coins and
-> networks are data, what the wallets show is kept in an encrypted database, and a start shows it at
-> once. Where it goes from here, with payment alerts, Ethereum's history, many more coins and spending,
-> is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on test networks before it touches real
-> funds.
+> transaction in a History, a Receive that hands out a fresh address per payment, alerts when a payment
+> comes in, an app password and a portable backup.** Coins and networks are data, what the wallets show
+> is kept in an encrypted database, and a start shows it at once. Where it goes from here, with Ethereum's
+> history, many more coins and spending, is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on
+> test networks before it touches real funds.
 
 ![Portfolio: the total, and a row per coin](docs/screenshot-portfolio.png)
 
@@ -52,6 +52,12 @@ something is still being read a figure says so: "≥" for what is known so far, 
    each place has its tabs: what it holds, its addresses, its history. An address opens to every asset in
    its own coin with USD. What holds nothing can be hidden; what nobody has answered for yet never is,
    as a dash is no zero.
+
+   **Dust** is what strangers scatter on addresses to be noticed: less than each coin's limit in the list
+   of coins (now 0.00001 BTC, 0.00001 ETH, 0.01 USDT, 0.01 USDC). *Hide dust* on Portfolio, Addresses and
+   History takes it off those lists, unless the address was given out or has a label, or the line has a
+   note. It still counts in every total, a search still finds it, one address's own page and history show
+   it, and the list says how many it hides.
 2. **History** *(done for Bitcoin)* — every transaction of every wallet: overall, per wallet
    (Wallets > History) and per address (a double click on its row, which also says what it
    holds). Each says what it did in the coin and in USD now and when it happened, its fee, and how
@@ -87,8 +93,31 @@ something is still being read a figure says so: "≥" for what is known so far, 
    was only saved, the page says that rather than "nothing has come in", and what is in no block yet reads
    as that, not as received. Removing a wallet forgets what it gave out, and the dialog says how many of those
    are still waiting for a payment.
-4. **Send BTC** *(later)* — sweep selected or all addresses into one transaction.
-5. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
+4. **Payment alerts** *(done)* — a line when a payment comes in, or a Windows notification when the window
+   is not in front, and a bell in the title bar that counts what was not looked at and lists all of it, the
+   latest 5,000, with what each was worth then and how it stands now. On Bitcoin a payment is a transaction
+   read because an address moved on from a history complete here, and that spends nothing of the wallets':
+   so the first look at a wallet tells of nothing, nor do change and moves between its addresses, and a higher
+   fee on the same payment is no second one. It reads "Not in a block yet" until it is. Ethereum has no history
+   here yet and goes by the balance going up, past a source behind the others saying less for a moment; a
+   move between its own addresses reads as a payment there until the next stage. It can only say so while
+   it runs: what came while it was closed is told at the next start, as that. Dust goes untold while it is
+   hidden. Settings turns either off.
+5. **App password** *(done)* — optional, on top of DPAPI: wallet.dat, and with it the key of the database,
+   cannot be read without it, not by a program running under this Windows account either. Argon2id at 256 MiB
+   makes the key, about a second per guess, and AES-256-GCM locks with it. The window locks when asked, from
+   the title bar, and when left alone for as long as Settings says (15 minutes unless told otherwise); what is
+   open closes first, and the scans and alerts go on behind it, an alert then saying nothing but that one came.
+   A lock covers the window: the keys of a running GitWallet are in its memory, and they are public ones. Nobody
+   can get a forgotten password back: the file then stays aside, under another name, and you start over with
+   your seeds.
+6. **Backup** *(done)* — one file under a password of its own, to keep elsewhere or take to another PC:
+   the wallets' public keys and names, the addresses given out, the settings, every label and note. It reads as
+   nothing without the password, a changed byte fails it, and it is read back when made. A restore removes
+   nothing: wallets this PC does not have are added, what the others gave out is joined, and on a PC with no
+   wallet the settings come along. It cannot spend and does not replace your seeds.
+7. **Send BTC** *(later)* — sweep selected or all addresses into one transaction.
+8. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
    needs one transaction per address; gas is funded automatically for tokens).
 
 **Size.** 500 wallets at the default gaps are 425,000 addresses. Everything fits a
@@ -114,7 +143,9 @@ compare with the other wallet.
   scan settings and the key of the database below. A seed is used once to derive those keys and is then scrubbed
   from memory; it is never written anywhere. Public keys can show balances but cannot
   spend. A `wallet.dat` from an earlier version loads as it was, and a copy stays beside it
-  as `wallet.dat.format<N>-<date>`, since that version cannot read what is written next.
+  as `wallet.dat.format<N>-<date>`, since that version cannot read what is written next. With a
+  password set, all of it is under that too. No copy is made in the clear then, and setting one
+  offers to delete those made before, which no password reaches.
 - `wallet.db`, encrypted with SQLCipher under a random key only `wallet.dat` holds: every
   address with what it last showed, the prices with their times, the transactions with their
   whether each was proven and where its block holds it, and the headers that rests on. A start reads it first and shows it marked as saved until
@@ -123,6 +154,9 @@ compare with the other wallet.
   reads everything again. **Labels and notes are not**: only this PC has them, so keep a copy
   (Settings > Labels and notes). A write of those that fails is said at once and tried again until it
   goes in, a file set aside gives up what it can of them, and removing a wallet says how many go with it.
+  What came in is kept there too, for the bell.
+- `settings.ini`, per Windows user and in the clear: what the window remembers, such as the language and
+  whether dust is hidden. Nothing of a wallet.
 
 Starting GitWallet again brings the open window to the front instead of opening a
 second one, and only one window at a time writes these files. A CSV export is not

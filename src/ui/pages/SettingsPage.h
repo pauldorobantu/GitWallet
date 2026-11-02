@@ -23,6 +23,13 @@ class SettingsPage : public QWidget
 public:
     explicit SettingsPage(WalletController* controller, QWidget* parent = nullptr);
 
+    // What a test goes through, past the file dialogs.
+    void makeBackupAt(const QString& path);
+    void restoreBackupFrom(const QString& path);
+
+signals:
+    void lockRequested();
+
 private:
     WalletController* controller_ = nullptr;
 
@@ -42,6 +49,11 @@ private:
     void exportLabels();
     void importLabels();
     void removeWallet();
+    void updatePassword(); // what the card says, and which buttons it offers
+    void updateBackup();
+    void askPassword(int mode);
+    void chooseBackupFile();
+    void chooseRestoreFile();
 
     Ui* ui_ = nullptr;
 };

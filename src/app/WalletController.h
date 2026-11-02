@@ -85,6 +85,38 @@ public:
     // process holds the data folder, or when the file changed after this window read it.
     bool removeAllWallets(QString* error);
 
+    // A password over what is saved. Making a key takes about a second on purpose, so these go off
+    // this thread; `done` comes back on it, if `guard` is still there.
+    bool needsPassword() const { return store_.needsPassword(); } // the file opens with one, and nothing is loaded
+    bool hasPassword() const { return store_.hasPassword(); }
+    // Opens the file and goes on as loadExisting() would have. `error` empty: it opened.
+    void openWithPassword(const QString& password, QObject* guard, const std::function<void(const QString& error)>& done);
+    void checkPassword(const QString& password, QObject* guard, const std::function<void(bool right)>& done);
+    // `current` checked if there is one; `fresh` empty: no password from now on. `deleteOld`: the older
+    // files kept beside it, which no password reaches, go too.
+    void changePassword(const QString& current, const QString& fresh, bool deleteOld, QObject* guard, const std::function<void(const QString& error)>& done);
+    // A file under a password nobody remembers stays, under another name, and this starts empty.
+    bool setAsideLockedFile(QString* error);
+    int lockMinutes() const { return store_.lockMinutes; }
+    bool setLockMinutes(int minutes, QString* error);
+
+    // One file under a password of its own, for another PC or another day: what the wallets are, what
+    // they gave out, the settings, and every label and note. Empty when one can be made now, else why not.
+    QString backupBlocker() const;
+    void writeBackup(const QString& path, const QString& password, QObject* guard, const std::function<void(const QString& error)>& done);
+    // What a restore did. Nothing here is removed by one.
+    struct RestoreReport {
+        int walletsAdded = 0;
+        int walletsHere = 0;      // this PC has them already: what they gave out is joined
+        int walletsRefused = 0;
+        qint64 givenOut = 0;      // addresses given out that this PC had not known of
+        int labels = 0;
+        int labelsLeftOut = 0;
+        QString labelsWhy;        // none could go in, for this reason
+        QString error;            // nothing was done
+    };
+    void restoreBackup(const QString& path, const QString& password, QObject* guard, const std::function<void(const RestoreReport&)>& done);
+
     // The older files removeAllWallets() would delete with wallet.dat.
     int walletFilesKeptAside() const;
     // And the older databases, which may hold the only copy of labels and notes.
@@ -214,6 +246,8 @@ public:
 signals:
     void walletChanged();  // loaded / imported / removed
     void statusChanged();  // statusText() or any of the scan states above changed
+    void passwordChanged(); // one was set, changed or removed, or the time it locks after
+    void backupMade();
     void givenOutChanged(); // an address was given out
     void rowGivenOut(int row); // which, in the model
     void historyProgress(); // how far a history has got moved
@@ -230,6 +264,10 @@ private:
     const wallet::AccountKey* receiveKey(quint32 wallet, wallet::Network network, chain::ScriptType type) const; // the one Receive goes by
     const wallet::AccountKey* keyOf(const wallet::AddressRow& row) const; // the one that row comes from
     bool saveGivenOut(QString* why);
+    void finishLoading(); // the file is read: what the database kept, and the scans
+    struct ReadBackup;
+    void applyBackup(const ReadBackup& read, const QString& path, const QPointer<QObject>& guard, const std::function<void(const RestoreReport&)>& done);
+    void startLabelImport(const std::function<QByteArray(QString*)>& source, bool vetted, QObject* guard, const std::function<void(int added, int skipped, int later, const QString& error)>& done);
     // What statusText() leads with, the most pressing first.
     enum class Status {
         NoWallet,
@@ -319,6 +357,8 @@ private:
     // written over an existing wallet.dat only while it still has this digest,
     // so nothing written there since by someone else is replaced.
     QByteArray fileDigest_;
+    QByteArray sealedDigest_; // the same of a file that has yet to be opened with its password
+    QList<std::function<void()>> afterLedger_; // waits for what the database kept to be in
     QString fileSetAside_;
 };
 

@@ -19,6 +19,7 @@
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
 #include "ui/pages/HoldingsPage.h"
+#include "ui/pages/LockPage.h"
 #include "ui/pages/PortfolioPage.h"
 #include "ui/pages/ReceivePage.h"
 #include "ui/pages/SettingsPage.h"
@@ -37,6 +38,7 @@
 #include <QHBoxLayout>
 #include <QHash>
 #include <QLabel>
+#include <QLineEdit>
 #include <QLocale>
 #include <QMessageBox>
 #include <QPushButton>
@@ -216,6 +218,35 @@ QString wrapped(const QString& text, const QString& indent)
     return lines.join(QLatin1Char('\n'));
 }
 
+// Anything done with the keyboard or the mouse, anywhere in the app, puts off locking it.
+class ActivityWatch : public QObject
+{
+public:
+    ActivityWatch(QElapsedTimer* clock, QObject* parent) : QObject(parent), clock_(clock) {}
+
+protected:
+    bool eventFilter(QObject*, QEvent* event) override
+    {
+        switch (event->type()) {
+        case QEvent::MouseMove:
+        case QEvent::MouseButtonPress:
+        case QEvent::KeyPress:
+        case QEvent::Wheel:
+            clock_->restart();
+            break;
+        default:
+            break;
+        }
+        return false;
+    }
+
+private:
+    QElapsedTimer* clock_ = nullptr;
+};
+
+// How often it looks whether the time has come.
+constexpr int kIdleCheckMs = 5000;
+
 Feedback::Type toastType(int severity)
 {
     if (severity >= kSeverityIncomplete)
@@ -240,6 +271,13 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     connect(controller_, &WalletController::errorOccurred, this, &MainWindow::onWalletError);
     connect(controller_->payments(), &wallet::PaymentBook::told, this, &MainWindow::onPaymentsTold);
     connect(controller_->payments(), &wallet::PaymentBook::changed, this, &MainWindow::refreshBell);
+    connect(controller_, &WalletController::passwordChanged, this, &MainWindow::afterPasswordChange);
+    connect(controller_, &WalletController::walletChanged, this, &MainWindow::afterPasswordChange);
+    idleClock_.start();
+    qApp->installEventFilter(new ActivityWatch(&idleClock_, this));
+    idleCheck_ = new QTimer(this);
+    idleCheck_->setInterval(kIdleCheckMs);
+    connect(idleCheck_, &QTimer::timeout, this, &MainWindow::checkIdle);
     refreshStatus();
     refreshBell();
 }
@@ -254,11 +292,12 @@ void MainWindow::buildUi()
     title_->setUtilityButtonsVisible(true);
     root_->addWidget(title_);
 
-    auto* body = new QHBoxLayout;
+    bodyHost_ = new QWidget(this);
+    auto* body = new QHBoxLayout(bodyHost_);
     body->setContentsMargins(0, 0, 0, 0);
     body->setSpacing(0);
 
-    nav_ = new SideNav(this);
+    nav_ = new SideNav(bodyHost_);
     nav_->addSection(QStringLiteral("Wallet"));
     nav_->addItem(PagePortfolio, QStringLiteral("Portfolio"), int(icon::Kind::Dashboard));
     nav_->addItem(PageWallets, QStringLiteral("Wallets"), int(icon::Kind::Key));
@@ -299,7 +338,14 @@ void MainWindow::buildUi()
     column->addWidget(stack_, 1);
     body->addLayout(column, 1);
 
-    root_->addLayout(body, 1);
+    root_->addWidget(bodyHost_, 1);
+    lockPage_ = new LockPage(this);
+    lockPage_->hide();
+    root_->addWidget(lockPage_, 1);
+    connect(lockPage_, &LockPage::unlockRequested, this, &MainWindow::tryUnlock);
+    connect(lockPage_, &LockPage::forgotRequested, this, &MainWindow::forgotPassword);
+    connect(title_, &TitleBar::lockRequested, this, &MainWindow::lockNow);
+    connect(settings_, &SettingsPage::lockRequested, this, &MainWindow::lockNow);
 
     connect(portfolio_, &PortfolioPage::importRequested, this, [this] { openImportDialog(false); });
     connect(portfolio_, &PortfolioPage::importManyRequested, this, [this] { openImportDialog(true); });
@@ -627,6 +673,9 @@ void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
         text = priced ? trText(QStringLiteral("%1 payments came in · %2")).arg(figures::formatCount(int(payments.size())), figures::formatUsd(usd))
                       : trText(QStringLiteral("%1 payments came in")).arg(figures::formatCount(int(payments.size())));
     }
+    // Nothing of it to whoever is looking at a locked window.
+    if (locked_)
+        text = trText(QStringLiteral("A payment came in"));
     lastPaymentAlert_ = text;
     if (isActiveWindow()) {
         Feedback::show(this, Feedback::Type::Success, text);
@@ -653,6 +702,136 @@ void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
     QApplication::alert(this); // the taskbar button says so too
 }
 
+// ------------------------------------------------------------------ the lock ----
+
+void MainWindow::lockNow()
+{
+    if (locked_ || !controller_->hasPassword())
+        return;
+    // What is open goes first, a seed being typed included: it must not stay on top of the lock. What
+    // will not close yet, a note that cannot be written, says why itself, and this asks again.
+    bool open = false;
+    const QWidgetList windows = QApplication::topLevelWidgets();
+    for (QWidget* widget : windows) {
+        if (auto* dialog = qobject_cast<QDialog*>(widget); dialog && dialog->isVisible()) {
+            dialog->done(QDialog::Rejected);
+            open = open || dialog->isVisible();
+        }
+    }
+    if (QWidget* popup = QApplication::activePopupWidget())
+        popup->close();
+    if (open) {
+        QTimer::singleShot(1000, this, &MainWindow::lockNow);
+        return;
+    }
+    showLocked();
+}
+
+void MainWindow::showLocked()
+{
+    if (stack_->currentWidget() == receive_)
+        receive_->leaving();
+    locked_ = true;
+    idleCheck_->stop();
+    bodyHost_->hide();
+    title_->setUtilityButtonsVisible(false);
+    lockPage_->reset();
+    lockPage_->show();
+    lockPage_->field()->setFocus();
+    refreshStatus();
+}
+
+void MainWindow::showUnlocked()
+{
+    locked_ = false;
+    lockPage_->reset();
+    lockPage_->hide();
+    bodyHost_->show();
+    title_->setUtilityButtonsVisible(true);
+    idleClock_.restart();
+    afterPasswordChange();
+    refreshStatus();
+}
+
+void MainWindow::tryUnlock(const QString& password)
+{
+    lockPage_->setBusy(true);
+    const auto finish = [this](const QString& error) {
+        if (error.isEmpty()) {
+            showUnlocked();
+            return;
+        }
+        lockPage_->reset();
+        lockPage_->setError(error);
+    };
+    if (controller_->needsPassword()) {
+        controller_->openWithPassword(password, this, finish);
+        return;
+    }
+    controller_->checkPassword(password, this, [finish](bool right) {
+        finish(right ? QString() : trText(QStringLiteral("That is not the password.")));
+    });
+}
+
+void MainWindow::forgotPassword()
+{
+    auto* box = new QMessageBox(QMessageBox::Information, trText(QStringLiteral("Forgot the password")),
+                                trText(QStringLiteral("Nobody can open this without the password, GitWallet included: there is no way around it, and no one to ask.")),
+                                QMessageBox::NoButton, this);
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->setObjectName(QStringLiteral("forgotBox"));
+    if (!controller_->needsPassword()) {
+        // All of it is in use behind the lock: starting over begins with a start.
+        box->setInformativeText(trText(QStringLiteral("Your coins are safe: they are on their seeds, which were never stored here. Close GitWallet and open it again, and this same link offers to start over.")));
+        box->addButton(QMessageBox::Ok);
+        applyDialogChrome(box);
+        box->open();
+        return;
+    }
+    box->setInformativeText(trText(QStringLiteral("Your coins are safe: they are on their seeds, which were never stored here. You can start over: the file stays beside the new one under another name, in case the password comes back to you, and you add your seeds again. Labels, notes and addresses given out come back only from a backup.")));
+    QPushButton* startOver = box->addButton(trText(QStringLiteral("Keep it aside and start over")), QMessageBox::DestructiveRole);
+    startOver->setObjectName(QStringLiteral("dangerButton"));
+    QPushButton* cancel = box->addButton(QMessageBox::Cancel);
+    box->setDefaultButton(cancel);
+    box->setEscapeButton(cancel);
+    applyDialogChrome(box);
+    connect(box, &QDialog::finished, this, [this, box, startOver] {
+        if (box->clickedButton() != startOver)
+            return;
+        QString error;
+        if (controller_->setAsideLockedFile(&error))
+            showUnlocked();
+        else
+            lockPage_->setError(error);
+    });
+    box->open();
+}
+
+void MainWindow::afterPasswordChange()
+{
+    const bool has = controller_->hasPassword();
+    title_->setLockAvailable(has);
+    const bool watching = has && !locked_ && (controller_->lockMinutes() > 0 || idleLimitForTestMs_ > 0);
+    if (watching && !idleCheck_->isActive())
+        idleCheck_->start();
+    else if (!watching)
+        idleCheck_->stop();
+}
+
+void MainWindow::checkIdle()
+{
+    const qint64 limit = idleLimitForTestMs_ > 0 ? idleLimitForTestMs_ : qint64(controller_->lockMinutes()) * 60 * 1000;
+    if (limit > 0 && idleClock_.elapsed() >= limit)
+        lockNow();
+}
+
+void MainWindow::setIdleLimitForTest(int ms)
+{
+    idleLimitForTestMs_ = ms;
+    idleCheck_->setInterval(ms > 0 ? qMax(10, ms / 5) : kIdleCheckMs);
+    afterPasswordChange();
+}
+
 void MainWindow::editAddressLabel(const QString& address)
 {
     addresses_->editLabel(address);
@@ -673,7 +852,12 @@ void MainWindow::openImportDialog(bool many)
 void MainWindow::loadWallet()
 {
     QString error;
-    if (controller_->loadExisting(&error) || error.isEmpty()) return;
+    if (controller_->loadExisting(&error) || error.isEmpty()) {
+        if (controller_->needsPassword())
+            showLocked();
+        afterPasswordChange();
+        return;
+    }
     // The file exists but cannot be read (another Windows user, damaged).
     QMessageBox box(QMessageBox::Warning, QStringLiteral("GitWallet"),
                     QStringLiteral("The saved wallets could not be opened.\n\n%1\n\n%2")
@@ -798,7 +982,7 @@ void MainWindow::refreshStatus()
         renderNotices();
     // The controller's line says by itself when a balance is missing or stale;
     // dismissing the notices does not hide that.
-    title_->setStatus(controller_->statusText());
+    title_->setStatus(locked_ ? trText(QStringLiteral("Locked")) : controller_->statusText());
 }
 
 void MainWindow::onWalletError(wallet::Problem kind, const QString& message, const QString& serverDetail)

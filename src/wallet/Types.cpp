@@ -51,6 +51,28 @@ void GivenOut::add(quint32 index)
     }
 }
 
+void GivenOut::merge(const GivenOut& other)
+{
+    QList<Run> all;
+    all.reserve(runs.size() + other.runs.size());
+    std::merge(runs.cbegin(), runs.cend(), other.runs.cbegin(), other.runs.cend(), std::back_inserter(all), [](const Run& a, const Run& b) { return a.from < b.from; });
+    runs.clear();
+    for (const Run& run : std::as_const(all)) {
+        if (!runs.isEmpty() && run.from <= runs.constLast().to)
+            runs.last().to = std::max(runs.constLast().to, run.to);
+        else
+            runs.append(run);
+    }
+}
+
+qint64 GivenOut::count() const
+{
+    qint64 total = 0;
+    for (const Run& run : runs)
+        total += qint64(run.to) - qint64(run.from);
+    return total;
+}
+
 quint32 GivenOut::nextFree(quint32 index) const
 {
     const auto after = std::upper_bound(runs.cbegin(), runs.cend(), index, [](quint32 value, const Run& run) { return value < run.from; });

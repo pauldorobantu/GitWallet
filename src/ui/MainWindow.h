@@ -2,6 +2,7 @@
 
 #include "ui/PlaceBar.h"
 
+#include <QElapsedTimer>
 #include <QMap>
 #include <QStringList>
 #include <QWidget>
@@ -34,6 +35,7 @@ class AddressesPage;
 class HistoryPage;
 class ReceivePage;
 class SettingsPage;
+class LockPage;
 
 // The application window: the frameless shell, title bar and sidebar of the
 // reused FlowSuite design system, hosting the wallet pages. Owns the
@@ -56,6 +58,13 @@ public:
     TitleBar* titleBar() const { return title_; }
     void openPayments(); // the list of what came in
     QString lastPaymentAlert() const { return lastPaymentAlert_; } // for tests
+
+    // Covers everything with the page that asks for the password. The scans go on behind it, and
+    // nothing shows of them. With no password there is nothing to lock with.
+    void lockNow();
+    bool isLocked() const { return locked_; }
+    LockPage* lockPage() const { return lockPage_; }
+    void setIdleLimitForTest(int ms);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -121,12 +130,24 @@ private:
     void flushToast();
     void onPaymentsTold(const QList<wallet::Payment>& payments);
     void refreshBell();
+    void showLocked();
+    void showUnlocked();
+    void tryUnlock(const QString& password);
+    void forgotPassword();
+    void afterPasswordChange();
+    void checkIdle();
     Inputs currentInputs() const;
 
     WalletController* controller_ = nullptr;
     QVBoxLayout* root_ = nullptr;
     TitleBar* title_ = nullptr;
     SideNav* nav_ = nullptr;
+    QWidget* bodyHost_ = nullptr; // the sidebar and the pages, all that the lock covers
+    LockPage* lockPage_ = nullptr;
+    bool locked_ = false;
+    QTimer* idleCheck_ = nullptr;
+    QElapsedTimer idleClock_;     // since the last key or mouse move anywhere in the app
+    int idleLimitForTestMs_ = 0;
     QStackedWidget* stack_ = nullptr;
     PlaceBar* placeBar_ = nullptr;
     PortfolioPage* portfolio_ = nullptr;

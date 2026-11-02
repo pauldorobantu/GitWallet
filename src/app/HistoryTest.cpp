@@ -4,6 +4,7 @@
 #include "net/PriceHistory.h"
 #include "store/Ledger.h"
 #include "store/LedgerDb.h"
+#include "ui/Figures.h"
 #include "ui/HistoryTableModel.h"
 #include "ui/pages/HistoryPage.h"
 #include "wallet/HeaderChain.h"
@@ -2975,6 +2976,9 @@ void runHistoryTest(const Check& check, QString* report, const QList<wallet::Acc
         check(false, QStringLiteral("a native SegWit key to work with"));
         return;
     }
+    // These go by every line: what dust does to a list has checks of its own.
+    const bool hideDust = ui::figures::hideDust();
+    ui::figures::setHideDust(false);
     testChainUnits(check, *native);
     testBook(check, *native);
     testSavedHistory(check, *native);
@@ -2984,6 +2988,7 @@ void runHistoryTest(const Check& check, QString* report, const QList<wallet::Acc
     testLiars(check, *native);
     testPrices(check, *native);
     testWindow(check, *native);
+    ui::figures::setHideDust(hideDust);
 }
 
 } // namespace app

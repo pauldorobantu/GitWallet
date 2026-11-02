@@ -20,9 +20,9 @@ USDC. Coins and networks are data, what the wallets show is kept in an encrypted
 start shows it at once, and 425,000 addresses fit (stage 1). Every Bitcoin transaction is in a
 History, overall, per wallet and per address, proven on this PC, with its fee, USD then and now,
 explorer link, labels and notes (stage 2). It opens on a Portfolio, goes down both ways with a
-clickable path, and Receive gives the next address nobody has been given, with its QR code (stage 3,
-under way). Missing against the known wallets: payment alerts, app password, portable backup, the
-history of Ethereum, Send.
+clickable path, and Receive gives the next address nobody has been given, with its QR code. Dust can be
+hidden, a payment coming in is told and listed, and there is an app password and a backup in one file
+(stage 3). Missing against the known wallets: the history of Ethereum, Send.
 
 ## The logic people already know
 
@@ -76,7 +76,7 @@ real UI.
 |---|---|---|---|
 | 1 | **Foundation** *(done)* | Coins and chains are data, an encrypted local database and one scheduler. Starts instantly from saved balances. Live price source proven, with the time shown beside USD. Real limits of public endpoints measured | 3-5 |
 | 2 | **Bitcoin history** *(done)* | Every BTC transaction, overall and per address; detail with fee, USD then and now, explorer link; pending, replaced, confirmed; filters, search, CSV, labels and notes. No key needed | 4-6 |
-| 3 | **Familiar screens** *(under way; moved ahead of Ethereum history at the owner's choice)* | Portfolio, coin pages, clickable path, Receive with QR and next unused address, hide zeros *(these are in)*; hide dust, payment alerts, app password, portable backup | 6-8 |
+| 3 | **Familiar screens** *(done; moved ahead of Ethereum history at the owner's choice)* | Portfolio, coin pages, clickable path, Receive with QR and next unused address, hide zeros and dust, payment alerts, app password, portable backup | 6-8 |
 | 4 | **Ethereum history** | The same for ETH, USDT, USDC, with failed transactions. "Complete back to" shown per chain | 3-5 |
 | 5 | **Ethereum-style chains** | BNB, Base, Arbitrum, Polygon, OP, Avalanche, custom tokens. No retyping | 3-5 |
 | 6 | **Tron and Bitcoin forks** | USDT on Tron, Litecoin, Dogecoin, Bitcoin Cash, Dash. Seeds typed once more, after the capture list is verified per chain | 6-10 |

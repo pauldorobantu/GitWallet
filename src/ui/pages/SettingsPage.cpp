@@ -8,10 +8,15 @@
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
 #include "ui/design/Style.h"
+#include "ui/dialogs/PasswordDialog.h"
 #include "wallet/Types.h"
 #include "wallet/WalletStore.h"
 
 #include <QCheckBox>
+#include <QComboBox>
+#include <QDate>
+#include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFontMetrics>
@@ -171,6 +176,16 @@ struct SettingsPage::Ui : QObject
     QPushButton* remove = nullptr;
     QPushButton* exportLabels = nullptr;
     QPushButton* importLabels = nullptr;
+    QLabel* passwordState = nullptr;
+    QPushButton* setPassword = nullptr;
+    QPushButton* changePassword = nullptr;
+    QPushButton* removePassword = nullptr;
+    QPushButton* lockNow = nullptr;
+    QComboBox* lockAfter = nullptr;
+    QWidget* lockAfterRow = nullptr;
+    QLabel* backupState = nullptr;
+    QPushButton* makeBackup = nullptr;
+    QPushButton* restoreBackup = nullptr;
     // A copy on its way, either way: one at a time.
     void labelsBusy(bool busy)
     {
@@ -315,6 +330,78 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     alerts.body->addWidget(alertsWindows);
     column->addWidget(alerts.card);
 
+    const page::Section password = page::makeSection(
+        content, QStringLiteral("App password"),
+        QStringLiteral("Without one, anyone using this Windows account can open GitWallet and see your wallets, and so can any program running under it. With one, what is saved here cannot be read without it. Seeds are not stored either way."));
+    ui_->passwordState = new QLabel(password.card);
+    ui_->passwordState->setObjectName(QStringLiteral("passwordState"));
+    password.body->addWidget(ui_->passwordState);
+    auto* passwordRow = new QHBoxLayout;
+    passwordRow->setSpacing(page::kFormHSpacing);
+    ui_->setPassword = new QPushButton(QStringLiteral("Set a password"), password.card);
+    ui_->setPassword->setObjectName(QStringLiteral("setPassword"));
+    ui_->changePassword = new QPushButton(QStringLiteral("Change it"), password.card);
+    ui_->changePassword->setObjectName(QStringLiteral("changePassword"));
+    ui_->removePassword = new QPushButton(QStringLiteral("Remove it"), password.card);
+    ui_->removePassword->setObjectName(QStringLiteral("removePassword"));
+    ui_->lockNow = new QPushButton(QStringLiteral("Lock now"), password.card);
+    ui_->lockNow->setObjectName(QStringLiteral("lockNow"));
+    passwordRow->addWidget(ui_->setPassword);
+    passwordRow->addWidget(ui_->changePassword);
+    passwordRow->addWidget(ui_->removePassword);
+    passwordRow->addWidget(ui_->lockNow);
+    passwordRow->addStretch(1);
+    password.body->addLayout(passwordRow);
+    ui_->lockAfterRow = new QWidget(password.card);
+    auto* lockRow = new QHBoxLayout(ui_->lockAfterRow);
+    lockRow->setContentsMargins(0, 0, 0, 0);
+    lockRow->setSpacing(page::kFormHSpacing);
+    lockRow->addWidget(new QLabel(QStringLiteral("Lock when left alone for"), ui_->lockAfterRow));
+    ui_->lockAfter = new QComboBox(ui_->lockAfterRow);
+    ui_->lockAfter->setObjectName(QStringLiteral("lockAfter"));
+    ui_->lockAfter->addItem(QStringLiteral("1 minute"), 1);
+    ui_->lockAfter->addItem(QStringLiteral("5 minutes"), 5);
+    ui_->lockAfter->addItem(QStringLiteral("15 minutes"), 15);
+    ui_->lockAfter->addItem(QStringLiteral("30 minutes"), 30);
+    ui_->lockAfter->addItem(QStringLiteral("1 hour"), 60);
+    ui_->lockAfter->addItem(QStringLiteral("Never"), 0);
+    lockRow->addWidget(ui_->lockAfter);
+    lockRow->addStretch(1);
+    password.body->addWidget(ui_->lockAfterRow);
+    column->addWidget(password.card);
+    connect(ui_->setPassword, &QPushButton::clicked, this, [this] { askPassword(int(PasswordDialog::Mode::SetApp)); });
+    connect(ui_->changePassword, &QPushButton::clicked, this, [this] { askPassword(int(PasswordDialog::Mode::ChangeApp)); });
+    connect(ui_->removePassword, &QPushButton::clicked, this, [this] { askPassword(int(PasswordDialog::Mode::RemoveApp)); });
+    connect(ui_->lockNow, &QPushButton::clicked, this, &SettingsPage::lockRequested);
+    connect(ui_->lockAfter, &QComboBox::activated, this, [this](int) {
+        QString error;
+        if (controller_ && !controller_->setLockMinutes(ui_->lockAfter->currentData().toInt(), &error)) {
+            Feedback::show(this, Feedback::Type::Error, error);
+            updatePassword();
+        }
+    });
+
+    const page::Section backup = page::makeSection(
+        content, QStringLiteral("Backup"),
+        QStringLiteral("One file under a password of its own, to keep elsewhere or take to another PC: your wallets' public keys and names, the addresses given out, the settings, every label and note. It cannot spend, and it does not replace your seeds: write those down apart."));
+    ui_->backupState = new QLabel(backup.card);
+    ui_->backupState->setObjectName(QStringLiteral("backupState"));
+    ui_->backupState->setWordWrap(true);
+    backup.body->addWidget(ui_->backupState);
+    auto* backupRow = new QHBoxLayout;
+    backupRow->setSpacing(page::kFormHSpacing);
+    ui_->makeBackup = new QPushButton(QStringLiteral("Make a backup"), backup.card);
+    ui_->makeBackup->setObjectName(QStringLiteral("makeBackup"));
+    ui_->restoreBackup = new QPushButton(QStringLiteral("Restore from a backup"), backup.card);
+    ui_->restoreBackup->setObjectName(QStringLiteral("restoreBackup"));
+    backupRow->addWidget(ui_->makeBackup);
+    backupRow->addWidget(ui_->restoreBackup);
+    backupRow->addStretch(1);
+    backup.body->addLayout(backupRow);
+    column->addWidget(backup.card);
+    connect(ui_->makeBackup, &QPushButton::clicked, this, &SettingsPage::chooseBackupFile);
+    connect(ui_->restoreBackup, &QPushButton::clicked, this, &SettingsPage::chooseRestoreFile);
+
     column->addStretch(1);
     scroll->setWidget(content);
     root->addWidget(scroll, 1);
@@ -340,11 +427,17 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
                 ui_->fill(s);
             rebuildWallet();
             updateInUse();
+            updatePassword();
+            updateBackup();
         });
+        connect(controller_, &WalletController::passwordChanged, this, &SettingsPage::updatePassword);
+        connect(controller_, &WalletController::backupMade, this, &SettingsPage::updateBackup);
         connect(controller_, &WalletController::statusChanged, this, &SettingsPage::updateInUse);
     }
     // The captions are runtime text (trText) that the language walk cannot re-template.
     connect(LanguageManager::instance(), &LanguageManager::changed, this, &SettingsPage::updateInUse);
+    connect(LanguageManager::instance(), &LanguageManager::changed, this, &SettingsPage::updatePassword);
+    connect(LanguageManager::instance(), &LanguageManager::changed, this, &SettingsPage::updateBackup);
     load();
 }
 
@@ -416,6 +509,119 @@ void SettingsPage::load()
     ui_->fill(controller_ ? controller_->store().settings : wallet::ScanSettings());
     rebuildWallet();
     updateInUse();
+    updatePassword();
+    updateBackup();
+}
+
+void SettingsPage::updatePassword()
+{
+    const bool has = controller_ && controller_->hasPassword();
+    ui_->passwordState->setText(has ? trText(QStringLiteral("A password is set.")) : trText(QStringLiteral("No password is set.")));
+    ui_->setPassword->setVisible(!has);
+    ui_->changePassword->setVisible(has);
+    ui_->removePassword->setVisible(has);
+    ui_->lockNow->setVisible(has);
+    ui_->lockAfterRow->setVisible(has);
+    if (controller_) {
+        const int at = ui_->lockAfter->findData(controller_->lockMinutes());
+        if (at >= 0)
+            ui_->lockAfter->setCurrentIndex(at);
+    }
+}
+
+void SettingsPage::askPassword(int mode)
+{
+    if (!controller_)
+        return;
+    const auto chosen = PasswordDialog::Mode(mode);
+    auto* dialog = new PasswordDialog(chosen, controller_->walletFilesKeptAside(), QString(), [this](const PasswordDialog::Filled& filled, const PasswordDialog::Finish& finish) {
+        controller_->changePassword(filled.current, filled.fresh, filled.deleteOldFiles, this, finish);
+    }, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &QDialog::accepted, this, [this, chosen] {
+        Feedback::show(this, Feedback::Type::Success,
+                       chosen == PasswordDialog::Mode::RemoveApp ? trText(QStringLiteral("The password was removed")) : trText(QStringLiteral("The password is set")));
+    });
+    dialog->open();
+}
+
+void SettingsPage::updateBackup()
+{
+    const wallet::WalletStore* store = controller_ ? &controller_->store() : nullptr;
+    if (!store || store->lastBackupMs <= 0) {
+        ui_->backupState->setText(trText(QStringLiteral("No backup was made here yet.")));
+    } else {
+        QString line = trText(QStringLiteral("Last backup: %1.")).arg(QDateTime::fromMSecsSinceEpoch(store->lastBackupMs).toString(QStringLiteral("d MMM yyyy HH:mm")));
+        const int since = int(store->wallets.size()) - store->lastBackupWallets;
+        if (since > 0)
+            line += QLatin1Char(' ') + trText(QStringLiteral("%1 wallets were added since: it does not hold them.")).arg(since);
+        ui_->backupState->setText(line);
+    }
+}
+
+void SettingsPage::chooseBackupFile()
+{
+    if (!controller_)
+        return;
+    const QString blocker = controller_->backupBlocker();
+    if (!blocker.isEmpty()) {
+        Feedback::show(this, Feedback::Type::Info, blocker);
+        return;
+    }
+    const QString name = QStringLiteral("GitWallet-backup-%1.gwbackup").arg(QDate::currentDate().toString(Qt::ISODate));
+    const QString path = QFileDialog::getSaveFileName(this, trText(QStringLiteral("Make a backup")), name, QStringLiteral("GitWallet backup (*.gwbackup)"));
+    if (!path.isEmpty())
+        makeBackupAt(path);
+}
+
+void SettingsPage::makeBackupAt(const QString& path)
+{
+    auto* dialog = new PasswordDialog(PasswordDialog::Mode::MakeBackup, 0, QDir::toNativeSeparators(path), [this, path](const PasswordDialog::Filled& filled, const PasswordDialog::Finish& finish) {
+        controller_->writeBackup(path, filled.fresh, this, finish);
+    }, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &QDialog::accepted, this, [this] { Feedback::show(this, Feedback::Type::Success, trText(QStringLiteral("Backup made, and read back"))); });
+    dialog->open();
+}
+
+void SettingsPage::chooseRestoreFile()
+{
+    if (!controller_)
+        return;
+    const QString path = QFileDialog::getOpenFileName(this, trText(QStringLiteral("Restore from a backup")), QString(), QStringLiteral("GitWallet backup (*.gwbackup);;All files (*)"));
+    if (!path.isEmpty())
+        restoreBackupFrom(path);
+}
+
+void SettingsPage::restoreBackupFrom(const QString& path)
+{
+    auto* dialog = new PasswordDialog(PasswordDialog::Mode::OpenBackup, 0, QDir::toNativeSeparators(path), [this, path](const PasswordDialog::Filled& filled, const PasswordDialog::Finish& finish) {
+        controller_->restoreBackup(path, filled.current, this, [this, finish](const WalletController::RestoreReport& report) {
+            finish(report.error);
+            if (!report.error.isEmpty())
+                return;
+            QStringList lines;
+            lines << trText(QStringLiteral("Wallets added: %1")).arg(report.walletsAdded);
+            if (report.walletsHere > 0)
+                lines << trText(QStringLiteral("Already on this PC: %1")).arg(report.walletsHere);
+            if (report.walletsRefused > 0)
+                lines << trText(QStringLiteral("Not added, as a wallet of that kind cannot go in: %1")).arg(report.walletsRefused);
+            lines << trText(QStringLiteral("Addresses given out that this PC did not know of: %1")).arg(report.givenOut);
+            lines << trText(QStringLiteral("Labels and notes: %1")).arg(report.labels);
+            if (report.labelsLeftOut > 0)
+                lines << trText(QStringLiteral("Labels and notes left out: %1")).arg(report.labelsLeftOut);
+            if (!report.labelsWhy.isEmpty())
+                lines << trText(QStringLiteral("Labels and notes did not come along: %1")).arg(report.labelsWhy);
+            auto* box = new QMessageBox(QMessageBox::Information, trText(QStringLiteral("Restored")), lines.join(QLatin1Char('\n')), QMessageBox::Ok, this);
+            box->setObjectName(QStringLiteral("restoredBox"));
+            box->setInformativeText(trText(QStringLiteral("Balances and transactions are read again from the servers: that can take a while.")));
+            box->setAttribute(Qt::WA_DeleteOnClose);
+            applyDialogChrome(box);
+            box->open();
+        });
+    }, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->open();
 }
 
 void SettingsPage::rebuildWallet()

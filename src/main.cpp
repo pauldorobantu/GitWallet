@@ -497,7 +497,7 @@ int main(int argc, char** argv)
     // (checked above), so it never lands in the real wallet.
     if (args.contains(QStringLiteral("--import-test-mnemonic"))) {
         QTimer::singleShot(0, controller, [controller] {
-            if (controller->hasWallet()) return;
+            if (controller->hasWallet() || controller->needsPassword()) return;
             QString error;
             if (!controller->addMnemonicWallet(chain::bip39::split(kPublicTestMnemonic), {},
                                                QStringLiteral("Test"), &error))
@@ -509,7 +509,7 @@ int main(int argc, char** argv)
     // (checked above), so the app can be seen working on real data without a real seed.
     if (args.contains(QStringLiteral("--demo-wallets"))) {
         QTimer::singleShot(0, controller, [&window, controller] {
-            if (controller->hasWallet()) return;
+            if (controller->hasWallet() || controller->needsPassword()) return;
             QList<wallet::WalletRequest> requests;
             try {
                 int number = 0;

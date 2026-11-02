@@ -79,7 +79,7 @@ private:
     void onRowMoved(int row, const AddressRow& before);
     void onAdded(HistoryBook* book, int position);
     bool isDust(Asset asset, const chain::Amount& amount, const QList<int>& rows) const;
-    void record(Asset asset, const chain::Amount& amount, quint32 wallet, const QString& address, int addresses, const chain::Hash256* txid);
+    void record(Asset asset, const chain::Amount& amount, quint32 wallet, const QString& address, int addresses, const chain::Hash256* txid, bool whileClosed);
     void tellNow();
 
     struct Fall {
@@ -93,7 +93,7 @@ private:
     QList<Payment> payments_;
     QList<Payment> toTell_;
     QSet<chain::Hash256> told_;
-    QHash<Network, QSet<QString>> expecting_; // addresses whose status moved on from a history complete here
+    QHash<Network, QHash<QString, bool>> expecting_; // addresses whose status moved on from a history complete here, and whether that was at the start
     QHash<QString, Fall> falls_;              // by asset and address
     QTimer* pause_ = nullptr;
     qint64 lastId_ = 0;

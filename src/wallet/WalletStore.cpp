@@ -42,6 +42,7 @@ namespace {
 
 constexpr int kFormatVersion = 4; // what was given out: a build that does not know it would write it away
 constexpr int kLegacyFormatVersion = 1;    // one wallet: "label" + "accounts" at the top
+constexpr int kMostLockMinutes = 24 * 60;
 constexpr qint64 kMaxFileBytes = 16 << 20; // room for the account keys of every network kMaxWallets may hold
 constexpr qsizetype kMaxXpubChars = 128;   // a serialized extended key is 111 chars
 constexpr qsizetype kDatabaseKeyBytes = 32;
@@ -67,7 +68,16 @@ struct StoreData {
     ScanSettings settings;
     QByteArray databaseKey;
     int format = 0;
+    int lockMinutes = WalletStore::kDefaultLockMinutes;
+    qint64 lastBackupMs = 0;
+    int lastBackupWallets = 0;
 };
+
+// What a file under a password says it is, inside DPAPI.
+QString sealedFormat()
+{
+    return QStringLiteral("gitwallet-sealed");
+}
 
 QString& dataDirOverride()
 {
@@ -351,7 +361,7 @@ QStringList readList(const QJsonObject& o, const QString& key)
 // ------------------------------------------------------------ file body ----
 
 QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const ScanSettings& s,
-                  const QByteArray& databaseKey)
+                  const QByteArray& databaseKey, int lockMinutes = WalletStore::kDefaultLockMinutes, qint64 lastBackupMs = 0, int lastBackupWallets = 0)
 {
     QJsonArray entries;
     for (const WalletEntry& w : wallets) {
@@ -399,6 +409,12 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
     root.insert(QStringLiteral("settings"), settings);
     if (!databaseKey.isEmpty())
         root.insert(QStringLiteral("databaseKey"), QString::fromLatin1(databaseKey.toHex()));
+    if (lockMinutes != WalletStore::kDefaultLockMinutes)
+        root.insert(QStringLiteral("lockMinutes"), lockMinutes);
+    if (lastBackupMs > 0) {
+        root.insert(QStringLiteral("lastBackupMs"), lastBackupMs);
+        root.insert(QStringLiteral("lastBackupWallets"), lastBackupWallets);
+    }
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
 }
 
@@ -556,6 +572,9 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
     out->settings = sanitized(s);
     out->databaseKey = databaseKey.size() == kDatabaseKeyBytes ? databaseKey : QByteArray();
     out->format = int(version.toDouble());
+    out->lockMinutes = std::clamp(readInt(root, QStringLiteral("lockMinutes"), WalletStore::kDefaultLockMinutes), 0, kMostLockMinutes);
+    out->lastBackupMs = qint64(root.value(QStringLiteral("lastBackupMs")).toDouble());
+    out->lastBackupWallets = readInt(root, QStringLiteral("lastBackupWallets"), 0);
     return true;
 }
 
@@ -662,6 +681,17 @@ bool WalletStore::load(QString* error)
             return fail(error, QStringLiteral("This wallet file belongs to another Windows user or is "
                                               "damaged (%1).")
                                    .arg(windowsError(code)));
+        // Under a password: it stays as it came until the key of one opens it.
+        const QJsonObject outer = QJsonDocument::fromJson(json).object();
+        if (outer.value(QStringLiteral("format")).toString() == sealedFormat()) {
+            seal::Cost cost;
+            if (outer.value(QStringLiteral("version")).toInt() != 1 || !seal::costOf(outer, &cost))
+                return fail(error, QStringLiteral("The wallet file %1 was written by a newer version of GitWallet, or is damaged.").arg(nativePath(path)));
+            const QJsonObject sealed = outer;
+            *this = WalletStore();
+            sealed_ = sealed;
+            return fail(error, QStringLiteral("The wallet file %1 is under a password.").arg(nativePath(path)));
+        }
         if (!parseStore(json, path, &data, error)) return false;
     } // the plaintext is zeroed here
 
@@ -670,7 +700,66 @@ bool WalletStore::load(QString* error)
     nextWalletId_ = data.nextWalletId;
     settings = std::move(data.settings);
     databaseKey = std::move(data.databaseKey);
+    lockMinutes = data.lockMinutes;
+    lastBackupMs = data.lastBackupMs;
+    lastBackupWallets = data.lastBackupWallets;
     olderFormat_ = data.format < kFormatVersion ? data.format : 0;
+    sealed_ = {};
+    passwordKey_.clear();
+    return true;
+}
+
+bool WalletStore::openSealed(const QByteArray& key, QString* error)
+{
+    QByteArray json;
+    const auto wipe = qScopeGuard([&json] { scrub(json); });
+    if (!seal::open(key, sealed_, &json))
+        return fail(error, QStringLiteral("That is not the password."));
+    StoreData data;
+    if (!parseStore(json, filePath(), &data, error))
+        return false;
+    seal::costOf(sealed_, &passwordCost_);
+    passwordKey_ = key;
+    sealed_ = {};
+    wallets = std::move(data.wallets);
+    nextWalletId_ = data.nextWalletId;
+    settings = std::move(data.settings);
+    databaseKey = std::move(data.databaseKey);
+    lockMinutes = data.lockMinutes;
+    lastBackupMs = data.lastBackupMs;
+    lastBackupWallets = data.lastBackupWallets;
+    olderFormat_ = data.format < kFormatVersion ? data.format : 0;
+    return true;
+}
+
+void WalletStore::setPasswordKey(const QByteArray& key, const seal::Cost& cost)
+{
+    passwordKey_ = key;
+    passwordCost_ = cost;
+}
+
+bool WalletStore::isPasswordKey(const QByteArray& key) const
+{
+    if (key.size() != passwordKey_.size() || key.isEmpty())
+        return false;
+    char differs = 0;
+    for (qsizetype i = 0; i < key.size(); ++i)
+        differs = char(differs | (key.at(i) ^ passwordKey_.at(i)));
+    return differs == 0;
+}
+
+QByteArray WalletStore::backupBody() const
+{
+    return toJson(wallets, nextWalletId_, sanitized(settings), QByteArray());
+}
+
+bool WalletStore::readBackupBody(const QByteArray& json, const QString& name, WalletStore* into, QString* error)
+{
+    StoreData data;
+    if (!parseStore(json, name, &data, error))
+        return false;
+    into->wallets = std::move(data.wallets);
+    into->settings = std::move(data.settings);
     return true;
 }
 
@@ -685,8 +774,17 @@ bool WalletStore::save(QString* error, QByteArray* digest) const
 
     QByteArray blob;
     {
-        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings), databaseKey);
+        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings), databaseKey, lockMinutes, lastBackupMs, lastBackupWallets);
         const auto wipe = qScopeGuard([&json] { scrub(json); });
+        if (!passwordKey_.isEmpty()) {
+            try {
+                QByteArray sealed = QJsonDocument(seal::lock(passwordKey_, passwordCost_, json, sealedFormat())).toJson(QJsonDocument::Compact);
+                scrub(json);
+                json = std::move(sealed);
+            } catch (const std::exception&) {
+                return fail(error, QStringLiteral("The wallet was not saved: it could not be locked under the password."));
+            }
+        }
         DWORD code = 0;
         if (!protect(json, &blob, &code))
             return fail(error, QStringLiteral("Windows could not encrypt the wallet file (%1).")
@@ -724,6 +822,7 @@ bool WalletStore::remove(QString* error)
     if (file.exists() && !file.remove())
         return fail(error, QStringLiteral("Cannot delete the wallet file %1: %2")
                                .arg(nativePath(path), file.errorString()));
+    seal::wipe(passwordKey_);
     *this = WalletStore(); // wallets and settings back to their defaults
     return true;
 }
@@ -738,6 +837,18 @@ bool WalletStore::writeRawForTest(const QByteArray& json, QString* error)
     if (!file.open(QIODevice::WriteOnly) || file.write(blob) != blob.size() || !file.commit())
         return fail(error, file.errorString());
     return true;
+}
+
+QByteArray WalletStore::readRawForTest(QString* error)
+{
+    QFile file(filePath());
+    QByteArray plain;
+    DWORD code = 0;
+    if (!file.open(QIODevice::ReadOnly) || !unprotect(file.readAll(), &plain, &code)) {
+        fail(error, file.errorString());
+        return {};
+    }
+    return plain;
 }
 
 QList<AccountKey> WalletStore::allAccounts() const

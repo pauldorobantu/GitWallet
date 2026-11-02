@@ -27,6 +27,8 @@ struct GivenOut {
     bool isEmpty() const { return runs.isEmpty(); }
     bool contains(quint32 index) const;
     void add(quint32 index);
+    void merge(const GivenOut& other); // all of what either holds
+    qint64 count() const;
     quint32 end() const { return runs.isEmpty() ? 0 : runs.constLast().to; } // one past the highest
     quint32 nextFree(quint32 index) const; // the first at or past `index` that was not given out
 };
@@ -63,6 +65,7 @@ struct WalletRequest {
     QString label;         // empty: "Wallet N"
     bool numbered = false; // `label` is what the name starts with: the next free number follows
     bool fromKeys = false;
+    QJsonArray keptAccounts; // of a kind this version does not know, as a backup holds them
     int line = 0;          // the caller's: which line of its list this came from
     QString refused;
 };
