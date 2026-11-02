@@ -39,6 +39,8 @@ private:
     void askThenApply(const wallet::ScanSettings& settings, int accepted);
     void apply(const wallet::ScanSettings& settings);
     void confirmRemove();
+    void exportLabels();
+    void importLabels();
     void removeWallet();
 
     Ui* ui_ = nullptr;

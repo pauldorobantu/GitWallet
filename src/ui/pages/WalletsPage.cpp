@@ -345,6 +345,7 @@ struct WalletsPage::Ui : QObject
     QPushButton* rename = nullptr;
     QPushButton* remove = nullptr;
     QPushButton* addresses = nullptr;
+    QPushButton* history = nullptr;
     QPushButton* addMany = nullptr;
     QPushButton* add = nullptr;
     QWidget* empty = nullptr;
@@ -405,6 +406,8 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     ui_->rename = new QPushButton(QStringLiteral("Rename"), bar.widget);
     ui_->remove = new QPushButton(QStringLiteral("Remove"), bar.widget);
     ui_->addresses = new QPushButton(QStringLiteral("View addresses"), bar.widget);
+    ui_->history = new QPushButton(QStringLiteral("History"), bar.widget);
+    ui_->history->setToolTip(trText(QStringLiteral("Every transaction of this wallet")));
     ui_->addMany = new QPushButton(QStringLiteral("Add many"), bar.widget);
     ui_->addMany->setToolTip(QStringLiteral("A list of seeds or public keys, pasted or from a file"));
     ui_->add = new QPushButton(QStringLiteral("Add wallet"), bar.widget);
@@ -413,6 +416,7 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     bar.right->addWidget(ui_->rename);
     bar.right->addWidget(ui_->remove);
     bar.right->addWidget(ui_->addresses);
+    bar.right->addWidget(ui_->history);
     bar.right->addWidget(ui_->addMany);
     bar.right->addWidget(ui_->add);
     root->addWidget(bar.widget);
@@ -441,6 +445,10 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     connect(ui_->addresses, &QPushButton::clicked, this, [this] {
         if (const quint32 id = selectedId())
             emit showAddressesRequested(id);
+    });
+    connect(ui_->history, &QPushButton::clicked, this, [this] {
+        if (const quint32 id = selectedId())
+            emit showHistoryRequested(id);
     });
     connect(ui_->rename, &QPushButton::clicked, this, &WalletsPage::renameSelected);
     connect(ui_->remove, &QPushButton::clicked, this, &WalletsPage::confirmRemoveSelected);
@@ -498,6 +506,7 @@ void WalletsPage::updateState()
     ui_->rename->setEnabled(chosen);
     ui_->remove->setEnabled(chosen);
     ui_->addresses->setEnabled(chosen);
+    ui_->history->setEnabled(chosen);
     ui_->count->setVisible(total > 0);
     ui_->count->setText(shown == total
                             ? trText(total == 1 ? QStringLiteral("%1 wallet") : QStringLiteral("%1 wallets"))
@@ -584,6 +593,11 @@ void WalletsPage::confirmRemoveSelected()
             + (controller_->walletFilesKeptAside() > 0
                    ? QStringLiteral(" An older wallet file kept beside wallet.dat may still hold its keys, until Remove "
                                     "all wallets in Settings.")
+                   : QString())
+            + (controller_->labelCount(id) > 0
+                   ? QStringLiteral(" Its %1 labels and notes go too, for good: only this PC has them, and no seed brings "
+                                    "them back. Keep a copy first, under Labels and notes in Settings.")
+                         .arg(controller_->labelCount(id))
                    : QString()));
     QPushButton* remove = box->addButton(QStringLiteral("Remove wallet"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));

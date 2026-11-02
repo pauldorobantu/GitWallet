@@ -10,6 +10,8 @@
 #include "wallet/Types.h"
 #include "wallet/WalletStore.h"
 
+#include <QFile>
+#include <QFileDialog>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QFrame>
@@ -18,6 +20,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QScrollArea>
 #include <QSpinBox>
 #include <QTextBlock>
@@ -164,6 +167,14 @@ struct SettingsPage::Ui : QObject
     QLabel* walletCount = nullptr;
     QWidget* removeRow = nullptr;
     QPushButton* remove = nullptr;
+    QPushButton* exportLabels = nullptr;
+    QPushButton* importLabels = nullptr;
+    // A copy on its way, either way: one at a time.
+    void labelsBusy(bool busy)
+    {
+        exportLabels->setEnabled(!busy);
+        importLabels->setEnabled(!busy);
+    }
     wallet::ScanSettings filled; // what the form last showed from the store
 
     void fill(const wallet::ScanSettings& s)
@@ -262,6 +273,25 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     walletSection.body->addWidget(ui_->removeRow);
     column->addWidget(walletSection.card);
 
+    const page::Section labels = page::makeSection(
+        content, QStringLiteral("Labels and notes"),
+        QStringLiteral("The labels and notes you give transactions and addresses are on this PC alone, in its "
+                       "encrypted database: no server can give them back. Keep a copy elsewhere. The file is in the "
+                       "form other wallets read (BIP-329), and it is not encrypted."));
+    auto* labelsRow = new QHBoxLayout;
+    labelsRow->setSpacing(page::kFormHSpacing);
+    auto* exportLabels = new QPushButton(QStringLiteral("Export labels"), labels.card);
+    auto* importLabels = new QPushButton(QStringLiteral("Import labels"), labels.card);
+    ui_->exportLabels = exportLabels;
+    ui_->importLabels = importLabels;
+    labelsRow->addWidget(exportLabels);
+    labelsRow->addWidget(importLabels);
+    labelsRow->addStretch(1);
+    labels.body->addLayout(labelsRow);
+    column->addWidget(labels.card);
+    connect(exportLabels, &QPushButton::clicked, this, &SettingsPage::exportLabels);
+    connect(importLabels, &QPushButton::clicked, this, &SettingsPage::importLabels);
+
     column->addStretch(1);
     scroll->setWidget(content);
     root->addWidget(scroll, 1);
@@ -293,6 +323,59 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     // The captions are runtime text (trText) that the language walk cannot re-template.
     connect(LanguageManager::instance(), &LanguageManager::changed, this, &SettingsPage::updateInUse);
     load();
+}
+
+void SettingsPage::exportLabels()
+{
+    if (!controller_)
+        return;
+    // What is not in memory is not "nothing": it is why it says so.
+    const QString blocker = controller_->labelsBlocker();
+    if (!blocker.isEmpty()) {
+        Feedback::show(this, Feedback::Type::Info, trText(blocker));
+        return;
+    }
+    if (!controller_->hasLabels()) {
+        Feedback::show(this, Feedback::Type::Info, trText(QStringLiteral("No label or note to export yet")));
+        return;
+    }
+    const QString path = QFileDialog::getSaveFileName(this, trText(QStringLiteral("Export labels")), QStringLiteral("gitwallet-labels.jsonl"),
+                                                      QStringLiteral("JSON lines (*.jsonl);;All files (*)"));
+    if (path.isEmpty())
+        return;
+    ui_->labelsBusy(true);
+    controller_->writeLabelsFile(path, this, [this](bool ok, const QString& error) {
+        ui_->labelsBusy(false);
+        if (ok)
+            Feedback::show(this, Feedback::Type::Success, trText(QStringLiteral("Labels exported")));
+        else
+            Feedback::show(this, Feedback::Type::Error, trText(QStringLiteral("Could not write the file: %1")).arg(error));
+    });
+}
+
+void SettingsPage::importLabels()
+{
+    if (!controller_)
+        return;
+    const QString blocker = controller_->labelsBlocker();
+    if (!blocker.isEmpty()) {
+        Feedback::show(this, Feedback::Type::Info, trText(blocker));
+        return;
+    }
+    const QString path = QFileDialog::getOpenFileName(this, trText(QStringLiteral("Import labels")), QString(), QStringLiteral("JSON lines (*.jsonl);;All files (*)"));
+    if (path.isEmpty())
+        return;
+    ui_->labelsBusy(true);
+    controller_->importLabelsFile(path, this, [this](int added, int skipped, const QString& error) {
+        ui_->labelsBusy(false);
+        if (added < 0) {
+            Feedback::show(this, Feedback::Type::Error, trText(error));
+            return;
+        }
+        Feedback::show(this, skipped > 0 ? Feedback::Type::Warning : Feedback::Type::Success,
+                       skipped > 0 ? trText(QStringLiteral("%1 labels imported, %2 lines left out")).arg(added).arg(skipped)
+                                   : trText(QStringLiteral("%1 labels imported")).arg(added));
+    });
 }
 
 void SettingsPage::load()
@@ -472,6 +555,20 @@ void SettingsPage::confirmRemove()
                                 : QStringLiteral("It also deletes the %1 older wallet files kept aside, which may hold "
                                                  "other wallets.")
                                       .arg(aside));
+    }
+    const int labels = controller_->labelCount();
+    if (labels > 0) {
+        detail += QLatin1Char(' ')
+                  + QStringLiteral("Its %1 labels and notes go too, for good: only this PC has them, and no seed brings them "
+                                   "back. Keep a copy first, under Labels and notes here in Settings.")
+                        .arg(labels);
+    }
+    const int databases = controller_->databasesKeptAside();
+    if (databases > 0) {
+        detail += QLatin1Char(' ')
+                  + QStringLiteral("It also deletes %1 older databases kept aside, which may hold the only copy of other "
+                                   "labels and notes.")
+                        .arg(databases);
     }
     box->setInformativeText(detail);
     QPushButton* remove = box->addButton(QStringLiteral("Remove all wallets"), QMessageBox::DestructiveRole);

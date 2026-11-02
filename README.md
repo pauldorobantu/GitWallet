@@ -6,11 +6,11 @@ total per wallet and one combined total in each coin and in USD. Built for seeds
 generate many addresses (e.g. a shop that makes a fresh address per order), where
 ordinary wallets stop scanning after the first gap and miss funds further down.
 
-> **Status: view-only, on Bitcoin and Ethereum (ETH, USDT, USDC).** Coins and networks
-> are data now, what the wallets show is kept in an encrypted database, and a start
-> shows it at once. Where it goes from here, with history, many more coins and spending,
-> is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on test networks before it
-> touches real funds.
+> **Status: view-only, on Bitcoin and Ethereum (ETH, USDT, USDC), with every Bitcoin
+> transaction in a History.** Coins and networks are data, what the wallets show is kept in
+> an encrypted database, and a start shows it at once. Where it goes from here, with Ethereum's
+> history, many more coins and spending, is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending
+> is tested on test networks before it touches real funds.
 
 ![Overview](docs/screenshot-overview.png)
 
@@ -39,8 +39,28 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
    CSV for the books; the Overview shows the totals in each coin and in USD, with
    where the prices come from and how old they are. Addresses another app creates
    later from the same seed appear by themselves.
-2. **Send BTC** *(next)* — sweep selected or all addresses into one transaction.
-3. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
+2. **History** *(done for Bitcoin)* — every transaction of every wallet: overall, per wallet
+   (Wallets > History) and per address (a double click on its row, which also says what it
+   holds). Each says what it did in the coin and in USD now and when it happened, its fee, and how
+   far it is believed: pending, how many confirmations, replaced or dropped. Opened, it shows where
+   its coins came from and went, with an explorer link. Labels and notes, on transactions and on
+   addresses, are kept on this PC, search finds them, and Settings exports them in the form other
+   wallets read (BIP-329). Filters, search over ids, addresses, labels and notes, and CSV for the
+   books. 510,000 transactions fit: the list is put together again in about 0.1 s. No key is needed
+   for any of it.
+
+   *What is believed:* a server's list only says where to look. Every raw transaction has to hash
+   to its id, and each in a block has to have a Merkle proof leading to the root of a header this
+   PC vouches for: below a checkpoint in the list of coins, a branch to the root of every header up
+   to it; past that, each header following the last with its work and difficulty checked. A server
+   whose answer does not hold is left, and the page says what did not check out. A line is shown as
+   a server's word until then, and says so if the proof failed. A list has to be what the server's own
+   status says, what it names has to touch the address, and no list takes back what this PC has
+   proven: only the chain does, when blocks give way. What an address's transactions add up to, without
+   any whose proof failed, is compared with its balance, and if it differs the title says so on every
+   page. What was replaced or dropped stays in the list for 90 days, longer with a note.
+3. **Send BTC** *(next)* — sweep selected or all addresses into one transaction.
+4. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
    needs one transaction per address; gas is funded automatically for tokens).
 
 **Size.** 500 wallets at the default gaps are 425,000 addresses. Everything fits a
@@ -68,10 +88,13 @@ compare with the other wallet.
   spend. A `wallet.dat` from an earlier version loads as it was, and a copy stays beside it
   as `wallet.dat.format<N>-<date>`, since that version cannot read what is written next.
 - `wallet.db`, encrypted with SQLCipher under a random key only `wallet.dat` holds: every
-  address with what it last showed, and the prices with their times. A start reads it
-  first and shows it marked as saved until the servers have answered. Every page is checked
-  at the start; one that fails moves the file aside and a new one is made. It is a copy:
-  deleting it only means the next start reads everything again.
+  address with what it last showed, the prices with their times, the transactions with their
+  whether each was proven and where its block holds it, and the headers that rests on. A start reads it first and shows it marked as saved until
+  the servers have answered. Every page is checked at the start; one that fails moves the file
+  aside and a new one is made. Nearly all of it is a copy: deleting it only means the next start
+  reads everything again. **Labels and notes are not**: only this PC has them, so keep a copy
+  (Settings > Labels and notes). A write of those that fails is said at once and tried again until it
+  goes in, a file set aside gives up what it can of them, and removing a wallet says how many go with it.
 
 Starting GitWallet again brings the open window to the front instead of opening a
 second one, and only one window at a time writes these files. A CSV export is not
@@ -87,7 +110,9 @@ the same way. "Remove all wallets" deletes those too.
 All of it is data, in `res/coins.json`: each network's family, servers, explorer links,
 address format, coin and tokens, with the names each price source knows them by. A
 network of a family GitWallet has code for is one entry there, with no code: the scanners,
-the pages, the prices, the settings and the database follow. Every build tests that with a
+the pages, the prices, the settings and the database follow. (For a UTXO chain that means one whose
+headers hash and whose difficulty goes as Bitcoin's do: proving anything else takes code for its
+headers.) Every build tests that with an EVM
 network added from a file, for its rows, totals and prices. An Ethereum-style address is one row per network, as what it
 holds and whether it answered differ per network.
 
@@ -193,8 +218,10 @@ new build.
 - Servers see the addresses they are asked about (Bitcoin scripthashes, Ethereum
   addresses) and this PC's IP: a server can tell they belong together. With a
   connection to one Electrum server at a time, that server sees them all.
-- Answers are not proven yet: a server could lie about a balance. Checking proofs for
-  Bitcoin and a second endpoint for Ethereum come with the transaction history.
+- On Bitcoin a transaction in a block is proven on this PC (see History above). A balance is
+  still a server's word, compared with what the transactions add up to; a server could hide a
+  transaction from both, which a second server would show. Ethereum's answers are not proven
+  yet: a second endpoint comes with its transaction history.
 - TLS / HTTPS certificate verification is always on.
 - Spending features will be tested on Bitcoin testnet and Ethereum Sepolia
   before release; real transfers are always initiated by you.

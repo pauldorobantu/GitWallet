@@ -51,6 +51,38 @@ bool isHttpsUrl(const QString& text)
     return url.isValid() && url.scheme() == QLatin1String("https") && !url.host().isEmpty();
 }
 
+bool readBits(const QJsonValue& value, uint32_t* out)
+{
+    bool ok = false;
+    const uint value32 = value.toString().toUInt(&ok, 16);
+    *out = value32;
+    return ok && value.toString().size() == 8;
+}
+
+// Empty when `o` says how a UTXO network's headers are checked, otherwise why not.
+QString readProofs(const QJsonObject& o, ChainProofs* out)
+{
+    if (!readBits(o.value(QLatin1String("powLimit")), &out->powLimit))
+        return QStringLiteral("no usable easiest target");
+    out->retargetBlocks = o.value(QLatin1String("retargetBlocks")).toInt(-1);
+    out->targetSeconds = uint32_t(o.value(QLatin1String("targetSeconds")).toInt(0));
+    if (out->retargetBlocks < 0 || (out->retargetBlocks > 0 && out->targetSeconds == 0))
+        return QStringLiteral("no usable difficulty rule");
+    const QJsonObject checkpoint = o.value(QLatin1String("checkpoint")).toObject();
+    out->checkpointHeight = checkpoint.value(QLatin1String("height")).toInt(-1);
+    out->periodStart = uint32_t(checkpoint.value(QLatin1String("periodStart")).toDouble(0));
+    readBits(checkpoint.value(QLatin1String("nextBits")), &out->nextBits); // for a test, if it is there
+    out->checkpointTime = uint32_t(checkpoint.value(QLatin1String("time")).toDouble(0));
+    if (out->checkpointHeight < 0
+        || !chain::hashFromHex(checkpoint.value(QLatin1String("hash")).toString().toStdString(), &out->checkpointHash)
+        || !chain::hashFromHex(checkpoint.value(QLatin1String("headersRoot")).toString().toStdString(), &out->headersRoot)
+        || !readBits(checkpoint.value(QLatin1String("bits")), &out->checkpointBits))
+        return QStringLiteral("no usable checkpoint");
+    if (out->retargetBlocks > 0 && ((out->checkpointHeight + 1) % out->retargetBlocks != 0 || out->periodStart == 0 || out->checkpointTime == 0))
+        return QStringLiteral("a checkpoint that does not end a period");
+    return {};
+}
+
 // One coin or token of `network`. Empty when it is usable, otherwise why not.
 QString readAsset(const QJsonObject& o, const NetworkInfo& network, bool token, AssetInfo* out)
 {
@@ -125,6 +157,9 @@ QString readNetwork(const QJsonObject& o, Registry* r)
         static const QRegularExpression hash(QStringLiteral("^[0-9a-f]{64}$"));
         if (!hash.match(n.genesis).hasMatch())
             return QStringLiteral("%1 has no usable genesis hash").arg(n.id);
+        const QString proofs = readProofs(o.value(QLatin1String("proofs")).toObject(), &n.proofs);
+        if (!proofs.isEmpty())
+            return QStringLiteral("%1 has %2").arg(n.id, proofs);
     } else {
         const double chainId = o.value(QLatin1String("chainId")).toDouble(-1.0);
         n.multicall = o.value(QLatin1String("multicall3")).toString();

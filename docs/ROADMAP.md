@@ -17,9 +17,10 @@ was measured is in [ENDPOINTS.md](ENDPOINTS.md).
 
 USD at every level and per-address amounts exist, for four assets only: BTC, ETH, USDT,
 USDC. Coins and networks are data, what the wallets show is kept in an encrypted database, a
-start shows it at once, and 425,000 addresses fit (stage 1). Missing against the known wallets:
-History, transaction detail, Receive with QR, a per-coin screen, address labels, explorer
-links, app password, Send. Nothing keeps transactions yet.
+start shows it at once, and 425,000 addresses fit (stage 1). Every Bitcoin transaction is in a
+History, overall, per wallet and per address, proven on this PC, with its fee, USD then and now,
+explorer link, labels and notes (stage 2). Missing against the known wallets: the same for
+Ethereum, Receive with QR, a per-coin screen, app password, Send.
 
 ## The logic people already know
 
@@ -56,9 +57,10 @@ level. An address opens to every asset in its own coin with USD, then its histor
   a minute, and the next unused ones go ahead of a longer one. The worst delay per chain is
   shown.
 - **Public servers see the addresses asked about**, and a key ties them to whoever holds it.
-  They are not yet checked on what they answer: Merkle proofs against headers for Bitcoin and
-  a second endpoint for Ethereum-style chains come with the history, in stages 2 and 3, before
-  "paid" is believed.
+  On Bitcoin, what is in a block is checked on this PC since stage 2: a Merkle proof against a header
+  that leads to a checkpoint, or has its work and difficulty checked. A balance is still a server's
+  word, but it is compared with what its transactions add up to, without any whose proof failed. A second endpoint for
+  Ethereum-style chains comes with their history in stage 3, before "paid" is believed there.
 - **Many chains will be view-only for a long time.** Sending beyond Bitcoin and
   Ethereum-style chains is extra work per family, and the app says so per chain.
 
@@ -71,7 +73,7 @@ real UI.
 | # | Stage | What the owner gets | Size |
 |---|---|---|---|
 | 1 | **Foundation** *(done)* | Coins and chains are data, an encrypted local database and one scheduler. Starts instantly from saved balances. Live price source proven, with the time shown beside USD. Real limits of public endpoints measured | 3-5 |
-| 2 | **Bitcoin history** | Every BTC transaction, overall and per address; detail with fee, USD then and now, explorer link; pending, replaced, confirmed; filters, search, CSV, labels and notes. No key needed | 4-6 |
+| 2 | **Bitcoin history** *(done)* | Every BTC transaction, overall and per address; detail with fee, USD then and now, explorer link; pending, replaced, confirmed; filters, search, CSV, labels and notes. No key needed | 4-6 |
 | 3 | **Ethereum history** | The same for ETH, USDT, USDC, with failed transactions. "Complete back to" shown per chain | 3-5 |
 | 4 | **Familiar screens** | Portfolio, coin pages, clickable path, Receive with QR and next unused address, hide spam and zeros, payment alerts, app password, portable backup | 6-8 |
 | 5 | **Ethereum-style chains** | BNB, Base, Arbitrum, Polygon, OP, Avalanche, custom tokens. No retyping | 3-5 |

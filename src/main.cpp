@@ -8,6 +8,8 @@
 #include "ui/LanguageManager.h"
 #include "ui/MainWindow.h"
 #include "ui/ThemeManager.h"
+#include "wallet/History.h"
+#include "wallet/UtxoHistory.h"
 #include "wallet/UtxoScanner.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
@@ -16,6 +18,7 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -30,6 +33,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -262,7 +266,46 @@ bool writeScanReport(const QString& path, app::WalletController* c, bool timedOu
                                     {QStringLiteral("type"), QString::fromLatin1(chain::scriptTypeName(k.type))},
                                     {QStringLiteral("account"), int(k.account)},
                                     {QStringLiteral("xpub"), k.xpub}});
+    // Every transaction, and what it did to each address: for comparing with a block explorer.
+    QJsonArray history;
+    QJsonArray historyState;
+    const QList<wallet::UtxoHistory*> histories = c->histories();
+    for (const wallet::UtxoHistory* source : histories) {
+        const wallet::HistoryBook* book = source->book();
+        const wallet::HistoryProgress progress = source->progress();
+        historyState.append(QJsonObject{{QStringLiteral("network"), wallet::networkInfo(source->network()).id},
+                                        {QStringLiteral("transactions"), book->size()},
+                                        {QStringLiteral("addressesLeft"), progress.addressesLeft},
+                                        {QStringLiteral("transactionsLeft"), progress.transactionsLeft},
+                                        {QStringLiteral("proofsLeft"), progress.proofsLeft},
+                                        {QStringLiteral("refused"), progress.refused},
+                                        {QStringLiteral("differing"), progress.differing},
+                                        {QStringLiteral("unproven"), progress.unproven},
+                                        {QStringLiteral("tip"), source->tip()}});
+        for (int position = 0; position < book->size(); ++position) {
+            const wallet::TxRecord& tx = book->at(position);
+            QJsonArray effects;
+            for (const wallet::TxEffect& effect : book->effectsOf(position))
+                effects.append(QJsonObject{{QStringLiteral("address"), book->addressAt(effect.address).address},
+                                           {QStringLiteral("wallet"), qint64(book->addressAt(effect.address).wallet)},
+                                           {QStringLiteral("received"), QString::number(effect.received)},
+                                           {QStringLiteral("spent"), QString::number(effect.spent)}});
+            history.append(QJsonObject{{QStringLiteral("network"), wallet::networkInfo(source->network()).id},
+                                       {QStringLiteral("txid"), QString::fromStdString(chain::hashHex(tx.txid))},
+                                       {QStringLiteral("height"), tx.height},
+                                       {QStringLiteral("time"), QString::number(tx.time)},
+                                       {QStringLiteral("fee"), QString::number(tx.fee)},
+                                       {QStringLiteral("vsize"), tx.vsize},
+                                       {QStringLiteral("seen"), int(tx.seen)},
+                                       {QStringLiteral("proven"), tx.proven},
+                                       {QStringLiteral("usdThen"), tx.usdThen},
+                                       {QStringLiteral("usdThenAt"), QString::number(tx.usdThenAt)},
+                                       {QStringLiteral("effects"), effects}});
+        }
+    }
     const QJsonObject report{
+        {QStringLiteral("history"), history},
+        {QStringLiteral("historyState"), historyState},
         {QStringLiteral("accounts"), accounts},
         {QStringLiteral("timedOut"), timedOut},
         {QStringLiteral("networks"), networks},
@@ -369,6 +412,12 @@ int main(int argc, char** argv)
         app::ui::LanguageManager::instance()->loadFromSettings();
 
     if (!coinsProblem.isEmpty()) {
+        // A run with nobody in front of it says so and ends: a dialog would wait for ever.
+        if (args.contains(QStringLiteral("--scan-report")) || args.contains(QStringLiteral("--walkthrough")) || args.contains(QStringLiteral("--scale-test"))) {
+            attachParentConsole();
+            std::fprintf(stderr, "The list of coins does not load: %s\n", coinsProblem.toUtf8().constData());
+            return 1;
+        }
         QMessageBox::critical(nullptr, QStringLiteral("GitWallet"),
                               QStringLiteral("The list of coins does not load, so nothing can be shown.\n\n%1").arg(coinsProblem));
         return 1;
@@ -497,8 +546,47 @@ int main(int argc, char** argv)
             const bool ok = writeScanReport(reportPath, controller, timedOut);
             QCoreApplication::exit(ok ? (timedOut ? 3 : 0) : 4);
         };
-        QObject::connect(controller, &app::WalletController::scanFinished, controller,
-                         [finish] { QTimer::singleShot(1500, [finish] { finish(false); }); });
+        // The balances first, then the histories they lead to, then what those were worth then, for as
+        // long as a source takes to say: all of it has to hold when the report is written.
+        const auto historyDone = [controller] {
+            const QList<wallet::UtxoHistory*> histories = controller->histories();
+            for (const wallet::UtxoHistory* history : histories) {
+                if (history->running() && history->progress().working())
+                    return false;
+            }
+            return true;
+        };
+        const auto pricesDone = [controller] {
+            const QList<wallet::UtxoHistory*> histories = controller->histories();
+            for (const wallet::UtxoHistory* history : histories) {
+                const wallet::HistoryBook* book = history->book();
+                for (int position = 0; position < book->size(); ++position) {
+                    if (book->at(position).proven && book->at(position).usdThen <= 0.0)
+                        return false;
+                }
+            }
+            return true;
+        };
+        QObject::connect(controller, &app::WalletController::scanFinished, controller, [finish, historyDone, pricesDone, controller] {
+            auto* wait = new QTimer(controller);
+            wait->setInterval(500);
+            auto clock = std::make_shared<QElapsedTimer>();
+            auto settled = std::make_shared<int>(0);
+            clock->start();
+            QObject::connect(wait, &QTimer::timeout, controller, [finish, historyDone, pricesDone, wait, clock, settled] {
+                if (!historyDone()) {
+                    *settled = 0;
+                    clock->restart();
+                    return;
+                }
+                // A moment of quiet, then prices have up to 30 s: what predates them never gets one.
+                if (++*settled < 4 || (!pricesDone() && clock->elapsed() < 30000))
+                    return;
+                wait->stop();
+                finish(false);
+            });
+            wait->start();
+        });
         QTimer::singleShot(argValue(args, QStringLiteral("--timeout")).isEmpty() ? 300000 : timeoutMs,
                            controller, [finish] { finish(true); });
     } else if (!shot.isEmpty()) {

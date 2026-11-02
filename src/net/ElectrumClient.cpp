@@ -44,9 +44,10 @@ constexpr int kRefusedRetries = 2;
 // uses is well under 1 KB. Each line is parsed in full on the GUI thread before its
 // meaning is known, so this bounds what one line can cost in memory and in time.
 constexpr qsizetype kMaxLineBytes = qsizetype(1) * 1024 * 1024;
-// While a history is on its way: about 90 bytes per transaction, and servers stop giving
-// one well before this. Long lines are for that, and they are rationed: a server that
-// sends them one after another is keeping the window busy, and is left.
+// While a history is on its way (about 90 bytes per transaction, and servers stop giving one
+// well before this) or a raw transaction (8 MB of hex at the very most). Long lines are for
+// that, and they are rationed: a server that sends them one after another is keeping the
+// window busy, and is left.
 constexpr qsizetype kMaxHistoryLineBytes = qsizetype(32) * 1024 * 1024;
 constexpr qsizetype kRationedLineBytes = qsizetype(64) * 1024;
 constexpr qint64 kMaxLongLineBytesPerMinute = qint64(128) * 1024 * 1024;
@@ -62,6 +63,7 @@ constexpr qsizetype kUnsolicitedAllowance = 1'000;
 constexpr QLatin1String kScripthashSubscribe("blockchain.scripthash.subscribe");
 constexpr QLatin1String kHeadersSubscribe("blockchain.headers.subscribe");
 constexpr QLatin1String kGetHistory("blockchain.scripthash.get_history");
+constexpr QLatin1String kGetTransaction("blockchain.transaction.get");
 
 // What a block header in hex hashes to, as explorers write it. Empty if it is no header.
 QString headerHash(const QString& hex)
@@ -937,7 +939,7 @@ void ElectrumClient::onReadyRead()
 qsizetype ElectrumClient::lineLimit() const
 {
     for (const Pending& p : inFlight_) {
-        if (p.method == kGetHistory)
+        if (p.method == kGetHistory || p.method == kGetTransaction)
             return kMaxHistoryLineBytes;
     }
     return kMaxLineBytes;

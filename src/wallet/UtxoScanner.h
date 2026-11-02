@@ -60,6 +60,8 @@ public:
     static void setPacesForTest(int minRoundMs, int retryFirstMs, int readPauseMs);
     // Plain TCP to a test's own server.
     void usePlainTcpForTest();
+    // The connection, which the history of this network's addresses shares.
+    net::ElectrumClient* client() const { return client_; }
 
     UtxoScanner(Network network, WalletModel* model, QObject* parent = nullptr);
     ~UtxoScanner() override;
@@ -87,6 +89,11 @@ public:
     QDateTime balancesAt() const override;
     QString serverName() const override;
     ScanTiers tiers() const override;
+    // A balance of this address is queued, asked for, or to be asked for again.
+    bool balanceOnItsWay(const QString& scripthash) const
+    {
+        return balanceQueued_.contains(scripthash) || balanceSeq_.contains(scripthash) || balanceRetry_.contains(scripthash);
+    }
     int checkedCount() const;  // rows whose status, and balance if used, have answered
     int derivedCount() const;  // rows derived so far
 

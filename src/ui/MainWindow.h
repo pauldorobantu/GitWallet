@@ -24,6 +24,7 @@ class SideNav;
 class OverviewPage;
 class WalletsPage;
 class AddressesPage;
+class HistoryPage;
 class SettingsPage;
 
 // The application window: the frameless shell, title bar and sidebar of the
@@ -39,7 +40,7 @@ public:
 
     WalletController* controller() const { return controller_; }
 
-    // "overview" | "wallets" | "addresses" | "send" | "settings" (for --page and tests).
+    // "overview" | "wallets" | "addresses" | "history" | "send" | "settings" (for --page and tests).
     void showPage(const QString& name);
 
 protected:
@@ -107,6 +108,7 @@ private:
     OverviewPage* overview_ = nullptr;
     WalletsPage* wallets_ = nullptr;
     AddressesPage* addresses_ = nullptr;
+    HistoryPage* history_ = nullptr;
     SettingsPage* settings_ = nullptr;
     QWidget* noticeBar_ = nullptr; // shown while a notice waits to be read
     QLabel* noticeChip_ = nullptr;

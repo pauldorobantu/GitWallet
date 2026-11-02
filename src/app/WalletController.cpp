@@ -7,6 +7,8 @@
 #include "ui/LanguageManager.h"
 #include "wallet/BulkImport.h"
 #include "wallet/EvmScanner.h"
+#include "wallet/History.h"
+#include "wallet/UtxoHistory.h"
 #include "wallet/UtxoScanner.h"
 #include "wallet/WalletModel.h"
 
@@ -20,7 +22,11 @@
 #include <QLocale>
 #include <QLockFile>
 #include <QLoggingCategory>
+#include <QPointer>
+#include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
 
@@ -30,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace app {
@@ -56,6 +63,11 @@ constexpr std::chrono::seconds kLedgerRetryInterval{5};
 constexpr int kLedgerRetriesBeforeSaying = 6;
 // A price older than this says it did not move on its own.
 constexpr qint64 kPricesOldSeconds = 3600;
+// Lines of a file of labels that go in per event-loop turn, each lot in one transaction.
+constexpr qsizetype kImportChunk = 2000;
+// Past anything an export makes of half a million notes: a file this long is a mistake, and not one
+// to read into memory.
+constexpr qint64 kMaxLabelsFileBytes = qint64(1) << 30;
 // Scanners report progress once per address (thousands in a row on a shop
 // seed); the title chip needs only a few updates a second.
 constexpr std::chrono::milliseconds kStatusThrottle{150};
@@ -239,6 +251,11 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     model_ = new wallet::WalletModel(this);
     scheduler_ = new wallet::Scheduler(model_, this);
     ledger_ = new store::Ledger(model_, this);
+    const QList<wallet::HistoryBook*> books = scheduler_->books();
+    for (wallet::HistoryBook* book : books)
+        ledger_->addBook(book);
+    connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::historyProgress);
+    connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::queueStatus); // an address may not add up
 
     priceTimer_ = new QTimer(this);
     priceTimer_->setInterval(kPriceInterval);
@@ -281,12 +298,25 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     connect(ledger_, &store::Ledger::problem, this, [this](const QString& message) {
         emit errorOccurred(wallet::Problem::SavedData, message, QString());
     });
-    connect(ledger_, &store::Ledger::setAside, this, [this](const QString& file) {
-        emit errorOccurred(wallet::Problem::SavedDataAside,
-                           QStringLiteral("The saved balances could not be read, so they were kept as %1 and are being "
-                                          "read again.")
-                               .arg(QDir::toNativeSeparators(file)),
-                           QString());
+    connect(ledger_, &store::Ledger::labelsRead, this, [this](const QHash<QString, QString>& labels) {
+        addressLabels_ = labels;
+        emit labelsChanged();
+    });
+    connect(ledger_, &store::Ledger::labelsRemoved, this, [this](const QStringList& addresses) {
+        for (const QString& address : addresses)
+            addressLabels_.remove(address);
+        emit labelsChanged();
+    });
+    connect(ledger_, &store::Ledger::setAside, this, [this](const QString& file, int recovered, bool whole) {
+        const QString shown = QDir::toNativeSeparators(file);
+        QString message = QStringLiteral("The saved balances could not be read, so they were kept as %1 and are being read again.").arg(shown);
+        if (recovered < 0)
+            message += QStringLiteral(" Its labels and notes could not be read: only that file, or a copy you exported, holds them.");
+        else if (!whole)
+            message += QStringLiteral(" %1 of its labels and notes came along; the rest could not be read, and stay in that file.").arg(recovered);
+        else if (recovered > 0)
+            message += QStringLiteral(" Its %1 labels and notes came along.").arg(recovered);
+        emit errorOccurred(wallet::Problem::SavedDataAside, message, QString());
     });
     // The rows they describe are gone.
     connect(model_, &wallet::WalletModel::cleared, this, [this] {
@@ -345,6 +375,9 @@ bool WalletController::loadExisting(QString* error)
     stopServices();
     ledger_->close();
     model_->clear();
+    const QList<wallet::HistoryBook*> books = scheduler_->books();
+    for (wallet::HistoryBook* book : books)
+        book->clear();
     openLedger();
     emit walletChanged();
     emit statusChanged();
@@ -555,6 +588,11 @@ bool WalletController::removeWallet(quint32 id, QString* error)
         setError(error, QStringLiteral("The wallet was not removed: ") + blocker);
         return false;
     }
+    // What it holds of this wallet is still on its way: it would go on arriving after this.
+    if (waitingForLedger_) {
+        setError(error, QStringLiteral("The wallet was not removed: what is saved is still being read. Try again in a moment."));
+        return false;
+    }
     const qsizetype position = std::find_if(store_.wallets.cbegin(), store_.wallets.cend(),
                                             [id](const wallet::WalletEntry& w) { return w.id == id; })
                                - store_.wallets.cbegin();
@@ -573,6 +611,22 @@ bool WalletController::removeWallet(quint32 id, QString* error)
     }
 
     stopServices();
+    // What only this PC knew of its addresses goes with them.
+    QStringList labelled;
+    for (int row = 0; row < model_->size(); ++row) {
+        const wallet::AddressRow& r = model_->at(row);
+        if (r.wallet == id && addressLabels_.contains(r.address))
+            labelled.append(r.address);
+    }
+    for (const QString& address : std::as_const(labelled)) {
+        addressLabels_.remove(address);
+        ledger_->saveAddressLabel(address, QString());
+    }
+    if (!labelled.isEmpty())
+        emit labelsChanged();
+    const QList<wallet::HistoryBook*> books = scheduler_->books();
+    for (wallet::HistoryBook* book : books)
+        book->forgetWallet(id);
     ledger_->forgetWallet(id);
     model_->removeWallet(id);
     startServices();
@@ -672,6 +726,11 @@ bool WalletController::removeAllWallets(QString* error)
     showingSaved_ = false;
     savedAt_ = QDateTime();
     model_->clear();
+    const QList<wallet::HistoryBook*> books = scheduler_->books();
+    for (wallet::HistoryBook* book : books)
+        book->clear();
+    addressLabels_.clear();
+    emit labelsChanged();
     emit walletChanged();
     emit statusChanged();
     if (!left.isEmpty())
@@ -686,6 +745,13 @@ bool WalletController::removeAllWallets(QString* error)
 int WalletController::walletFilesKeptAside() const
 {
     return int(keptAsideFiles().size());
+}
+
+int WalletController::databasesKeptAside() const
+{
+    QStringList files = store::Ledger::keptAsideFiles(wallet::WalletStore::databasePath());
+    files.removeIf([](const QString& name) { return name.endsWith(QLatin1String("-wal")) || name.endsWith(QLatin1String("-shm")); });
+    return int(files.size());
 }
 
 QString WalletController::unreadFileNote() const
@@ -956,6 +1022,8 @@ QString WalletController::statusText() const
             .arg(rows, grouped(model_->size() - model_->checkedCount()));
     case Status::Unscanned:
         return QStringLiteral("Some addresses not scanned · %1").arg(rows);
+    case Status::DoNotAddUp:
+        return QStringLiteral("Balances in doubt · %1 · %2 do not add up to their transactions").arg(rows, grouped(differingAddresses()));
     case Status::UpToDate:
         break;
     }
@@ -1001,6 +1069,338 @@ QString WalletController::pricesLine() const
     if (!doubted.isEmpty())
         parts << ui::trText(QStringLiteral("sources disagree on %1")).arg(doubted.join(QStringLiteral(", ")));
     return parts.join(QLatin1String(" · "));
+}
+
+wallet::UtxoHistory* WalletController::historyOf(wallet::Network network) const
+{
+    const QList<wallet::UtxoHistory*> all = scheduler_->histories();
+    for (wallet::UtxoHistory* history : all) {
+        if (history->network() == network)
+            return history;
+    }
+    return nullptr;
+}
+
+QString WalletController::labelsBlocker() const
+{
+    if (!hasWallet())
+        return ui::trText(QStringLiteral("Add a wallet first: labels and notes are kept with it."));
+    if (waitingForLedger_ || ledger_->isLoading())
+        return ui::trText(QStringLiteral("What is saved is still being read. Try again in a moment."));
+    if (importingLabels_)
+        return ui::trText(QStringLiteral("A file of labels is still going in. Try again in a moment."));
+    if (!ledger_->isOpen())
+        return ui::trText(QStringLiteral("Labels and notes are not being kept: %1.")).arg(ledgerClosedWhy_.isEmpty() ? ui::trText(QStringLiteral("another GitWallet window holds this folder")) : ledgerClosedWhy_);
+    return {};
+}
+
+bool WalletController::holdsSecret(const QString& text) const
+{
+    if (!wallet::looksLikeSecret(text))
+        return false;
+    // Copy gives a transaction's id, and a note on a refund names one. That many hex digits read as a
+    // key, unless they are an id these wallets know.
+    static const QRegularExpression hex(QStringLiteral("\\b[0-9a-fA-F]{64}\\b"));
+    QString rest = text;
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    for (auto it = hex.globalMatch(text); it.hasNext();) {
+        const QString token = it.next().captured();
+        chain::Hash256 txid{};
+        chain::hashFromHex(token.toStdString(), &txid);
+        if (std::any_of(histories.cbegin(), histories.cend(), [&txid](const wallet::UtxoHistory* history) { return history->book()->find(txid) >= 0; }))
+            rest.replace(token, QStringLiteral(" "));
+    }
+    return wallet::looksLikeSecret(rest);
+}
+
+bool WalletController::setTxNote(wallet::Network network, const chain::Hash256& txid, const wallet::TxNote& note, QString* error)
+{
+    setError(error, QString());
+    wallet::UtxoHistory* history = historyOf(network);
+    if (!history)
+        return false;
+    wallet::TxNote clean{note.label.trimmed(), note.note.trimmed()};
+    // Whatever goes into a label ends up in an export. Like a wallet's name, it never holds a secret.
+    if (holdsSecret(clean.label) || holdsSecret(clean.note)) {
+        setError(error, QStringLiteral("That looks like seed words or a private key, so it was not kept."));
+        return false;
+    }
+    const QString blocker = labelsBlocker();
+    if (!blocker.isEmpty()) {
+        setError(error, blocker);
+        return false;
+    }
+    ledger_->saveNote(network, txid, clean);
+    history->book()->setNote(txid, clean);
+    return true;
+}
+
+bool WalletController::setAddressLabel(const QString& address, const QString& label, QString* error)
+{
+    setError(error, QString());
+    const QString clean = label.trimmed();
+    if (holdsSecret(clean)) {
+        setError(error, QStringLiteral("That looks like seed words or a private key, so it was not kept."));
+        return false;
+    }
+    const QString blocker = labelsBlocker();
+    if (!blocker.isEmpty()) {
+        setError(error, blocker);
+        return false;
+    }
+    ledger_->saveAddressLabel(address, clean);
+    if (clean.isEmpty())
+        addressLabels_.remove(address);
+    else
+        addressLabels_.insert(address, clean);
+    emit labelsChanged();
+    return true;
+}
+
+bool WalletController::hasLabels() const
+{
+    return labelCount() > 0;
+}
+
+int WalletController::labelCount() const
+{
+    int count = int(addressLabels_.size());
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    for (const wallet::UtxoHistory* history : histories)
+        count += int(history->book()->notes().size());
+    return count;
+}
+
+int WalletController::labelCount(quint32 wallet) const
+{
+    int count = 0;
+    for (int row = 0; row < model_->size(); ++row) {
+        const wallet::AddressRow& r = model_->at(row);
+        if (r.wallet == wallet && addressLabels_.contains(r.address))
+            ++count;
+    }
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    for (const wallet::UtxoHistory* history : histories) {
+        const wallet::HistoryBook* book = history->book();
+        const QHash<chain::Hash256, wallet::TxNote>& notes = book->notes();
+        for (auto it = notes.cbegin(); it != notes.cend(); ++it) {
+            const int position = book->find(it.key());
+            if (position < 0)
+                continue;
+            const QVector<wallet::TxEffect>& effects = book->effectsOf(position);
+            if (!effects.isEmpty() && std::all_of(effects.cbegin(), effects.cend(), [book, wallet](const wallet::TxEffect& effect) { return book->addressAt(effect.address).wallet == wallet; }))
+                ++count;
+        }
+    }
+    return count;
+}
+
+namespace {
+
+// Everything a file of labels says, as it stands this moment: shared, so that it can be written
+// elsewhere while the window goes on.
+struct LabelsNow {
+    QList<QPair<QString, QHash<chain::Hash256, wallet::TxNote>>> notes;
+    QHash<QString, QString> addresses;
+};
+
+QByteArray labelsText(const LabelsNow& now)
+{
+    QByteArray out;
+    for (const auto& network : now.notes) {
+        for (auto it = network.second.cbegin(); it != network.second.cend(); ++it) {
+            wallet::LabelLine line;
+            line.txid = it.key();
+            line.network = network.first;
+            line.label = it->label;
+            line.note = it->note;
+            out += wallet::writeLabelLine(line);
+        }
+    }
+    for (auto it = now.addresses.cbegin(); it != now.addresses.cend(); ++it) {
+        wallet::LabelLine line;
+        line.isTransaction = false;
+        line.address = it.key();
+        line.label = it.value();
+        out += wallet::writeLabelLine(line);
+    }
+    return out;
+}
+
+// Off this thread: what `work` makes of its own copies comes back to `owner`.
+template <typename Work, typename Done>
+void offThisThread(QObject* owner, Work work, Done done)
+{
+    using Result = std::invoke_result_t<Work>;
+    auto result = std::make_shared<Result>();
+    QThread* thread = QThread::create([work = std::move(work), result]() mutable { *result = work(); });
+    QObject::connect(thread, &QThread::finished, owner, [thread, result, done = std::move(done)]() mutable {
+        thread->deleteLater();
+        done(*result);
+    });
+    thread->start();
+}
+
+} // namespace
+
+QByteArray WalletController::labelsFile() const
+{
+    LabelsNow now;
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    for (const wallet::UtxoHistory* history : histories)
+        now.notes.append({wallet::networkInfo(history->network()).id, history->book()->notes()});
+    now.addresses = addressLabels_;
+    return labelsText(now);
+}
+
+void WalletController::writeLabelsFile(const QString& path, QObject* guard, const std::function<void(bool, const QString&)>& done)
+{
+    LabelsNow now;
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    for (const wallet::UtxoHistory* history : histories)
+        now.notes.append({wallet::networkInfo(history->network()).id, history->book()->notes()});
+    now.addresses = addressLabels_;
+    struct Written {
+        bool ok = false;
+        QString error;
+    };
+    offThisThread(guard, [now, path] {
+        Written written;
+        const QByteArray body = labelsText(now);
+        QSaveFile file(path);
+        written.ok = file.open(QIODevice::WriteOnly) && file.write(body) == body.size() && file.commit();
+        if (!written.ok)
+            written.error = file.errorString();
+        return written;
+    }, [done](const Written& written) { done(written.ok, written.error); });
+}
+
+// One file of labels on its way in.
+struct LabelImport {
+    QVector<wallet::LabelLine> lines;
+    QSet<int> suspect; // a field looks like a secret, unless what looks so is an id these wallets know
+    qsizetype at = 0;
+    int added = 0;
+    int left = 0;
+    bool anyAddress = false;
+    QPointer<QObject> guard;
+    std::function<void(int, int, const QString&)> done;
+};
+
+void WalletController::importLabelsFile(const QString& path, QObject* guard, const std::function<void(int, int, const QString&)>& done)
+{
+    const QString blocker = labelsBlocker();
+    if (!blocker.isEmpty()) {
+        done(-1, 0, blocker);
+        return;
+    }
+    importingLabels_ = true;
+    struct Read {
+        QVector<wallet::LabelLine> lines;
+        QSet<int> suspect;
+        int left = 0;
+        QString error;
+    };
+    const QPointer<QObject> stillThere(guard);
+    offThisThread(this, [path] {
+        Read read;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            read.error = QStringLiteral("That file could not be read.");
+            return read;
+        }
+        if (file.size() > kMaxLabelsFileBytes) {
+            read.error = QStringLiteral("That file is too long to be a file of labels.");
+            return read;
+        }
+        read.lines = wallet::readLabelLines(file.readAll(), &read.left);
+        for (int i = 0; i < read.lines.size(); ++i) {
+            const wallet::LabelLine& line = read.lines.at(i);
+            if (wallet::looksLikeSecret(line.label) || wallet::looksLikeSecret(line.note))
+                read.suspect.insert(i);
+        }
+        return read;
+    }, [this, stillThere, done](const Read& read) {
+        auto import = std::make_shared<LabelImport>();
+        import->guard = stillThere;
+        import->done = done;
+        if (!read.error.isEmpty()) {
+            importingLabels_ = false;
+            if (stillThere)
+                done(-1, 0, read.error);
+            return;
+        }
+        import->lines = read.lines;
+        import->suspect = read.suspect;
+        import->left = read.left;
+        importNextPart(import);
+    });
+}
+
+void WalletController::importNextPart(const std::shared_ptr<LabelImport>& import)
+{
+    const wallet::NetworkInfo* firstUtxo = wallet::firstOf(wallet::Family::Utxo);
+    QHash<wallet::Network, QHash<chain::Hash256, wallet::TxNote>> notes;
+    QHash<QString, QString> labels;
+    const qsizetype to = qMin(import->at + kImportChunk, import->lines.size());
+    for (; import->at < to; ++import->at) {
+        const wallet::LabelLine& line = import->lines.at(import->at);
+        const QString label = line.label.trimmed();
+        const QString note = line.note.trimmed();
+        // Whatever goes into a label ends up in an export. Like a wallet's name, it never holds a secret.
+        if (import->suspect.contains(int(import->at)) && (holdsSecret(label) || holdsSecret(note))) {
+            ++import->left;
+            continue;
+        }
+        if (line.isTransaction) {
+            const wallet::NetworkInfo* network = line.network.isEmpty() ? firstUtxo : wallet::findNetwork(line.network);
+            wallet::UtxoHistory* history = network ? historyOf(network->network) : nullptr;
+            if (!history || (label.isEmpty() && note.isEmpty())) {
+                ++import->left;
+                continue;
+            }
+            // Over what is there only what the line says: most wallets' files have labels alone.
+            wallet::TxNote kept = history->book()->noteOf(line.txid);
+            if (!label.isEmpty())
+                kept.label = label;
+            if (!note.isEmpty())
+                kept.note = note;
+            notes[network->network].insert(line.txid, kept);
+            history->book()->setNote(line.txid, kept);
+        } else {
+            // All an address has is its label: a line without one says nothing of it.
+            if (label.isEmpty()) {
+                ++import->left;
+                continue;
+            }
+            labels.insert(line.address, label);
+            addressLabels_.insert(line.address, label);
+            import->anyAddress = true;
+        }
+        ++import->added;
+    }
+    for (auto it = notes.cbegin(); it != notes.cend(); ++it)
+        ledger_->saveNotes(it.key(), *it);
+    if (!labels.isEmpty())
+        ledger_->saveAddressLabels(labels);
+    if (import->at < import->lines.size()) {
+        QTimer::singleShot(0, this, [this, import] { importNextPart(import); });
+        return;
+    }
+    importingLabels_ = false;
+    if (import->anyAddress)
+        emit labelsChanged();
+    if (import->guard)
+        import->done(import->added, import->left, QString());
+}
+
+int WalletController::differingAddresses() const
+{
+    int count = 0;
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    for (const wallet::UtxoHistory* history : histories)
+        count += history->progress().differing;
+    return count;
 }
 
 double WalletController::usdValue(wallet::Asset asset) const
@@ -1076,6 +1476,7 @@ void WalletController::openLedger()
         ledgerRetry_->start();
         return;
     }
+    ledgerClosedWhy_.clear();
     if (store_.databaseKey.isEmpty()) {
         // A wallet.dat from before the database: the key joins it, if it may be written.
         const QString blocker = settingsSaveBlocker();
@@ -1087,6 +1488,7 @@ void WalletController::openLedger()
         }
         if (store_.databaseKey.isEmpty()) {
             // Every start is then a whole scan, and at scale that takes a while.
+            ledgerClosedWhy_ = why;
             emit errorOccurred(wallet::Problem::SavedData,
                                QStringLiteral("Saved balances are not being kept: %1").arg(why), QString());
             startServices();
@@ -1125,6 +1527,20 @@ void WalletController::tryLedgerAgain()
 
 void WalletController::onLedgerLoaded(const QList<store::SavedPrice>& prices, const QList<store::SavedTime>& times)
 {
+    if (!ledger_->isOpen()) {
+        // It could not be read after all: what it handed over is no more to go by than the rest.
+        ledgerClosedWhy_ = QStringLiteral("the database could not be opened");
+        addressLabels_.clear();
+        emit labelsChanged();
+    }
+    // What a wallet removed while the file could not be written left behind.
+    QSet<quint32> wallets;
+    for (const wallet::WalletEntry& w : std::as_const(store_.wallets))
+        wallets.insert(w.id);
+    const QList<wallet::HistoryBook*> books = scheduler_->books();
+    for (wallet::HistoryBook* book : books)
+        book->keepWallets(wallets);
+
     QList<net::PriceQuote> quotes;
     for (const store::SavedPrice& saved : prices) {
         if (const wallet::AssetInfo* asset = wallet::findAsset(saved.asset)) {
@@ -1262,6 +1678,8 @@ WalletController::Status WalletController::status() const
         return Status::Unchecked;
     if (accountUnscanned())
         return Status::Unscanned;
+    if (differingAddresses() > 0)
+        return Status::DoNotAddUp;
     return Status::UpToDate;
 }
 

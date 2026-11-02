@@ -17,7 +17,7 @@ class AddressTableModel : public QAbstractTableModel
 {
     Q_OBJECT
 public:
-    enum Column { ColWallet, ColChain, ColType, ColPath, ColAddress, ColBalance, ColUsd, ColState, ColumnCount };
+    enum Column { ColWallet, ColChain, ColType, ColPath, ColAddress, ColLabel, ColBalance, ColUsd, ColState, ColumnCount };
     enum Role {
         SortRole = Qt::UserRole + 1, // numeric value for balance / USD / path index columns
         NetworkRole,                 // int(wallet::Network)

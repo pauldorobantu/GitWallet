@@ -29,6 +29,7 @@ namespace app {
 void runScanTest(const std::function<void(bool, const QString&)>& check, QString* report, const QList<wallet::AccountKey>& someKeys);
 void runFoundationTest(const std::function<void(bool, const QString&)>& check, QString* report,
                        const QList<wallet::AccountKey>& someKeys);
+void runHistoryTest(const std::function<void(bool, const QString&)>& check, QString* report, const QList<wallet::AccountKey>& someKeys);
 
 namespace {
 
@@ -1015,6 +1016,7 @@ StoreTestResult runStoreTest()
         }
         runFoundationTest(check, &result.report, first);
         runScanTest(check, &result.report, first);
+        runHistoryTest(check, &result.report, first);
     } catch (const std::exception& e) {
         check(false, QStringLiteral("threw: ") + QString::fromUtf8(e.what()));
     }

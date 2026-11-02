@@ -1,6 +1,8 @@
 #include "wallet/Scheduler.h"
 
 #include "wallet/EvmScanner.h"
+#include "wallet/History.h"
+#include "wallet/UtxoHistory.h"
 #include "wallet/UtxoScanner.h"
 
 #include <algorithm>
@@ -12,9 +14,21 @@ Scheduler::Scheduler(WalletModel* model, QObject* parent) : QObject(parent)
     for (const NetworkInfo& info : networks()) {
         ChainScanner* scanner = nullptr;
         switch (info.family) {
-        case Family::Utxo:
-            scanner = new UtxoScanner(info.network, model, this);
+        case Family::Utxo: {
+            auto* utxo = new UtxoScanner(info.network, model, this);
+            scanner = utxo;
+            auto* book = new HistoryBook(info.network, this);
+            auto* history = new UtxoHistory(info.network, utxo->client(), model, book, this);
+            history->setRoundsRunning([utxo] { return utxo->tiers().rounds > 0; });
+            history->setBalanceOnItsWay([utxo](const QString& scripthash) { return utxo->balanceOnItsWay(scripthash); });
+            histories_.append(history);
+            connect(history, &UtxoHistory::progressed, this, &Scheduler::historyProgress);
+            connect(history, &UtxoHistory::problem, this, [this](Problem kind, const QString& message, const QString& detail) {
+                if (running_)
+                    emit problem(kind, message, detail);
+            });
             break;
+        }
         case Family::Evm:
             scanner = new EvmScanner(info.network, &budgets_, model, this);
             break;
@@ -41,6 +55,9 @@ Scheduler::~Scheduler()
 {
     blockSignals(true);
     stop();
+    // They share the scanners' clients, so they go first.
+    qDeleteAll(histories_);
+    histories_.clear();
     // Here, while budgets_ is still there for their clients.
     qDeleteAll(scanners_);
     scanners_.clear();
@@ -69,13 +86,28 @@ void Scheduler::start()
         if (scanner->hasAccounts())
             scanner->start();
     }
+    for (UtxoHistory* history : std::as_const(histories_)) {
+        const auto scanner = std::find_if(scanners_.cbegin(), scanners_.cend(), [history](const ChainScanner* s) { return s->network() == history->network(); });
+        if (scanner != scanners_.cend() && (*scanner)->hasAccounts())
+            history->start();
+    }
 }
 
 void Scheduler::stop()
 {
     running_ = false;
+    for (UtxoHistory* history : std::as_const(histories_))
+        history->stop();
     for (ChainScanner* scanner : std::as_const(scanners_))
         scanner->stop();
+}
+
+QList<HistoryBook*> Scheduler::books() const
+{
+    QList<HistoryBook*> out;
+    for (const UtxoHistory* history : histories_)
+        out.append(history->book());
+    return out;
 }
 
 void Scheduler::refreshNow()

@@ -25,6 +25,7 @@ signals:
     void addRequested();
     void addManyRequested();
     void showAddressesRequested(quint32 wallet);
+    void showHistoryRequested(quint32 wallet);
 
 protected:
     void showEvent(QShowEvent* event) override; // the figures repaint only while this page shows

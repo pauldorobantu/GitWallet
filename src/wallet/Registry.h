@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chain/Address.h"
+#include "chain/Transaction.h"
 
 #include <QHash>
 #include <QList>
@@ -42,12 +43,29 @@ struct AssetInfo {
     bool isToken() const { return !contract.isEmpty(); }
 };
 
+// How a UTXO network's headers are checked. Up to a checkpoint a server proves a header with
+// a Merkle branch to the root of all of them. Past it each header has to follow the one before,
+// with the work its difficulty asks for and the difficulty the rule gives.
+struct ChainProofs {
+    uint32_t powLimit = 0;       // the easiest target there is, as bits
+    int retargetBlocks = 0;      // blocks between changes of difficulty; 0: it never changes
+    uint32_t targetSeconds = 0;  // what those blocks should take
+    int checkpointHeight = -1;   // the last block of such a period
+    chain::Hash256 checkpointHash{};
+    chain::Hash256 headersRoot{}; // of every header up to the checkpoint
+    uint32_t checkpointBits = 0;
+    uint32_t nextBits = 0;       // of the block after it: what the difficulty rule has to give, for a test to check
+    uint32_t checkpointTime = 0;
+    uint32_t periodStart = 0;    // the time of the first block of the checkpoint's period
+};
+
 struct NetworkInfo {
     Network network{};
     QString id;   // "bitcoin"
     QString name; // "Bitcoin"
     Family family = Family::Utxo;
     QString genesis;         // Utxo: the first block's hash, which tells a server's chain
+    ChainProofs proofs;      // Utxo
     quint64 chainId = 0;     // Evm: what eth_chainId must answer
     QString multicall;       // Evm: the Multicall3 contract
     chain::AddressFormat format;

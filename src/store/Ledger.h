@@ -9,7 +9,9 @@
 class QTimer;
 
 namespace wallet {
+class HistoryBook;
 class WalletModel;
+struct HistoryDelta;
 }
 
 namespace store {
@@ -18,15 +20,19 @@ namespace store {
 // knows is there at the next start, before any server has answered. The rows it read
 // reach the model a chunk at a time. What changes after that goes to the database a few
 // seconds later, in one transaction, and at the latest when the window closes. A write
-// that fails is tried again whole. All of it is a copy: the servers go on deciding what a
-// figure is. If the database cannot be used the wallet runs as it would without one, and
-// says so once.
+// that fails is tried again whole. Nearly all of it is a copy: the servers go on deciding what
+// a figure is. Labels and notes are not, so they go first when read, at once when written, are
+// tried again until they are in, and are saved from a file that has to be set aside. If the
+// database cannot be used the wallet runs as it would without one, and says so once.
 class Ledger : public QObject
 {
     Q_OBJECT
 public:
     explicit Ledger(wallet::WalletModel* model, QObject* parent = nullptr);
     ~Ledger() override;
+
+    // The histories it keeps too. Before the first open().
+    void addBook(wallet::HistoryBook* book);
 
     // Opens the database at `path` and starts reading. A file that is not a database
     // under this key, or is damaged, is moved aside, never written to, and a new one is made.
@@ -39,6 +45,13 @@ public:
     void rewriteAll();
     void savePrices(const QList<SavedPrice>& prices);
     void saveTimes(const QList<SavedTime>& times);
+    // A label or note goes now: only this PC has it. False while nothing can be kept. One that
+    // does not go in is tried again until it does, and problem() says so.
+    bool saveNote(wallet::Network network, const chain::Hash256& txid, const wallet::TxNote& note);
+    bool saveAddressLabel(const QString& address, const QString& label);
+    // Many, in one transaction.
+    bool saveNotes(wallet::Network network, const QHash<chain::Hash256, wallet::TxNote>& notes);
+    bool saveAddressLabels(const QHash<QString, QString>& labels);
 
     void flush(); // what waits goes now
     // Writes what waits and closes: when this returns, the file is complete and let go.
@@ -51,10 +64,16 @@ public:
     static QStringList keptAsideFiles(const QString& path);
 
 signals:
+    // Before any row: what can be edited on a row has to be there with it.
+    void labelsRead(const QHash<QString, QString>& addressLabels);
     // Everything has been read. `savedAt`: when each network last had a full answer.
     void loaded(const QList<SavedPrice>& prices, const QList<SavedTime>& times);
     void problem(const QString& message);
-    void setAside(const QString& file); // a new database took the place of this one
+    // A new database took the place of this one. `recovered`: labels and notes that came along from
+    // it, -1 if it could not be read at all. `whole`: and it had no others.
+    void setAside(const QString& file, int recovered, bool whole);
+    // Those of a wallet removed, which the window may not have had a row for.
+    void labelsRemoved(const QStringList& addresses);
 
 private:
     void noteRows(int first, int last);
@@ -63,16 +82,31 @@ private:
     void schedule();
     void report(const QString& message); // at most once per open
     void noteWrite(bool ok, bool whole, const QString& why);
+    void flushHistory();
+    void noteHistoryWrite(wallet::HistoryBook* book, bool ok, const QString& why, const wallet::HistoryDelta& delta);
+    void writeNotes(wallet::Network network, const QHash<chain::Hash256, wallet::TxNote>& notes);
+    void writeLabels(const QHash<QString, QString>& labels);
+    void flushLabels();
+    void noteLabelsWrite(bool ok, const QString& why);
     template <typename Work>
     void onWorker(Work work);
 
     wallet::WalletModel* model_ = nullptr;
+    QList<wallet::HistoryBook*> books_;
     QThread thread_;
     QObject* worker_ = nullptr;  // lives on thread_
     LedgerDb* db_ = nullptr;     // touched on thread_ only
     QTimer* timer_ = nullptr;
     QSet<int> dirty_;            // positions in the model
     QSet<quint32> wallets_;      // whose rows may still arrive
+    QSet<wallet::HistoryBook*> historyWriting_; // one write of a book at a time: a later one must not stand on one that failed
+    // What did not go in, by what was last asked of each: a newer one in the queue goes on its own.
+    QHash<wallet::Network, QHash<chain::Hash256, wallet::TxNote>> unsavedNotes_;
+    QHash<QString, QString> unsavedLabels_;
+    QHash<chain::Hash256, quint64> noteSerials_;
+    QHash<QString, quint64> labelSerials_;
+    quint64 labelWrites_ = 0;
+    bool labelsFailing_ = false;
     bool rewrite_ = false;
     bool open_ = false;
     bool loading_ = false;

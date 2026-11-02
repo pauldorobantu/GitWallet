@@ -4,9 +4,13 @@
 #include "chain/Bip39.h"
 #include "ui/MainWindow.h"
 #include "ui/dialogs/ImportSeedDialog.h"
+#include "ui/HistoryTableModel.h"
 #include "ui/pages/AddressesPage.h"
+#include "ui/pages/HistoryPage.h"
 #include "ui/pages/SettingsPage.h"
 #include "ui/pages/WalletsPage.h"
+#include "wallet/History.h"
+#include "wallet/UtxoHistory.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
@@ -29,6 +33,7 @@
 #include <QScreen>
 #include <QSpinBox>
 #include <QTableView>
+#include <QTableWidget>
 #include <QTimer>
 
 #include <algorithm>
@@ -239,6 +244,12 @@ void Walkthrough::buildSteps()
     };
     auto tableRows = [table] { return table() && table()->model() ? table()->model()->rowCount() : -1; };
     auto settingsPage = [this]() -> QWidget* { return window_->findChild<ui::SettingsPage*>(); };
+    auto historyPage = [this]() -> QWidget* { return window_->findChild<ui::HistoryPage*>(); };
+    auto historyModel = [this]() -> ui::HistoryTableModel* { return window_->findChild<ui::HistoryPage*>()->tableModel(); };
+    auto historyLines = [historyModel] { return historyModel()->rowCount(); };
+    auto historyBook = [controller]() -> wallet::HistoryBook* { return controller()->histories().first()->book(); };
+    auto historyDone = [controller] { return !controller()->histories().first()->progress().working(); };
+    auto labelledTx = std::make_shared<chain::Hash256>();
     auto confirmBox = [this]() -> QMessageBox* {
         for (QMessageBox* box : window_->findChildren<QMessageBox*>())
             if (box->isVisible()) return box;
@@ -654,6 +665,167 @@ void Walkthrough::buildSteps()
                         .arg(controller()->model()->fundedCount()));
          },
          nullptr},
+        // The history of what those addresses did.
+        {QStringLiteral("history"),
+         [this] { window_->showPage(QStringLiteral("history")); },
+         [controller, historyDone, historyLines] { return historyDone() && historyLines() > 0; }, 180000,
+         [this, controller, historyLines, historyBook, historyPage, wholeButtons] {
+             expect(historyLines() == historyBook()->lineCount(), QStringLiteral("History lists every transaction (%1)").arg(historyLines()));
+             int proven = 0;
+             int inBlocks = 0;
+             for (int i = 0; i < historyBook()->size(); ++i) {
+                 const wallet::TxRecord& tx = historyBook()->at(i);
+                 inBlocks += tx.height > 0 ? 1 : 0;
+                 proven += tx.height > 0 && tx.proven ? 1 : 0;
+             }
+             expect(inBlocks > 0 && proven == inBlocks, QStringLiteral("and each in a block has its proof checked (%1 of %2)").arg(proven).arg(inBlocks));
+             const wallet::HistoryProgress progress = controller()->histories().first()->progress();
+             expect(progress.refused == 0 && progress.unproven == 0, QStringLiteral("nothing refused, nothing unproven"));
+             // On the narrowest window too.
+             expect(wholeButtons(historyPage(), {QStringLiteral("Export CSV"), QStringLiteral("Details")}), QStringLiteral("and the buttons of its bar have their whole width"));
+         },
+         nullptr},
+        {QStringLiteral("history-received"),
+         [historyPage] {
+             if (auto* combo = historyPage()->findChild<QComboBox*>(QStringLiteral("historyType")))
+                 combo->setCurrentIndex(1);
+         },
+         nullptr, 2000,
+         [this, historyLines, historyModel] {
+             bool all = historyLines() > 0;
+             for (int row = 0; row < historyLines(); ++row)
+                 all = all && historyModel()->lineAt(row)->kind == ui::TxKind::Received;
+             expect(all, QStringLiteral("filter Received: %1 lines, all of them received").arg(historyLines()));
+         },
+         nullptr},
+        {QStringLiteral("history-search"),
+         [historyPage, historyModel] {
+             if (auto* combo = historyPage()->findChild<QComboBox*>(QStringLiteral("historyType")))
+                 combo->setCurrentIndex(0);
+             const QString txid = historyModel()->index(0, 0).data(ui::HistoryTableModel::TxidRole).toString();
+             if (auto* search = historyPage()->findChild<QLineEdit*>(QStringLiteral("mimSearch")))
+                 search->setText(txid);
+         },
+         nullptr, 2000,
+         [this, historyLines] { expect(historyLines() == 1, QStringLiteral("search by id: one line (%1)").arg(historyLines())); },
+         nullptr},
+        {QStringLiteral("history-transaction"),
+         [historyPage] {
+             if (auto* search = historyPage()->findChild<QLineEdit*>(QStringLiteral("mimSearch")))
+                 search->clear();
+             static_cast<ui::HistoryPage*>(historyPage())->openRow(0);
+         },
+         [namedDialog] {
+             QWidget* dialog = namedDialog("transactionDialog");
+             auto* to = dialog ? dialog->findChild<QTableWidget*>(QStringLiteral("txTo")) : nullptr;
+             return to && to->rowCount() > 0;
+         },
+         15000,
+         [this, namedDialog, wholeButtons, labelledTx] {
+             QWidget* dialog = namedDialog("transactionDialog");
+             expect(dialog != nullptr, QStringLiteral("a line opens to the whole transaction"));
+             auto* id = dialog ? dialog->findChild<QLabel*>(QStringLiteral("txId")) : nullptr;
+             if (id)
+                 chain::hashFromHex(id->text().toStdString(), labelledTx.get());
+             auto* state = dialog ? dialog->findChild<QLabel*>(QStringLiteral("txState")) : nullptr;
+             auto* from = dialog ? dialog->findChild<QTableWidget*>(QStringLiteral("txFrom")) : nullptr;
+             auto* to = dialog ? dialog->findChild<QTableWidget*>(QStringLiteral("txTo")) : nullptr;
+             expect(id && id->text().size() == 64, QStringLiteral("with its id"));
+             expect(state && !state->text().isEmpty(), QStringLiteral("how far it is believed"));
+             expect(from && from->rowCount() > 0 && to && to->rowCount() > 0, QStringLiteral("where its coins came from and went"));
+             expect(wholeButtons(dialog, {QStringLiteral("Copy"), QStringLiteral("Open in explorer"), QStringLiteral("Close")}), QStringLiteral("and whole buttons"));
+             // What looks like a private key first: it is not kept, and what was typed is not lost.
+             if (auto* label = dialog ? dialog->findChild<QLineEdit*>(QStringLiteral("txLabel")) : nullptr)
+                 label->setText(QStringLiteral("ab").repeated(32));
+             if (auto* note = dialog ? dialog->findChild<QPlainTextEdit*>(QStringLiteral("txNote")) : nullptr)
+                 note->setPlainText(QStringLiteral("A note on it"));
+         },
+         [namedDialog]() -> QWidget* { return namedDialog("transactionDialog"); }},
+        {QStringLiteral("history-not-kept"),
+         [this, namedDialog, clickLater] { clickLater(findButton(namedDialog("transactionDialog"), QStringLiteral("Close"))); },
+         [namedDialog] {
+             QWidget* dialog = namedDialog("transactionDialog");
+             auto* said = dialog ? dialog->findChild<QLabel*>(QStringLiteral("txNotKept")) : nullptr;
+             return said && !said->text().isEmpty();
+         },
+         3000,
+         [this, namedDialog] {
+             QWidget* dialog = namedDialog("transactionDialog");
+             expect(dialog != nullptr, QStringLiteral("what cannot be kept does not close the window it was typed in"));
+             auto* note = dialog ? dialog->findChild<QPlainTextEdit*>(QStringLiteral("txNote")) : nullptr;
+             expect(note && note->toPlainText() == QLatin1String("A note on it"), QStringLiteral("and nothing typed is gone"));
+             auto* said = dialog ? dialog->findChild<QLabel*>(QStringLiteral("txNotKept")) : nullptr;
+             expect(said && said->isVisible(), QStringLiteral("and it says why"));
+             if (auto* label = dialog ? dialog->findChild<QLineEdit*>(QStringLiteral("txLabel")) : nullptr)
+                 label->setText(QStringLiteral("Order 1001"));
+         },
+         [namedDialog]() -> QWidget* { return namedDialog("transactionDialog"); }},
+        {QStringLiteral("history-labelled"),
+         [this, namedDialog, clickLater] { clickLater(findButton(namedDialog("transactionDialog"), QStringLiteral("Close"))); },
+         [namedDialog] { return namedDialog("transactionDialog") == nullptr; }, 3000,
+         [this, historyModel, historyBook, labelledTx] {
+             // By its id: anyone can pay these seeds, and what is new stands on top.
+             const int row = historyModel()->rowOf(historyBook(), *labelledTx);
+             const QString shown = historyModel()->index(row, ui::HistoryTableModel::ColLabel).data().toString();
+             expect(shown == QLatin1String("Order 1001") && historyBook()->noteOf(*labelledTx).note == QLatin1String("A note on it"), QStringLiteral("its label shows in the list, and its note is kept"));
+         },
+         nullptr},
+        {QStringLiteral("history-search-label"),
+         [historyPage] {
+             if (auto* search = historyPage()->findChild<QLineEdit*>(QStringLiteral("mimSearch")))
+                 search->setText(QStringLiteral("order 1001"));
+         },
+         nullptr, 2000,
+         [this, historyLines] { expect(historyLines() == 1, QStringLiteral("search by label finds it (%1)").arg(historyLines())); },
+         nullptr},
+        {QStringLiteral("history-export"),
+         [historyPage] {
+             if (auto* search = historyPage()->findChild<QLineEdit*>(QStringLiteral("mimSearch")))
+                 search->clear();
+         },
+         nullptr, 1000,
+         [this, historyPage, historyLines] {
+             const QString path = outDir_ + QStringLiteral("/transactions.csv");
+             QString error;
+             const bool written = static_cast<ui::HistoryPage*>(historyPage())->exportCsvNow(path, &error);
+             expect(written, QStringLiteral("the lines export (%1)").arg(error));
+             QFile file(path);
+             file.open(QIODevice::ReadOnly);
+             const QString all = QString::fromUtf8(file.readAll());
+             const QStringList lines = all.split(QStringLiteral("\r\n"), Qt::SkipEmptyParts);
+             expect(lines.size() == historyLines() + 1, QStringLiteral("every one of them, under its titles (%1)").arg(lines.size()));
+             expect(all.contains(QLatin1String("Order 1001")) && all.contains(QLatin1String("A note on it")), QStringLiteral("with their labels and notes"));
+             // A number stays a number: no apostrophe in front of a minus sign.
+             expect(!all.contains(QLatin1String("'-0")), QStringLiteral("and what went out as numbers a spreadsheet reads"));
+         },
+         nullptr},
+        {QStringLiteral("address-history"),
+         [this, controller, historyBook] {
+             // A used address, as a double click on its row does.
+             const wallet::WalletModel* m = controller()->model();
+             auto* page = window_->findChild<ui::HistoryPage*>();
+             for (int i = 0; i < m->size(); ++i) {
+                 const wallet::AddressRow& row = m->at(i);
+                 if (row.isUtxo() && row.used && historyBook()->netOf(row.scripthash) == row.confirmed + row.unconfirmed && historyBook()->findAddress(row.scripthash) >= 0) {
+                     page->showAddress(row.network, row.scripthash, row.address);
+                     break;
+                 }
+             }
+         },
+         nullptr, 2000,
+         [this, historyLines, historyPage] {
+             expect(historyLines() > 0, QStringLiteral("an address opens to its own transactions (%1)").arg(historyLines()));
+             auto* title = historyPage()->findChild<QLabel*>(QStringLiteral("historyScopeTitle"));
+             auto* text = historyPage()->findChild<QLabel*>(QStringLiteral("historyScopeText"));
+             expect(title && title->isVisible() && !title->text().isEmpty(), QStringLiteral("under the address"));
+             expect(text && text->text().contains(QLatin1String("BTC")) && text->text().contains(QLatin1String("m/")), QStringLiteral("its path and what it holds"));
+         },
+         nullptr},
+        {QStringLiteral("history-all-again"),
+         [historyPage] { static_cast<ui::HistoryPage*>(historyPage())->showAll(); },
+         nullptr, 1000,
+         [this, historyLines, historyBook] { expect(historyLines() == historyBook()->lineCount(), QStringLiteral("Show all brings back every line")); },
+         nullptr},
         {QStringLiteral("settings"),
          [this] {
              auto* page = window_->findChild<ui::AddressesPage*>();
@@ -720,9 +892,12 @@ void Walkthrough::buildSteps()
          },
          // What the database kept is there before any server can have answered.
          [controller] { return controller()->showingSaved() && controller()->model()->size() > 0; }, 5000,
-         [this, controller] {
+         [this, controller, historyBook, labelledTx] {
              const wallet::WalletModel* m = controller()->model();
              const QString shown = visibleText(window_);
+             // Through the real way it was typed: what only this PC has is there before anything else.
+             expect(historyBook()->noteOf(*labelledTx).label == QLatin1String("Order 1001") && historyBook()->noteOf(*labelledTx).note == QLatin1String("A note on it"),
+                    QStringLiteral("reopened: the label and note written in the window are there"));
              expect(controller()->showingSaved(), QStringLiteral("reopened: the figures say they are the saved ones"));
              expect(m->usedCount() == rowsBeforeReopen_,
                     QStringLiteral("reopened: at once, the used addresses are there (%1 vs %2)").arg(m->usedCount()).arg(rowsBeforeReopen_));

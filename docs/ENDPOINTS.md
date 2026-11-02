@@ -26,6 +26,11 @@ assets within two minutes of the time asked, and 2015 for Bitcoin only, and `cha
 daily points in one call. CoinGecko without a key refuses anything over 365 days old (HTTP
 401). Kraken `OHLC` gives 720 daily candles.
 
+`batchHistorical` takes many moments of one coin in one call: 500 fine, 1,000 over the URL limit
+(HTTP 414), ten calls of 200 in 3.5 s all answered. The answer lists a point per moment it has,
+closest first and leaving out those it has none for, so an answer has to be matched by its time: within
+minutes in recent years, the same day before about 2020, nothing before 2015.
+
 ## Bitcoin: Electrum servers
 
 | Server | Software | 1,000 `get_history`, 64 in flight | 2,000 subscribes | 30,000 `get_history` at 250/s | `unsubscribe` |
@@ -43,6 +48,25 @@ daily points in one call. CoinGecko without a key refuses anything over 365 days
 The last one is off the list. All the others give 2,016 headers a call, raw transactions and
 Merkle proofs by height. `verbose` transactions are refused by electrs, so raw ones have to be
 parsed.
+
+**Proving a header (2026-11-02):** all eight answered `blockchain.block.header(height, checkpoint)`
+with a Merkle branch of 20 steps, and all eight gave the same root over every header up to block
+971,711. That root is the checkpoint in `res/coins.json`, with the block's hash, which Blockstream's
+and mempool.space's own APIs name the same. A header below it is proven with one small call;
+past it each header has to follow the last, with the work and the difficulty the rule gives, and
+those come 2,016 a call. `.github/new-checkpoint.py` makes the next one. On the seed the tests use:
+87 used addresses and 447 transactions read and proven in about 15 s, and each list, amount, block,
+time and fee the same as Blockstream's REST API says.
+
+One server, once, went slow for minutes and refused transactions while answering everything else.
+A refusal of one kind therefore says nothing of the others: after a pause, the same kind refused
+again is reason to ask the next server. Each server once: what none of them will give does not keep
+the client going round them.
+
+The history reads at 120 calls a second, and at 40 while a scanner reads rounds at 200 on the same
+connection, which stays under the 250 at which the one server stopped. At the 500,000 transactions the
+wallet is built for, with a raw transaction, a header and a proof for each, a first read takes hours
+that way. It goes on in the background, new payments go ahead of it, and a start goes on where it stopped.
 
 **What this means:** 200 reads a second is below the pace any of them complained about, so
 reading the 335,000 or so addresses of 500 wallets that have no live place takes about 30

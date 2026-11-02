@@ -3,6 +3,8 @@
 #include "app/WalletController.h"
 #include "net/PriceFeed.h"
 #include "ui/AddressTableModel.h"
+#include "ui/Csv.h"
+#include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
 #include "ui/HoverRowTable.h"
 #include "ui/Icons.h"
@@ -10,17 +12,20 @@
 #include "ui/PageKit.h"
 #include "ui/TableUtil.h"
 #include "ui/ThemeManager.h"
+#include "ui/design/Style.h"
 #include "wallet/Types.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
 #include <QComboBox>
 #include <QDateTime>
+#include <QDialog>
 #include <QFileDialog>
 #include <QFontMetrics>
 #include <QHash>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
@@ -36,10 +41,6 @@
 
 #include <algorithm>
 #include <exception>
-
-#ifdef Q_OS_WIN
-#include <windows.h>
-#endif
 
 namespace app::ui {
 
@@ -119,6 +120,8 @@ protected:
             return true;
         if (first.data(AddressTableModel::AddressRole).toString().contains(query_, Qt::CaseInsensitive))
             return true;
+        if (source->index(sourceRow, AddressTableModel::ColLabel, sourceParent).data().toString().contains(query_, Qt::CaseInsensitive))
+            return true;
         // A path only has so many kinds of character, and building one costs more than the search.
         return pathQuery_
                && source->index(sourceRow, AddressTableModel::ColPath, sourceParent).data().toString().contains(query_, Qt::CaseInsensitive);
@@ -148,49 +151,6 @@ private:
     int chain_ = kAllChains;
     int state_ = StateAll;
 };
-
-// How a spreadsheet on this PC reads a CSV: Excel splits columns on the Windows
-// list separator and reads numbers with its decimal symbol, so an export in any
-// other form lands in one column ("," is ";" on Romanian, German or French formats).
-struct CsvFormat {
-    QChar separator = QLatin1Char(',');
-    QChar decimal = QLatin1Char('.');
-};
-
-CsvFormat csvFormat()
-{
-    CsvFormat format;
-#ifdef Q_OS_WIN
-    wchar_t text[8] = {};
-    if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SLIST, text, 8) >= 2)
-        format.separator = QChar(text[0]);
-    if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SDECIMAL, text, 8) >= 2)
-        format.decimal = QChar(text[0]);
-#endif
-    return format;
-}
-
-// A CSV field: quoted when it has to be. A name opening with what a spreadsheet
-// reads as a formula is defused, so opening the export never runs anything.
-QString csvField(const QString& text, const CsvFormat& format)
-{
-    QString field = text;
-    if (!field.isEmpty() && QStringLiteral("=+-@\t\r").contains(field.at(0)))
-        field.prepend(QLatin1Char('\''));
-    if (field.contains(format.separator) || field.contains(QLatin1Char('"')) || field.contains(QLatin1Char('\n'))
-        || field.contains(QLatin1Char('\r'))) {
-        field.replace(QLatin1Char('"'), QStringLiteral("\"\""));
-        field = QLatin1Char('"') + field + QLatin1Char('"');
-    }
-    return field;
-}
-
-// A number as this PC's spreadsheet reads it; `plain` has a '.' for a decimal point.
-QString csvNumber(QString plain, const CsvFormat& format)
-{
-    plain.replace(QLatin1Char('.'), format.decimal);
-    return csvField(plain, format);
-}
 
 // The row's amount of `info` in whole units, every digit kept; empty for an asset
 // of another network, and for a zero that may only mean "no answer yet".
@@ -267,6 +227,8 @@ struct AddressesPage::Ui : QObject
     QLabel* count = nullptr;
     QPushButton* exportCsv = nullptr;
     QPushButton* refresh = nullptr;
+    QPushButton* history = nullptr;
+    QPushButton* label = nullptr;
     QWidget* noWallet = nullptr; // first run: no wallet added yet
     QWidget* waiting = nullptr;  // a wallet whose first addresses are not derived yet
     QWidget* noResults = nullptr;
@@ -321,7 +283,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     root->addWidget(ui_->noResults, 1);
 
     const page::ActionBar bar = page::makeActionBar(this);
-    ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search address or path"));
+    ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search address, label or path"));
     ui_->wallet = new QComboBox(bar.widget);
     ui_->wallet->setObjectName(QStringLiteral("walletFilter"));
     ui_->wallet->setSizeAdjustPolicy(QComboBox::AdjustToContents);
@@ -351,6 +313,13 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->refresh->setToolTip(QStringLiteral("Fetch prices and read the balances that are not followed live, now"));
     page::setLabeledIcon(ui_->refresh, refreshIcon());
     bar.right->addWidget(ui_->refresh);
+    ui_->label = new QPushButton(QStringLiteral("Label"), bar.widget);
+    ui_->label->setToolTip(trText(QStringLiteral("A name for this address that only this PC knows")));
+    bar.right->addWidget(ui_->label);
+    ui_->history = new QPushButton(QStringLiteral("History"), bar.widget);
+    ui_->history->setObjectName(QStringLiteral("primaryButton"));
+    ui_->history->setToolTip(trText(QStringLiteral("Every transaction of this address. A double click opens it too.")));
+    bar.right->addWidget(ui_->history);
     root->addWidget(bar.widget);
 
     ui_->update = new QTimer(this);
@@ -400,6 +369,14 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->refresh->setEnabled(false);
     });
     connect(ui_->exportCsv, &QPushButton::clicked, this, &AddressesPage::chooseExportFile);
+    connect(view, &QAbstractItemView::doubleClicked, this, &AddressesPage::openHistoryOf);
+    connect(ui_->history, &QPushButton::clicked, this, [this] {
+        const QModelIndexList rows = ui_->view->selectionModel()->selectedRows();
+        if (!rows.isEmpty())
+            openHistoryOf(rows.first());
+    });
+    connect(ui_->label, &QPushButton::clicked, this, &AddressesPage::editLabelOfSelected);
+    connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &AddressesPage::scheduleUpdate);
 
     // Scan results arrive as inserts and single-row changes, hundreds a second:
     // recount in batches.
@@ -460,6 +437,77 @@ void AddressesPage::showWallet(quint32 id)
     ui_->wallet->setCurrentIndex(index >= 0 ? index : 0);
 }
 
+void AddressesPage::openHistoryOf(const QModelIndex& index)
+{
+    const QModelIndex source = ui_->filter->mapToSource(index);
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (!model || !source.isValid() || source.row() >= model->size())
+        return;
+    const wallet::AddressRow& row = model->at(source.row());
+    if (!row.isUtxo()) {
+        Feedback::show(ui_->history, Feedback::Type::Info, trText(QStringLiteral("Ethereum transactions come in the next stage")));
+        return;
+    }
+    emit showHistoryRequested(row.network, row.scripthash, row.address);
+}
+
+void AddressesPage::editLabelOfSelected()
+{
+    const QModelIndexList rows = ui_->view->selectionModel()->selectedRows();
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (rows.isEmpty() || !model)
+        return;
+    const QModelIndex source = ui_->filter->mapToSource(rows.first());
+    if (!source.isValid() || source.row() >= model->size())
+        return;
+    const QString address = model->at(source.row()).address;
+
+    auto* dialog = new QDialog(this);
+    dialog->setObjectName(QStringLiteral("addressLabelDialog"));
+    dialog->setWindowTitle(trText(QStringLiteral("Label")));
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    applyDialogChrome(dialog);
+    auto* column = new QVBoxLayout(dialog);
+    page::applyDialogLayout(column);
+    auto* where = new QLabel(address, dialog);
+    where->setTextFormat(Qt::PlainText);
+    where->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    column->addWidget(where);
+    auto* name = new QLineEdit(controller_->addressLabel(address), dialog);
+    name->setObjectName(QStringLiteral("addressLabel"));
+    name->setMaxLength(1024);
+    name->setPlaceholderText(trText(QStringLiteral("A customer, an order, a till")));
+    name->selectAll();
+    column->addWidget(name);
+    auto* status = new QLabel(dialog);
+    status->setTextFormat(Qt::PlainText);
+    status->setWordWrap(true);
+    setStatus(status, QString(), Tone::Muted);
+    column->addWidget(status);
+    auto* buttons = new QHBoxLayout;
+    buttons->setSpacing(page::kToolbarSpacing);
+    buttons->addStretch(1);
+    auto* cancel = new QPushButton(QStringLiteral("Cancel"), dialog);
+    auto* save = new QPushButton(QStringLiteral("Save"), dialog);
+    save->setObjectName(QStringLiteral("primaryButton"));
+    save->setDefault(true);
+    buttons->addWidget(cancel);
+    buttons->addWidget(save);
+    column->addLayout(buttons);
+    connect(cancel, &QPushButton::clicked, dialog, &QDialog::reject);
+    connect(save, &QPushButton::clicked, dialog, [this, dialog, name, status, address] {
+        QString error;
+        if (controller_->setAddressLabel(address, name->text(), &error)) {
+            dialog->accept();
+            return;
+        }
+        setStatus(status, error, Tone::Error);
+    });
+    page::fitDialog(dialog, page::DialogSize::Compact);
+    dialog->open();
+    name->setFocus();
+}
+
 void AddressesPage::chooseExportFile()
 {
     const QString path = QFileDialog::getSaveFileName(
@@ -484,7 +532,7 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
     const CsvFormat format = csvFormat();
     QStringList lines;
     QStringList titles{QStringLiteral("wallet"), QStringLiteral("chain"), QStringLiteral("type"),
-                       QStringLiteral("path"), QStringLiteral("address"), QStringLiteral("state")};
+                       QStringLiteral("path"), QStringLiteral("address"), QStringLiteral("label"), QStringLiteral("state")};
     for (const wallet::AssetInfo& info : wallet::assets())
         titles << csvTitle(info);
     titles << QStringLiteral("USD") << QStringLiteral("balances as of") << QStringLiteral("prices as of");
@@ -510,6 +558,7 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
                << csvField(cell(AddressTableModel::ColType), format)
                << csvField(r.path(), format)
                << csvField(r.address, format)
+               << csvField(cell(AddressTableModel::ColLabel), format)
                << csvField(cell(AddressTableModel::ColState), format);
         double usd = 0.0;
         // Only once every balance of the row has answered: a sum of this column
@@ -587,6 +636,7 @@ void AddressesPage::applyColumnWidths()
         {QStringLiteral("bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"),
          QStringLiteral("0x9858EfFD232B4033E47d90003D41EC34EcaEda94")},
         2 * cell.averageCharWidth());
+    fit(AddressTableModel::ColLabel, {QStringLiteral("A label for it")}, 0);
     fit(AddressTableModel::ColUsd, {QStringLiteral("$00,000,000.00")}, 0);
     fit(AddressTableModel::ColState, {QStringLiteral("Checking…"), QStringLiteral("Funded")}, 0);
     header->setSectionResizeMode(AddressTableModel::ColBalance, QHeaderView::Stretch);
@@ -630,6 +680,9 @@ void AddressesPage::updateState()
     ui_->chain->setEnabled(hasWallet);
     ui_->state->setEnabled(hasWallet);
     ui_->refresh->setEnabled(hasWallet && !ui_->cooldown->isActive());
+    const bool chosen = !ui_->view->selectionModel()->selectedRows().isEmpty();
+    ui_->history->setEnabled(chosen);
+    ui_->label->setEnabled(chosen);
 
     const int shown = ui_->filter->rowCount();
     // Not part of what the database kept, with nothing to say so.

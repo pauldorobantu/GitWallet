@@ -1,7 +1,9 @@
 #include "store/Ledger.h"
 
+#include "wallet/History.h"
 #include "wallet/WalletModel.h"
 
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -59,6 +61,15 @@ Ledger::Ledger(wallet::WalletModel* model, QObject* parent) : QObject(parent), m
     thread_.start();
 }
 
+void Ledger::addBook(wallet::HistoryBook* book)
+{
+    books_.append(book);
+    connect(book, &wallet::HistoryBook::changed, this, [this] {
+        if (open_ && !loading_)
+            schedule();
+    });
+}
+
 Ledger::~Ledger()
 {
     close();
@@ -80,10 +91,14 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
     loading_ = true;
     reported_ = false;
     writesFailing_ = false;
+    labelsFailing_ = false;
     retryMs_ = 0;
     timer_->setInterval(kFlushMs);
     dirty_.clear();
     rewrite_ = false;
+    historyWriting_.clear();
+    unsavedNotes_.clear();
+    unsavedLabels_.clear();
     // A scan that has run without a database: nothing it wrote was noted, and what it has
     // had answered is newer than what the file holds.
     const bool hadRows = model_ && model_->checkedCount() > 0;
@@ -93,7 +108,8 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
         QString why;
         LedgerDb::Open opened = db_->open(path, key, &why);
         // Another key's, or damaged: never written over. wallet.dat was replaced, or this
-        // file was. Everything in it can be read again from the servers.
+        // file was. All but its labels and notes can be read again from the servers, and those are
+        // read out of it as far as it gives them.
         const auto moveAside = [&] {
             qCWarning(lcLedger).noquote() << "the database is set aside:" << why;
             db_->close();
@@ -104,18 +120,55 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                 opened = LedgerDb::Open::Failed;
                 return;
             }
+            // What the WAL holds is part of it.
+            QFile::rename(path + QStringLiteral("-wal"), aside + QStringLiteral("-wal"));
             for (const QString& extra : companions(path))
                 QFile::remove(extra);
+            const SavedLabels saved = LedgerDb::salvageLabels(aside, key);
+            // A reading leaves these behind, however little there was for them to hold.
+            QFile::remove(aside + QStringLiteral("-shm"));
+            if (QFileInfo(aside + QStringLiteral("-wal")).size() == 0)
+                QFile::remove(aside + QStringLiteral("-wal"));
             opened = db_->open(path, key, &why);
-            QMetaObject::invokeMethod(this, [this, self, run, hadRows, aside] {
+            int recovered = saved.read ? saved.count() : -1;
+            bool whole = saved.whole;
+            if (opened == LedgerDb::Open::Ready && saved.count() > 0) {
+                QString lost;
+                if (!db_->restoreLabels(saved, &lost)) {
+                    qCWarning(lcLedger).noquote() << "labels and notes could not be brought over:" << lost;
+                    recovered = -1;
+                    whole = false;
+                }
+            }
+            QMetaObject::invokeMethod(this, [this, self, run, hadRows, aside, recovered, whole] {
                 if (!self || run != loadRun_) return;
                 // What it handed over before it failed is no more to be trusted than the rest.
                 // What a scan brought did not come from it, and goes into the new file.
                 if (!hadRows && model_ && model_->size() > 0) model_->clear();
+                for (wallet::HistoryBook* book : std::as_const(books_))
+                    book->clear();
                 dirty_.clear();
                 rewrite_ = false;
-                emit setAside(aside);
+                emit setAside(aside, recovered, whole);
             }, Qt::QueuedConnection);
+        };
+        // What can be edited on a line has to be there before the line is.
+        const auto handOverLabels = [&]() {
+            const QHash<QString, QString> labels = db_->loadAddressLabels(&why);
+            if (db_->readFailed())
+                return false;
+            for (wallet::HistoryBook* book : std::as_const(books_)) {
+                const QHash<chain::Hash256, wallet::TxNote> notes = db_->loadNotes(book->network(), &why);
+                if (db_->readFailed())
+                    return false;
+                QMetaObject::invokeMethod(this, [self, run, book, notes, this] {
+                    if (self && run == loadRun_) book->addSavedNotes(notes);
+                }, Qt::QueuedConnection);
+            }
+            QMetaObject::invokeMethod(this, [this, self, run, labels] {
+                if (self && run == loadRun_) emit labelsRead(labels);
+            }, Qt::QueuedConnection);
+            return true;
         };
         if (opened == LedgerDb::Open::NotOurs)
             moveAside();
@@ -135,12 +188,40 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                     model_->addSaved(known);
                 }, Qt::QueuedConnection);
             };
-            if (db_->loadRows(wallets, kChunk, chunk, &why)) {
+            // Of what a window has shown, a history is the longest to read again: it goes last, on
+            // top of the rows, and a part of it that does not load leaves those as they are.
+            const auto history = [&]() {
+                for (wallet::HistoryBook* book : std::as_const(books_)) {
+                    const wallet::Network network = book->network();
+                    const auto txs = [this, self, run, book](QVector<wallet::TxRecord>&& records) {
+                        QMetaObject::invokeMethod(this, [self, run, book, records = std::move(records), this] {
+                            if (self && run == loadRun_) book->addSaved(records);
+                        }, Qt::QueuedConnection);
+                    };
+                    if (!db_->loadHistory(network, kChunk, txs, &why))
+                        return false;
+                    const QVector<wallet::AddressHistory> addresses = db_->loadAddressHistory(network, &why);
+                    if (db_->readFailed())
+                        return false;
+                    const QMap<int, QByteArray> headers = db_->loadHeaders(network, &why);
+                    if (db_->readFailed())
+                        return false;
+                    QMetaObject::invokeMethod(this, [self, run, book, addresses, headers, this] {
+                        if (!self || run != loadRun_) return;
+                        book->addSavedAddresses(addresses);
+                        book->addSavedHeaders(headers);
+                    }, Qt::QueuedConnection);
+                }
+                return true;
+            };
+            if (handOverLabels() && db_->loadRows(wallets, kChunk, chunk, &why) && history()) {
                 prices = db_->loadPrices(nullptr);
                 times = db_->loadTimes(nullptr);
             } else if (db_->readDamaged()) {
                 // The check passed, or could not run, and a page still fails.
                 moveAside();
+                if (opened == LedgerDb::Open::Ready && !handOverLabels())
+                    opened = LedgerDb::Open::Failed;
             } else {
                 // The disk's doing, or a full one: nothing wrong with the file, which stays.
                 opened = LedgerDb::Open::Failed;
@@ -155,6 +236,8 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                 loading_ = false;
                 // Part of what it read is no figure to go by.
                 if (!hadRows && model_ && model_->size() > 0) model_->clear();
+                for (wallet::HistoryBook* book : std::as_const(books_))
+                    book->clear();
                 report(message);
                 emit loaded({}, {});
             }, Qt::QueuedConnection);
@@ -228,9 +311,55 @@ void Ledger::report(const QString& message)
     emit problem(message);
 }
 
+void Ledger::flushHistory()
+{
+    const QPointer<Ledger> self(this);
+    for (wallet::HistoryBook* book : std::as_const(books_)) {
+        // What comes next waits to hear of this: an address's status never goes in on top of a
+        // write that failed with the transactions it stands for.
+        if (historyWriting_.contains(book))
+            continue;
+        wallet::HistoryDelta delta = book->takeDelta();
+        if (delta.empty())
+            continue;
+        historyWriting_.insert(book);
+        const wallet::Network network = book->network();
+        onWorker([this, self, book, network, delta = std::move(delta)] {
+            QString why;
+            const bool ok = db_->saveHistory(network, delta, &why);
+            QMetaObject::invokeMethod(this, [this, self, book, ok, why, delta] {
+                if (self) noteHistoryWrite(book, ok, why, delta);
+            }, Qt::QueuedConnection);
+        });
+    }
+}
+
+void Ledger::noteHistoryWrite(wallet::HistoryBook* book, bool ok, const QString& why, const wallet::HistoryDelta& delta)
+{
+    historyWriting_.remove(book);
+    if (!open_)
+        return;
+    if (ok) {
+        if (!writesFailing_) {
+            retryMs_ = 0;
+            timer_->setInterval(kFlushMs);
+        }
+        schedule(); // what has come since
+        return;
+    }
+    report(QStringLiteral("Saved transactions could not be written: %1").arg(why));
+    book->takeBack(delta);
+    retryMs_ = qMin(retryMs_ > 0 ? retryMs_ * 2 : kFlushMs, kMaxRetryMs);
+    timer_->start(retryMs_);
+}
+
 void Ledger::flush()
 {
     timer_->stop();
+    if (open_ && !loading_) {
+        flushHistory();
+        flushLabels();
+    }
     // Part of the rows are in the model yet: loaded() comes back for what waits.
     if (!open_ || !model_ || loading_ || (dirty_.isEmpty() && !rewrite_))
         return;
@@ -298,10 +427,17 @@ void Ledger::forgetWallet(quint32 wallet)
     wallets_.remove(wallet);
     if (!open_)
         return;
-    onWorker([this, wallet] {
+    const QPointer<Ledger> self(this);
+    onWorker([this, self, wallet] {
         QString why;
-        if (!db_->removeWallet(wallet, &why))
+        QStringList labels;
+        if (!db_->removeWallet(wallet, &why, &labels))
             qCWarning(lcLedger).noquote() << "rows of a removed wallet stay until the next start:" << why;
+        if (!labels.isEmpty()) {
+            QMetaObject::invokeMethod(this, [this, self, labels] {
+                if (self) emit labelsRemoved(labels);
+            }, Qt::QueuedConnection);
+        }
     });
 }
 
@@ -328,12 +464,129 @@ void Ledger::saveTimes(const QList<SavedTime>& times)
     });
 }
 
+bool Ledger::saveNote(wallet::Network network, const chain::Hash256& txid, const wallet::TxNote& note)
+{
+    QHash<chain::Hash256, wallet::TxNote> one;
+    one.insert(txid, note);
+    return saveNotes(network, one);
+}
+
+bool Ledger::saveNotes(wallet::Network network, const QHash<chain::Hash256, wallet::TxNote>& notes)
+{
+    if (!open_)
+        return false;
+    writeNotes(network, notes);
+    return true;
+}
+
+bool Ledger::saveAddressLabel(const QString& address, const QString& label)
+{
+    QHash<QString, QString> one;
+    one.insert(address, label);
+    return saveAddressLabels(one);
+}
+
+bool Ledger::saveAddressLabels(const QHash<QString, QString>& labels)
+{
+    if (!open_)
+        return false;
+    writeLabels(labels);
+    return true;
+}
+
+void Ledger::writeNotes(wallet::Network network, const QHash<chain::Hash256, wallet::TxNote>& notes)
+{
+    const quint64 serial = ++labelWrites_;
+    for (auto it = notes.cbegin(); it != notes.cend(); ++it) {
+        noteSerials_.insert(it.key(), serial);
+        unsavedNotes_[network].remove(it.key());
+    }
+    const QPointer<Ledger> self(this);
+    onWorker([this, self, network, notes, serial] {
+        QString why;
+        const bool ok = db_->saveNotes(network, notes, &why);
+        QMetaObject::invokeMethod(this, [this, self, network, notes, serial, ok, why] {
+            if (!self)
+                return;
+            if (!ok) {
+                for (auto it = notes.cbegin(); it != notes.cend(); ++it) {
+                    if (noteSerials_.value(it.key()) == serial)
+                        unsavedNotes_[network].insert(it.key(), *it);
+                }
+            }
+            noteLabelsWrite(ok, why);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Ledger::writeLabels(const QHash<QString, QString>& labels)
+{
+    const quint64 serial = ++labelWrites_;
+    for (auto it = labels.cbegin(); it != labels.cend(); ++it) {
+        labelSerials_.insert(it.key(), serial);
+        unsavedLabels_.remove(it.key());
+    }
+    const QPointer<Ledger> self(this);
+    onWorker([this, self, labels, serial] {
+        QString why;
+        const bool ok = db_->saveAddressLabels(labels, &why);
+        QMetaObject::invokeMethod(this, [this, self, labels, serial, ok, why] {
+            if (!self)
+                return;
+            if (!ok) {
+                for (auto it = labels.cbegin(); it != labels.cend(); ++it) {
+                    if (labelSerials_.value(it.key()) == serial)
+                        unsavedLabels_.insert(it.key(), *it);
+                }
+            }
+            noteLabelsWrite(ok, why);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Ledger::flushLabels()
+{
+    const auto notes = std::exchange(unsavedNotes_, {});
+    for (auto it = notes.cbegin(); it != notes.cend(); ++it) {
+        if (!it->isEmpty())
+            writeNotes(it.key(), *it);
+    }
+    const QHash<QString, QString> labels = std::exchange(unsavedLabels_, {});
+    if (!labels.isEmpty())
+        writeLabels(labels);
+}
+
+void Ledger::noteLabelsWrite(bool ok, const QString& why)
+{
+    if (!open_)
+        return;
+    if (ok) {
+        labelsFailing_ = false;
+        return;
+    }
+    // Their own message: these exist nowhere else, whatever else has been said since this was opened.
+    qCWarning(lcLedger).noquote() << "a label or note could not be saved:" << why;
+    if (!labelsFailing_) {
+        labelsFailing_ = true;
+        emit problem(QStringLiteral("Labels and notes could not be written: %1. They are on screen and are being tried again, "
+                                    "but until that works only this window has them.").arg(why));
+    }
+    schedule();
+}
+
 void Ledger::close()
 {
+    // Nothing more of what an open is reading is wanted, and what is on its way has run when this
+    // comes back: what it says of itself is heard first, so that what failed goes with the rest.
+    ++loadRun_;
+    if (thread_.isRunning()) {
+        QMetaObject::invokeMethod(worker_, [] {}, Qt::BlockingQueuedConnection);
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+    }
     flush();
     open_ = false;
     loading_ = false;
-    ++loadRun_;
+    historyWriting_.clear();
     // BlockingQueuedConnection: everything queued before this has run when it returns.
     if (thread_.isRunning())
         QMetaObject::invokeMethod(worker_, [this] { db_->close(); }, Qt::BlockingQueuedConnection);
@@ -344,7 +597,14 @@ QStringList Ledger::destroy(const QString& path)
     dirty_.clear();
     rewrite_ = false;
     wallets_.clear();
+    unsavedNotes_.clear();
+    unsavedLabels_.clear();
+    // All of it is about to go: nothing is written for that.
+    for (wallet::HistoryBook* book : std::as_const(books_))
+        book->takeDelta();
     close();
+    unsavedNotes_.clear();
+    unsavedLabels_.clear();
     QStringList files{path};
     files += companions(path);
     const QDir folder = QFileInfo(path).dir();

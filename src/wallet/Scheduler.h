@@ -9,6 +9,8 @@
 
 namespace wallet {
 
+class HistoryBook;
+class UtxoHistory;
 class WalletModel;
 
 // What one network's scan is doing, as the pages read it.
@@ -38,6 +40,10 @@ public:
     explicit Scheduler(WalletModel* model, QObject* parent = nullptr);
     ~Scheduler() override;
 
+    // Every network whose history is read, as the pages and the database want it.
+    QList<UtxoHistory*> histories() const { return histories_; }
+    QList<HistoryBook*> books() const;
+
     void configure(const QList<AccountKey>& accounts, const ScanSettings& settings);
     void start(); // the networks with accounts; none: no connections at all
     void stop();
@@ -55,6 +61,7 @@ public:
     QList<NetworkStatus> statuses() const;
 
 signals:
+    void historyProgress(); // how far a history has got moved
     void scanFinished(); // every network with accounts has its first answers in
     void progress();     // counts or states moved
     void serverChanged();
@@ -65,6 +72,7 @@ private:
 
     net::BudgetPool budgets_; // before the scanners: their clients hold a pointer to it
     QList<ChainScanner*> scanners_;
+    QList<UtxoHistory*> histories_;
     QHash<Network, bool> done_;
     bool running_ = false;
     bool finishedSent_ = false; // scanFinished() already emitted for this start

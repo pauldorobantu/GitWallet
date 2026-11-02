@@ -26,6 +26,8 @@ class Ledger;
 } // namespace store
 
 namespace wallet {
+class HistoryBook;
+class UtxoHistory;
 class WalletModel;
 } // namespace wallet
 
@@ -37,6 +39,8 @@ namespace app {
 // page write through it. One process at a time writes a data folder (its wallet.lock): a
 // second GitWallet on the same folder shows the wallet but saves nothing.
 // GUI thread only.
+struct LabelImport;
+
 class WalletController : public QObject
 {
     Q_OBJECT
@@ -80,6 +84,8 @@ public:
 
     // The older files removeAllWallets() would delete with wallet.dat.
     int walletFilesKeptAside() const;
+    // And the older databases, which may hold the only copy of labels and notes.
+    int databasesKeptAside() const;
     // The file this session last kept aside, as errorOccurred() named it.
     QString fileSetAside() const { return fileSetAside_; }
     // What happens to a wallet.dat that could not be loaded, for the user to read:
@@ -142,6 +148,29 @@ public:
     // that it stopped moving, which of them has no price, and that a refresh is failing.
     QString pricesLine() const;
 
+    // The history of every network that has one.
+    QList<wallet::UtxoHistory*> histories() const { return scheduler_->histories(); }
+    wallet::UtxoHistory* historyOf(wallet::Network network) const;
+    // Empty when labels and notes can be read and written now; if not, why not.
+    QString labelsBlocker() const;
+    // A label and a note on a transaction, and a label on an address. False + why when they
+    // cannot be kept (a name that looks like seed words, or labelsBlocker()).
+    bool setTxNote(wallet::Network network, const chain::Hash256& txid, const wallet::TxNote& note, QString* error);
+    bool setAddressLabel(const QString& address, const QString& label, QString* error);
+    QString addressLabel(const QString& address) const { return addressLabels_.value(address); }
+    const QHash<QString, QString>& addressLabels() const { return addressLabels_; }
+    bool hasLabels() const;
+    int labelCount() const;              // every label and note there is
+    int labelCount(quint32 wallet) const; // those that would go with this wallet
+    // Every label and note, for a copy kept elsewhere: only this PC has them.
+    QByteArray labelsFile() const;
+    // The same into a file, off this thread. `done` runs on this one, if `guard` is still there.
+    void writeLabelsFile(const QString& path, QObject* guard, const std::function<void(bool ok, const QString& error)>& done);
+    // What such a file says goes in, a part per event-loop turn, over what is there: only what a
+    // line says, so that a file from a wallet that has only labels leaves a note alone. `done`: how
+    // many went in and how many lines were left out, or -1 with `error` when none can be kept.
+    void importLabelsFile(const QString& path, QObject* guard, const std::function<void(int added, int skipped, const QString& error)>& done);
+
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
     double totalUsd(quint32 wallet) const;      // one wallet's
@@ -149,6 +178,8 @@ public:
 signals:
     void walletChanged();  // loaded / imported / removed
     void statusChanged();  // statusText() or any of the scan states above changed
+    void historyProgress(); // how far a history has got moved
+    void labelsChanged();  // an address's label
     void totalsChanged();  // balances or prices changed
     void scanFinished();   // both chains finished their initial scan
     // The scanners' problem() reports and the controller's own. `message` is
@@ -169,6 +200,7 @@ private:
         Scanning,
         Unchecked,  // nothing scans, yet a row has no answer
         Unscanned,  // an account, or a Bitcoin chain, has no rows at all
+        DoNotAddUp, // what a server says an address holds is not what its transactions come to
         UpToDate,
     };
 
@@ -183,6 +215,10 @@ private:
     // kept is in the model.
     void openLedger();
     void onLedgerLoaded(const QList<store::SavedPrice>& prices, const QList<store::SavedTime>& times);
+    void importNextPart(const std::shared_ptr<LabelImport>& import);
+    // A key among what looks like one: the id of a transaction these wallets know is no secret.
+    bool holdsSecret(const QString& text) const;
+    int differingAddresses() const;
     void saveTimes();  // when each network last had a whole answer
     void savePrices();
     Status status() const;
@@ -220,6 +256,9 @@ private:
     int rowsBeforeLedger_ = 0;      // rows with an answer in the model when the database was opened
     bool settingsOnlyHere_ = false; // the settings in use are not what wallet.dat holds
     bool olderCopied_ = false;      // this session has made the way back from an older wallet.dat
+    QHash<QString, QString> addressLabels_;
+    QString ledgerClosedWhy_;       // why nothing can be kept, when the database is not open
+    bool importingLabels_ = false;
     bool running_ = false;          // between startServices() and stopServices()
     bool waitingForLedger_ = false; // the scans start when the database has handed over
     bool showingSaved_ = false;

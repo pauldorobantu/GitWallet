@@ -6,6 +6,20 @@
       "name": "Bitcoin",
       "family": "utxo",
       "genesis": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+      "proofs": {
+        "powLimit": "1d00ffff",
+        "retargetBlocks": 2016,
+        "targetSeconds": 1209600,
+        "checkpoint": {
+          "height": 971711,
+          "hash": "0000000000000000000051aed6d87a76a4f2387ce41455b61f3cd64cd7a95e2e",
+          "headersRoot": "24b52fa650e45301167e1f56831f811eceb73d5995f399b72c3e10a84ecaa9b3",
+          "bits": "17021ef0",
+          "time": 1792153758,
+          "periodStart": 1791011796,
+          "nextBits": "17020093"
+        }
+      },
       "coin": {
         "id": "btc",
         "symbol": "BTC",

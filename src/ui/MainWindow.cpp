@@ -14,6 +14,7 @@
 #include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/pages/WalletsPage.h"
 #include "ui/pages/AddressesPage.h"
+#include "ui/pages/HistoryPage.h"
 #include "ui/pages/OverviewPage.h"
 #include "ui/pages/SettingsPage.h"
 #include "wallet/Types.h"
@@ -47,7 +48,7 @@ namespace app::ui {
 namespace {
 
 // Page ids = the stacked-widget indices.
-enum PageId { PageOverview = 0, PageWallets, PageAddresses, PageSend, PageSettings };
+enum PageId { PageOverview = 0, PageWallets, PageAddresses, PageHistory, PageSend, PageSettings };
 
 // What a notice depends on besides the wallet (Notice::depends). It goes when
 // one of them changes: the scanners then restart and report again whatever
@@ -249,6 +250,7 @@ void MainWindow::buildUi()
     nav_->addItem(PageOverview, QStringLiteral("Overview"), int(icon::Kind::Dashboard));
     nav_->addItem(PageWallets, QStringLiteral("Wallets"), int(icon::Kind::Key));
     nav_->addItem(PageAddresses, QStringLiteral("Addresses"), int(icon::Kind::ListRows));
+    nav_->addItem(PageHistory, QStringLiteral("History"), int(icon::Kind::Traffic));
     nav_->addItem(PageSend, QStringLiteral("Send"), int(icon::Kind::ExternalLink));
     nav_->addItem(PageSettings, QStringLiteral("Settings"), int(icon::Kind::Settings));
     body->addWidget(nav_);
@@ -257,12 +259,13 @@ void MainWindow::buildUi()
     overview_ = new OverviewPage(controller_, stack_);
     wallets_ = new WalletsPage(controller_, stack_);
     addresses_ = new AddressesPage(controller_, stack_);
+    history_ = new HistoryPage(controller_, stack_);
     settings_ = new SettingsPage(controller_, stack_);
     stack_->addWidget(overview_);
     stack_->addWidget(wallets_);
     stack_->addWidget(addresses_);
-    // Spending comes in stage 2, after the view has been verified against
-    // other wallets and block explorers.
+    stack_->addWidget(history_);
+    // Spending comes once the history has been verified against other wallets and block explorers.
     stack_->addWidget(page::makeEmptyState(
         stack_, int(icon::Kind::ExternalLink), QStringLiteral("Send"),
         QStringLiteral("Consolidating funds is added in the next stage, once balances are verified.")));
@@ -285,6 +288,14 @@ void MainWindow::buildUi()
     connect(wallets_, &WalletsPage::showAddressesRequested, this, [this](quint32 wallet) {
         addresses_->showWallet(wallet);
         openPage(PageAddresses);
+    });
+    connect(wallets_, &WalletsPage::showHistoryRequested, this, [this](quint32 wallet) {
+        history_->showWallet(wallet);
+        openPage(PageHistory);
+    });
+    connect(addresses_, &AddressesPage::showHistoryRequested, this, [this](wallet::Network network, const QString& scripthash, const QString& address) {
+        history_->showAddress(network, scripthash, address);
+        openPage(PageHistory);
     });
 
     connect(title_, &TitleBar::minimised, this, &QWidget::showMinimized);
@@ -354,6 +365,7 @@ void MainWindow::showPage(const QString& name)
         {QStringLiteral("overview"), PageOverview},
         {QStringLiteral("wallets"), PageWallets},
         {QStringLiteral("addresses"), PageAddresses},
+        {QStringLiteral("history"), PageHistory},
         {QStringLiteral("send"), PageSend},
         {QStringLiteral("settings"), PageSettings},
     };

@@ -60,6 +60,9 @@ public:
     void stop();  // disconnect; pending replies get the error "stopped"
 
     bool isReady() const { return ready_; }
+    // A server is telling of this address as it moves: what it last said is as good as what it would
+    // say now. One read in rounds says what it was when it was read.
+    bool isFollowing(const QString& scripthash) const { return subscriptions_.contains(scripthash) && !refused_.contains(scripthash); }
     QString serverName() const; // "host:port" of the connected server, empty if none
     int tipHeight() const { return tip_; }
 

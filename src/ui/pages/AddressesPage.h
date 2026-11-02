@@ -1,5 +1,7 @@
 #pragma once
 
+#include "wallet/Registry.h"
+
 #include <QWidget>
 
 namespace app {
@@ -26,6 +28,9 @@ public:
     // for Excel). False + a sentence when the file cannot be written.
     bool exportCsv(const QString& path, QString* error) const;
 
+signals:
+    void showHistoryRequested(wallet::Network network, const QString& scripthash, const QString& address);
+
 private:
     WalletController* controller_ = nullptr;
 
@@ -35,6 +40,8 @@ private:
     void applyColumnWidths();
     void rebuildWalletFilter(); // the combo follows the wallet list; one wallet needs neither it nor the column
     void chooseExportFile();
+    void openHistoryOf(const QModelIndex& index);
+    void editLabelOfSelected();
     void keepTopRow(int first, int last);
     void scheduleUpdate();
     void updateState(); // count, enabled controls, table / empty / no-results

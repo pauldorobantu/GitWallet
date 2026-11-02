@@ -304,6 +304,10 @@ AddressTableModel::AddressTableModel(WalletController* controller, QObject* pare
     prices_ = currentPrices(controller_);
     refreshLabels();
     connect(controller_, &WalletController::walletChanged, this, &AddressTableModel::refreshLabels);
+    connect(controller_, &WalletController::labelsChanged, this, [this] {
+        if (rows_ > 0)
+            emit dataChanged(index(0, ColLabel), index(rows_ - 1, ColLabel));
+    });
     if (wallet::WalletModel* model = controller_->model()) {
         rows_ = model->size();
         connect(model, &wallet::WalletModel::rowsAppended, this, &AddressTableModel::appendRows);
@@ -360,6 +364,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
                 return row.path();
             case ColAddress:
                 return row.address;
+            case ColLabel:
+                return controller_ ? controller_->addressLabel(row.address) : QString();
             case ColBalance:
                 return balancePending(row) ? dash() : balanceText(row);
             case ColUsd: {
@@ -384,6 +390,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
                 return pathKey(row);
             case ColAddress:
                 return row.address;
+            case ColLabel:
+                return controller_ ? controller_->addressLabel(row.address) : QString();
             case ColBalance:
             case ColUsd:
                 return sortValue(controller_, row);
@@ -463,6 +471,8 @@ QVariant AddressTableModel::headerData(int section, Qt::Orientation orientation,
         return trText(QStringLiteral("Path"));
     case ColAddress:
         return trText(QStringLiteral("Address"));
+    case ColLabel:
+        return trText(QStringLiteral("Label"));
     case ColBalance:
         return trText(QStringLiteral("Balance"));
     case ColUsd:
