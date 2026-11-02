@@ -19,8 +19,10 @@ USD at every level and per-address amounts exist, for four assets only: BTC, ETH
 USDC. Coins and networks are data, what the wallets show is kept in an encrypted database, a
 start shows it at once, and 425,000 addresses fit (stage 1). Every Bitcoin transaction is in a
 History, overall, per wallet and per address, proven on this PC, with its fee, USD then and now,
-explorer link, labels and notes (stage 2). Missing against the known wallets: the same for
-Ethereum, Receive with QR, a per-coin screen, app password, Send.
+explorer link, labels and notes (stage 2). It opens on a Portfolio, goes down both ways with a
+clickable path, and Receive gives the next address nobody has been given, with its QR code (stage 3,
+under way). Missing against the known wallets: payment alerts, app password, portable backup, the
+history of Ethereum, Send.
 
 ## The logic people already know
 
@@ -51,8 +53,8 @@ level. An address opens to every asset in its own coin with USD, then its histor
 - **Solana, TON and similar chains** cannot make new addresses from public keys: a fixed
   batch is derived while the seed is there.
 - **Scale.** 500 wallets at the default gaps are 425,000 addresses, 375,000 of them Bitcoin's.
-  One connection follows 40,000 of those live, the next unused addresses and up to 10,000
-  holding coins (anything issued from Receive joins them in stage 4), and the rest are read in
+  One connection follows 40,000 of those live, what Receive gave out and the next unused addresses,
+  and up to 10,000 holding coins, and the rest are read in
   rounds of about 30 minutes at that size. On Ethereum, a pass over 50,000 balances takes about
   a minute, and the next unused ones go ahead of a longer one. The worst delay per chain is
   shown.
@@ -60,7 +62,7 @@ level. An address opens to every asset in its own coin with USD, then its histor
   On Bitcoin, what is in a block is checked on this PC since stage 2: a Merkle proof against a header
   that leads to a checkpoint, or has its work and difficulty checked. A balance is still a server's
   word, but it is compared with what its transactions add up to, without any whose proof failed. A second endpoint for
-  Ethereum-style chains comes with their history in stage 3, before "paid" is believed there.
+  Ethereum-style chains comes with their history in stage 4, before "paid" is believed there.
 - **Many chains will be view-only for a long time.** Sending beyond Bitcoin and
   Ethereum-style chains is extra work per family, and the app says so per chain.
 
@@ -74,8 +76,8 @@ real UI.
 |---|---|---|---|
 | 1 | **Foundation** *(done)* | Coins and chains are data, an encrypted local database and one scheduler. Starts instantly from saved balances. Live price source proven, with the time shown beside USD. Real limits of public endpoints measured | 3-5 |
 | 2 | **Bitcoin history** *(done)* | Every BTC transaction, overall and per address; detail with fee, USD then and now, explorer link; pending, replaced, confirmed; filters, search, CSV, labels and notes. No key needed | 4-6 |
-| 3 | **Ethereum history** | The same for ETH, USDT, USDC, with failed transactions. "Complete back to" shown per chain | 3-5 |
-| 4 | **Familiar screens** | Portfolio, coin pages, clickable path, Receive with QR and next unused address, hide spam and zeros, payment alerts, app password, portable backup | 6-8 |
+| 3 | **Familiar screens** *(under way; moved ahead of Ethereum history at the owner's choice)* | Portfolio, coin pages, clickable path, Receive with QR and next unused address, hide zeros *(these are in)*; hide dust, payment alerts, app password, portable backup | 6-8 |
+| 4 | **Ethereum history** | The same for ETH, USDT, USDC, with failed transactions. "Complete back to" shown per chain | 3-5 |
 | 5 | **Ethereum-style chains** | BNB, Base, Arbitrum, Polygon, OP, Avalanche, custom tokens. No retyping | 3-5 |
 | 6 | **Tron and Bitcoin forks** | USDT on Tron, Litecoin, Dogecoin, Bitcoin Cash, Dash. Seeds typed once more, after the capture list is verified per chain | 6-10 |
 | 7 | **Send** | Normal send and sweep for Bitcoin and Ethereum-style chains: fee presets, coin control, address book, first-time recipient warnings. Test networks first, then a small real payment the owner approves | 12-18 |

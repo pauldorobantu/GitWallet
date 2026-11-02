@@ -809,6 +809,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         QList<Row> rows;
         int gapNow = 0;
         int gapBefore = 0;
+        qint64 issued = 0; // what was given out is in a window whatever the gap
     };
     QHash<QString, Chain> chains;
     const wallet::ScanSettings s = sanitized(settings);
@@ -823,6 +824,13 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         // tokens away by signature reads as unused again.
         const bool found = funded || (r.isUtxo() ? r.used : r.nonce > 0);
         Chain& chain = chains[key];
+        if (chain.rows.isEmpty() && r.change == 0) {
+            const QList<wallet::AccountKey> keys = receiveKeys(r.wallet, r.network);
+            for (const wallet::AccountKey& own : keys) {
+                if (own.type == r.type && own.account == r.account)
+                    chain.issued = own.issued;
+            }
+        }
         chain.rows.append({r.index, funded, found, r.network});
         chain.gapNow = !r.isUtxo() ? s.evmGap : r.change == 0 ? s.utxoReceiveGap : s.utxoChangeGap;
         chain.gapBefore = !r.isUtxo() ? before.evmGap : r.change == 0 ? before.utxoReceiveGap : before.utxoChangeGap;
@@ -841,7 +849,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         for (auto it = chains.begin(); it != chains.end(); ++it) {
             std::sort(it->rows.begin(), it->rows.end(), [](const Row& a, const Row& b) { return a.index < b.index; });
             const qint64 gap = withNewGaps ? it->gapNow : it->gapBefore;
-            qint64 last = -1;
+            qint64 last = it->issued - 1;
             bool cut = false;
             for (const Row& row : std::as_const(it->rows)) {
                 cut = cut || qint64(row.index) > last + gap;
@@ -1471,6 +1479,127 @@ int WalletController::differingAddresses() const
     for (const wallet::UtxoHistory* history : histories)
         count += history->progress().differing;
     return count;
+}
+
+QList<wallet::AccountKey> WalletController::receiveKeys(quint32 wallet, wallet::Network network) const
+{
+    QList<wallet::AccountKey> out;
+    const wallet::WalletEntry* entry = store_.find(wallet);
+    if (!entry)
+        return out;
+    // The order of the list of coins: what it names first is what wallets take today. Keys added on
+    // their own can be of any account.
+    for (const wallet::CapturedAccount& captured : wallet::capturedAccounts()) {
+        const wallet::AccountKey* lowest = nullptr;
+        for (const wallet::AccountKey& key : entry->accounts) {
+            if (key.type == captured.type && key.serves(network) && (!lowest || key.account < lowest->account))
+                lowest = &key;
+        }
+        if (lowest && !std::any_of(out.cbegin(), out.cend(), [lowest](const wallet::AccountKey& had) { return had.type == lowest->type; }))
+            out.append(*lowest);
+    }
+    return out;
+}
+
+QString WalletController::checkedAddress(const wallet::AddressRow& row) const
+{
+    const wallet::WalletEntry* entry = store_.find(row.wallet);
+    if (!entry)
+        return {};
+    for (const wallet::AccountKey& key : entry->accounts) {
+        if (key.type != row.type || key.account != row.account || !key.serves(row.network))
+            continue;
+        try {
+            const QString derived = QString::fromStdString(
+                chain::addressFromChainNode(key.node().deriveChild(row.change), row.type, row.account, row.change, row.index, wallet::networkInfo(row.network).format).address);
+            // An Ethereum address reads the same in either case; the case is only its checksum.
+            return derived.compare(row.address, chain::isUtxo(row.type) ? Qt::CaseSensitive : Qt::CaseInsensitive) == 0 ? derived : QString();
+        } catch (const std::exception&) {
+            return {};
+        }
+    }
+    return {};
+}
+
+wallet::ReceiveOffer WalletController::nextReceive(quint32 wallet, wallet::Network network, chain::ScriptType type) const
+{
+    wallet::ReceiveOffer offer;
+    const QList<wallet::AccountKey> keys = receiveKeys(wallet, network);
+    const auto key = std::find_if(keys.cbegin(), keys.cend(), [type](const wallet::AccountKey& k) { return k.type == type; });
+    if (key == keys.cend())
+        return offer;
+    offer.state = wallet::ReceiveOffer::State::Checking;
+    if (waitingForLedger_)
+        return offer; // what the database kept says what has been used
+    for (quint32 index = key->issued;; ++index) {
+        const int position = model_->find(wallet, network, type, key->account, 0, index);
+        if (position < 0)
+            return offer;
+        const wallet::AddressRow& row = model_->at(position);
+        if (row.used || row.state() == wallet::AddressState::Funded)
+            continue;
+        if (!row.checked)
+            return offer;
+        offer.account = key->account;
+        offer.index = index;
+        offer.path = row.path();
+        offer.address = checkedAddress(row);
+        if (offer.address.isEmpty()) {
+            offer.state = wallet::ReceiveOffer::State::Failed;
+            offer.why = QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.");
+            return offer;
+        }
+        offer.state = wallet::ReceiveOffer::State::Ready;
+        return offer;
+    }
+}
+
+bool WalletController::markGivenOut(quint32 wallet, wallet::Network network, chain::ScriptType type, quint32 index, QString* error)
+{
+    setError(error, QString());
+    const QList<wallet::AccountKey> keys = receiveKeys(wallet, network);
+    const auto chosen = std::find_if(keys.cbegin(), keys.cend(), [type](const wallet::AccountKey& k) { return k.type == type; });
+    if (chosen == keys.cend())
+        return true;
+    for (wallet::WalletEntry& entry : store_.wallets) {
+        if (entry.id != wallet)
+            continue;
+        for (wallet::AccountKey& key : entry.accounts) {
+            if (key.type != type || key.account != chosen->account || !key.serves(network))
+                continue;
+            if (index < key.issued)
+                return true; // given out already
+            if (key.issued == 0)
+                key.issuedFrom = index;
+            key.issued = index + 1;
+            const wallet::AccountKey marked = key;
+            scheduler_->noteIssued(marked);
+            emit givenOutChanged();
+            QString why = settingsSaveBlocker();
+            if (why.isEmpty() && saveStore(&why))
+                settingsOnlyHere_ = false; // what was for this session only has gone with it
+            if (why.isEmpty())
+                return true;
+            setError(error, QStringLiteral("It could not be written down, so another start may offer it again: %1").arg(why));
+            return false;
+        }
+    }
+    return true;
+}
+
+QList<int> WalletController::givenOutRows(quint32 wallet, wallet::Network network, chain::ScriptType type, int limit) const
+{
+    QList<int> out;
+    const QList<wallet::AccountKey> keys = receiveKeys(wallet, network);
+    const auto key = std::find_if(keys.cbegin(), keys.cend(), [type](const wallet::AccountKey& k) { return k.type == type; });
+    if (key == keys.cend())
+        return out;
+    for (quint32 index = key->issued; index > key->issuedFrom && out.size() < limit; --index) {
+        const int position = model_->find(wallet, network, type, key->account, 0, index - 1);
+        if (position >= 0)
+            out.append(position);
+    }
+    return out;
 }
 
 double WalletController::usdValue(wallet::Asset asset) const

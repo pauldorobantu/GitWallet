@@ -438,7 +438,7 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &WalletsPage::updateState);
     connect(view, &QAbstractItemView::doubleClicked, this, [this] {
         if (const quint32 id = selectedId())
-            emit showAddressesRequested(id);
+            emit openRequested(id);
     });
     connect(ui_->add, &QPushButton::clicked, this, &WalletsPage::addRequested);
     connect(ui_->addMany, &QPushButton::clicked, this, &WalletsPage::addManyRequested);

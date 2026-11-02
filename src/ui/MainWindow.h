@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ui/PlaceBar.h"
+
 #include <QMap>
 #include <QStringList>
 #include <QWidget>
@@ -21,10 +23,13 @@ namespace app::ui {
 
 class TitleBar;
 class SideNav;
-class OverviewPage;
+class PlaceBar;
+class PortfolioPage;
+class HoldingsPage;
 class WalletsPage;
 class AddressesPage;
 class HistoryPage;
+class ReceivePage;
 class SettingsPage;
 
 // The application window: the frameless shell, title bar and sidebar of the
@@ -40,8 +45,11 @@ public:
 
     WalletController* controller() const { return controller_; }
 
-    // "overview" | "wallets" | "addresses" | "history" | "send" | "settings" (for --page and tests).
+    // "portfolio" | "wallets" | "addresses" | "history" | "receive" | "send" | "settings" (for --page and tests).
     void showPage(const QString& name);
+    // A step down from a total: where it goes, and which tab of it.
+    void goTo(Place place, Place::Tab tab);
+    PlaceBar* placeBar() const { return placeBar_; }
 
 protected:
     bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
@@ -88,7 +96,11 @@ private:
     void buildUi();
     QWidget* buildNoticeBar();
     void refreshFrame();
-    void openPage(int pageId); // highlights the sidebar item and shows its page
+    void openPage(int pageId); // highlights the sidebar item and shows its page, whole
+    void leavePlace();         // the pages are no longer narrowed to one
+    void openRoot(Place::Root root);
+    void editAddressLabel(const QString& address);
+    void afterWalletChange();  // what the reader was on may be gone
     void openImportDialog(bool many); // `many`: on the list of seeds rather than one seed
     void loadWallet();
     void refreshStatus(); // statusChanged / walletChanged
@@ -105,10 +117,13 @@ private:
     TitleBar* title_ = nullptr;
     SideNav* nav_ = nullptr;
     QStackedWidget* stack_ = nullptr;
-    OverviewPage* overview_ = nullptr;
+    PlaceBar* placeBar_ = nullptr;
+    PortfolioPage* portfolio_ = nullptr;
+    HoldingsPage* holdings_ = nullptr;
     WalletsPage* wallets_ = nullptr;
     AddressesPage* addresses_ = nullptr;
     HistoryPage* history_ = nullptr;
+    ReceivePage* receive_ = nullptr;
     SettingsPage* settings_ = nullptr;
     QWidget* noticeBar_ = nullptr; // shown while a notice waits to be read
     QLabel* noticeChip_ = nullptr;

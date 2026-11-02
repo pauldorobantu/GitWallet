@@ -285,7 +285,7 @@ int UtxoScanner::Chain::window() const
 {
     // lastUsed and floor never pass kMaxChainRows and gap is at most kMaxGap,
     // so this never comes near overflowing an int.
-    return std::max(floor, lastUsed + 1 + gap);
+    return std::max(floor, std::max(lastUsed + 1, issued) + gap);
 }
 
 int UtxoScanner::Chain::target() const
@@ -295,9 +295,9 @@ int UtxoScanner::Chain::target() const
 
 int UtxoScanner::Chain::base() const
 {
-    // The window as it stands with nothing used: what the gap alone asks for,
-    // plus the rows of another wallet to replace.
-    return std::min(std::max(floor, gap), kMaxChainRows);
+    // The window as it stands with nothing used: what the gap alone asks for past what
+    // was given out, plus the rows of another wallet to replace.
+    return std::min(std::max(floor, issued + gap), kMaxChainRows);
 }
 
 UtxoScanner::UtxoScanner(Network network, WalletModel* model, QObject* parent)
@@ -449,6 +449,7 @@ void UtxoScanner::start()
             c.account = acct.account;
             c.change = change;
             c.gap = change == 0 ? receiveGap_ : changeGap_;
+            c.issued = change == 0 ? int(std::min<quint32>(acct.issued, quint32(kMaxChainRows))) : 0;
             try {
                 c.node = accountNode.deriveChild(change);
             } catch (const std::exception& e) {
@@ -585,8 +586,8 @@ void UtxoScanner::adoptModelRows()
     // The addresses a payment comes to next first, as far as the rows say which they are.
     for (int ci = 0; ci < chains_.size(); ++ci) {
         const Chain& c = chains_.at(ci);
-        if (c.savedUsed < 0 || !c.reuse) continue;
-        for (int index = c.savedUsed + 1; index <= c.savedUsed + hotAhead(c); ++index) {
+        if ((c.savedUsed < 0 && c.issued == 0) || !c.reuse) continue;
+        for (int index = c.savedUsed + 1; index <= std::max(c.savedUsed, c.issued - 1) + hotAhead(c); ++index) {
             const int pos = model_->find(c.wallet, network_, c.type, c.account, c.change, quint32(index));
             if (pos < 0) continue;
             const AddressRow& row = model_->at(pos);
@@ -1061,8 +1062,9 @@ int UtxoScanner::hotAhead(const Chain& c) const
 
 bool UtxoScanner::isNext(const Chain& c, int index) const
 {
+    // What was given out and has not been paid yet, then the unused ones after that.
     const int last = std::max(c.lastUsed, c.savedUsed);
-    return index > last && index <= last + hotAhead(c);
+    return index > last && index <= std::max(last, c.issued - 1) + hotAhead(c);
 }
 
 bool UtxoScanner::wantsLive(const Chain& c, int index, const AddressRow& row) const
@@ -1777,6 +1779,21 @@ void UtxoScanner::noteUsed(int chainIndex, int index)
     // The window always ends `gap` past the last used address, also after the
     // initial scan: a payment to any subscribed address can reveal more.
     // deriveSlice() derives what the row limit allows and reports the rest.
+    if (c.next < c.window()) scheduleDerive();
+}
+
+void UtxoScanner::noteIssued(const AccountKey& key)
+{
+    if (!running_) return; // the next start() reads it from the key
+    const int ci = chainByKey_.value(ChainKey{key.wallet, key.account, quint8(key.type), 0}, -1);
+    if (ci < 0) return;
+    Chain& c = chains_[ci];
+    const int issued = int(std::min<quint32>(key.issued, quint32(kMaxChainRows)));
+    if (issued <= c.issued) return;
+    const int oldEnd = std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c);
+    c.issued = issued;
+    noteTiered();
+    if (tiered()) reconsiderRange(ci, oldEnd + 1, std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c));
     if (c.next < c.window()) scheduleDerive();
 }
 

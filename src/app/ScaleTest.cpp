@@ -250,7 +250,7 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
         settle();
     }
 
-    for (const QString& name : {QStringLiteral("overview"), QStringLiteral("wallets"), QStringLiteral("addresses")}) {
+    for (const QString& name : {QStringLiteral("portfolio"), QStringLiteral("wallets"), QStringLiteral("addresses"), QStringLiteral("receive")}) {
         clock.restart();
         window->showPage(name);
         settle();
@@ -375,13 +375,13 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
         }
         clock.restart();
         const QString wanted = known.at(known.size() / 2).scripthash;
-        history->showAddress(bitcoin, wanted, known.at(known.size() / 2).address);
+        history->showPlace(0, bitcoin, wanted, known.at(known.size() / 2).address);
         settle();
         say(QStringLiteral("one address's history"), clock.elapsed());
         if (lines->rowCount() != book->addressAt(book->findAddress(wanted)).txs.size())
             report += QStringLiteral("FAIL  one address shows %1 lines, not %2\n").arg(lines->rowCount()).arg(book->addressAt(book->findAddress(wanted)).txs.size());
         clock.restart();
-        history->showAll();
+        history->clearPlace();
         settle();
         say(QStringLiteral("back to all of them"), clock.elapsed());
         {

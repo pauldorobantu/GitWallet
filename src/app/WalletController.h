@@ -175,6 +175,22 @@ public:
     // that the same file will take them later, or -1 with `error` when none can be kept.
     void importLabelsFile(const QString& path, QObject* guard, const std::function<void(int added, int skipped, int later, const QString& error)>& done);
 
+    // The Receive page: the keys a wallet could be paid on, one per kind of address, its first account,
+    // in the order the list of coins captures them.
+    QList<wallet::AccountKey> receiveKeys(quint32 wallet, wallet::Network network) const;
+    // That row's address, as its key gives it now; empty when it gives another, or none. What is
+    // handed to someone to pay comes from here, not from what is kept.
+    QString checkedAddress(const wallet::AddressRow& row) const;
+    // The next address of one of them. Always derived here and now from the key: what is kept beside
+    // it only says which index is next, and if it says another address for that index, none is offered.
+    wallet::ReceiveOffer nextReceive(quint32 wallet, wallet::Network network, chain::ScriptType type) const;
+    // The address at `index` of that key was given out: neither it nor any before it is offered again,
+    // and it is followed ahead of others. It holds for this session in any case; false + why when it
+    // cannot be written down, and another start would offer it again.
+    bool markGivenOut(quint32 wallet, wallet::Network network, chain::ScriptType type, quint32 index, QString* error);
+    // Positions in the model of what was given out on that key, the latest first, at most `limit`.
+    QList<int> givenOutRows(quint32 wallet, wallet::Network network, chain::ScriptType type, int limit) const;
+
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
     double totalUsd(quint32 wallet) const;      // one wallet's
@@ -182,6 +198,7 @@ public:
 signals:
     void walletChanged();  // loaded / imported / removed
     void statusChanged();  // statusText() or any of the scan states above changed
+    void givenOutChanged(); // an address was given out
     void historyProgress(); // how far a history has got moved
     void labelsChanged();  // an address's label
     void totalsChanged();  // balances or prices changed

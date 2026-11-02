@@ -1,0 +1,732 @@
+#include "ui/Holdings.h"
+
+#include "app/WalletController.h"
+#include "net/PriceFeed.h"
+#include "ui/CoinIcon.h"
+#include "ui/Figures.h"
+#include "ui/HoverRowTable.h"
+#include "ui/LanguageManager.h"
+#include "ui/PageKit.h"
+#include "ui/design/Style.h"
+#include "wallet/WalletModel.h"
+#include "wallet/WalletStore.h"
+
+#include <QAbstractTableModel>
+#include <QApplication>
+#include <QEvent>
+#include <QHeaderView>
+#include <QHelpEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QSortFilterProxyModel>
+#include <QStyledItemDelegate>
+#include <QTimer>
+#include <QToolTip>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <exception>
+#include <limits>
+#include <utility>
+
+namespace app::ui {
+
+namespace {
+
+// A scan signals per address; the figures need the state a few times a second.
+constexpr int kRefreshMs = 300;
+
+enum Column { ColName, ColPrice, ColAmount, ColValue, ColShare, ColAddresses, ColGo, ColumnCount };
+enum Role {
+    kSortRole = Qt::UserRole + 1,
+    kSubRole,   // the line under the name
+    kAssetRole, // a row of a coin
+    kWalletRole, // a row of a wallet
+    kHoldsRole,  // known to hold something, or not known to hold nothing
+};
+
+enum class Kind { Coins, WalletsOfCoin, AssetsOfAddress };
+
+using figures::atLeast;
+using figures::dash;
+using figures::formatCount;
+using figures::formatUsd;
+
+// Why a figure is not final, and how current what is known of it is.
+QString noteOf(const WalletController* controller, const Holding& holding)
+{
+    const wallet::AssetInfo& info = wallet::assetInfo(holding.asset);
+    const wallet::NetworkInfo& network = wallet::networkInfo(info.network);
+    if (!holding.watched)
+        return trText(QStringLiteral("No wallet has a key on %1")).arg(network.name);
+    QStringList parts;
+    if (holding.pending > 0)
+        parts << trText(holding.pending == 1 ? QStringLiteral("%1 address not checked yet") : QStringLiteral("%1 addresses not checked yet"))
+                     .arg(formatCount(holding.pending));
+    if (controller->addressLimitReached())
+        parts << trText(QStringLiteral("address limit reached"));
+    const wallet::NetworkStatus status = controller->networkStatus(info.network);
+    if ((status.wrongChain || status.failing || status.connecting) && status.balancesAt.isValid())
+        parts << trText(QStringLiteral("as of %1")).arg(status.balancesAt.toLocalTime().toString(QStringLiteral("d MMM HH:mm")));
+    else if (status.wrongChain)
+        parts << trText(QStringLiteral("server on another chain"));
+    else if (status.failing)
+        parts << trText(QStringLiteral("lookups failing"));
+    else if (holding.complete && status.scanning)
+        parts << (controller->showingSaved() ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning")));
+    return parts.join(QStringLiteral(" · "));
+}
+
+// One row of the table: the figures of a moment, so that sorting and painting read no model.
+struct Line {
+    QIcon icon;
+    QString name;
+    QString sub;
+    wallet::Asset asset{};
+    quint32 wallet = 0;
+    Holding holding;
+    QString note;
+    double share = -1.0; // of what the rows come to; below 0: not known
+    bool chosen = true;  // opens to something
+};
+
+class HoldingsModel : public QAbstractTableModel
+{
+public:
+    using QAbstractTableModel::QAbstractTableModel;
+
+    Kind kind = Kind::Coins;
+
+    void setLines(QList<Line> lines)
+    {
+        if (lines.size() != lines_.size()) {
+            beginResetModel();
+            lines_ = std::move(lines);
+            endResetModel();
+            return;
+        }
+        lines_ = std::move(lines);
+        if (!lines_.isEmpty())
+            emit dataChanged(index(0, 0), index(int(lines_.size()) - 1, ColumnCount - 1));
+    }
+    void repaintHeaders() { emit headerDataChanged(Qt::Horizontal, 0, ColumnCount - 1); }
+    const QList<Line>& lines() const { return lines_; }
+
+    int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : int(lines_.size()); }
+    int columnCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : ColumnCount; }
+
+    QVariant headerData(int section, Qt::Orientation orientation, int role) const override
+    {
+        if (orientation != Qt::Horizontal)
+            return QAbstractTableModel::headerData(section, orientation, role);
+        if (role == Qt::TextAlignmentRole && section != ColName)
+            return QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
+        if (role == Qt::ToolTipRole && section == ColAddresses)
+            return trText(QStringLiteral("Addresses that hold some of it"));
+        if (role != Qt::DisplayRole)
+            return {};
+        switch (section) {
+        case ColName: return kind == Kind::WalletsOfCoin ? trText(QStringLiteral("Wallet")) : trText(QStringLiteral("Coin"));
+        case ColPrice: return trText(QStringLiteral("Price"));
+        case ColAmount: return trText(QStringLiteral("Holdings"));
+        case ColValue: return trText(QStringLiteral("Value"));
+        case ColShare: return trText(QStringLiteral("Share"));
+        case ColAddresses: return trText(QStringLiteral("Addresses"));
+        default: return {};
+        }
+    }
+
+    QVariant data(const QModelIndex& index, int role) const override
+    {
+        if (!index.isValid() || index.row() >= lines_.size())
+            return {};
+        const Line& line = lines_.at(index.row());
+        const Holding& h = line.holding;
+        const int column = index.column();
+        switch (role) {
+        case Qt::DisplayRole:
+            switch (column) {
+            case ColName: return line.name;
+            case ColPrice: return h.price > 0.0 ? formatUsd(h.price) : dash();
+            case ColAmount: return h.amountText();
+            case ColValue: return h.usdText();
+            case ColShare: return line.share >= 0.0 ? QStringLiteral("%1%").arg(line.share * 100.0, 0, 'f', 1) : dash();
+            case ColAddresses: return h.watched ? formatCount(h.holders) : dash();
+            case ColGo: return line.chosen ? QStringLiteral("›") : QString();
+            default: return {};
+            }
+        case Qt::DecorationRole:
+            return column == ColName ? QVariant(line.icon) : QVariant();
+        case kSubRole:
+            return line.sub;
+        case kAssetRole:
+            return int(line.asset);
+        case kWalletRole:
+            return line.wallet;
+        case kHoldsRole:
+            // Only a figure that answered says "nothing": "—" is no zero.
+            return h.holds() || !h.complete || !h.watched;
+        case kSortRole:
+            switch (column) {
+            case ColName: return line.name;
+            case ColPrice: return h.price;
+            case ColShare:
+            case ColValue:
+                // Before prices come a holding is still worth more than none.
+                return h.usd > 0.0 ? h.usd : (h.holds() ? std::numeric_limits<double>::min() : 0.0);
+            case ColAmount:
+                try {
+                    return h.amount.toDouble(wallet::assetInfo(h.asset).decimals);
+                } catch (const std::exception&) {
+                    return 0.0;
+                }
+            case ColAddresses: return h.holders;
+            default: return {};
+            }
+        case Qt::TextAlignmentRole:
+            return column == ColName ? QVariant() : QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
+        case Qt::ForegroundRole:
+            if (column == ColName)
+                return {};
+            if (column == ColGo || !h.holds())
+                return page::muted();
+            return page::text();
+        case Qt::ToolTipRole:
+            if (column == ColName)
+                return line.name;
+            if (column == ColAmount || column == ColValue)
+                return line.note.isEmpty() ? QVariant() : QVariant(line.note);
+            return {};
+        default:
+            return {};
+        }
+    }
+
+private:
+    QList<Line> lines_;
+};
+
+// The rows known to hold nothing go, unless that is all there is: a page with nothing on it says
+// nothing, and a coin not yet answered for is no zero.
+class HoldingsFilter : public QSortFilterProxyModel
+{
+public:
+    using QSortFilterProxyModel::QSortFilterProxyModel;
+
+    void setHide(bool hide)
+    {
+        if (hide == hide_)
+            return;
+        beginFilterChange();
+        hide_ = hide;
+        endFilterChange(Direction::Rows);
+    }
+    bool hide() const { return hide_; }
+    void linesChanged()
+    {
+        beginFilterChange();
+        endFilterChange(Direction::Rows);
+    }
+
+protected:
+    bool filterAcceptsRow(int row, const QModelIndex& parent) const override
+    {
+        const QAbstractItemModel* source = sourceModel();
+        if (!hide_ || !source)
+            return true;
+        if (source->index(row, 0, parent).data(kHoldsRole).toBool())
+            return true;
+        for (int other = 0; other < source->rowCount(parent); ++other) {
+            if (source->index(other, 0, parent).data(kHoldsRole).toBool())
+                return false;
+        }
+        return true;
+    }
+
+private:
+    bool hide_ = false;
+};
+
+// A mark and two lines of text in one cell.
+class NameDelegate : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override
+    {
+        // The row's band is the view's.
+        constexpr int kMark = 26;
+        constexpr int kMarkGap = 12;
+        painter->save();
+        const QRect cell = option.rect.adjusted(page::kCellPadX, 0, -page::kCellPadX, 0);
+        const QIcon icon = index.data(Qt::DecorationRole).value<QIcon>();
+        int textLeft = cell.left();
+        if (!icon.isNull()) {
+            icon.paint(painter, QRect(cell.left(), cell.center().y() - kMark / 2, kMark, kMark));
+            textLeft += kMark + kMarkGap;
+        }
+        const QRect text(textLeft, cell.top(), cell.right() - textLeft, cell.height());
+        const QString name = index.data(Qt::DisplayRole).toString();
+        const QString sub = index.data(kSubRole).toString();
+        QFont nameFont = option.font;
+        nameFont.setWeight(QFont::DemiBold);
+        const QFontMetrics nameMetrics(nameFont);
+        painter->setPen(page::text());
+        painter->setFont(nameFont);
+        if (sub.isEmpty()) {
+            painter->drawText(text, Qt::AlignLeft | Qt::AlignVCenter, nameMetrics.elidedText(name, Qt::ElideRight, text.width()));
+        } else {
+            QFont subFont = option.font;
+            subFont.setPixelSize(qMax(10, QFontInfo(option.font).pixelSize() - 2));
+            const QFontMetrics subMetrics(subFont);
+            const int block = nameMetrics.height() + subMetrics.height();
+            const int top = text.center().y() - block / 2;
+            painter->drawText(QRect(text.left(), top, text.width(), nameMetrics.height()), Qt::AlignLeft | Qt::AlignVCenter,
+                              nameMetrics.elidedText(name, Qt::ElideRight, text.width()));
+            painter->setFont(subFont);
+            painter->setPen(page::muted());
+            painter->drawText(QRect(text.left(), top + nameMetrics.height(), text.width(), subMetrics.height()), Qt::AlignLeft | Qt::AlignVCenter,
+                              subMetrics.elidedText(sub, Qt::ElideRight, text.width()));
+        }
+        painter->restore();
+    }
+};
+
+// Whether the key behind each network is there, and every row of it answered.
+struct Coverage {
+    bool watched = false;
+    bool missing = false; // an account has no rows at all: not derived yet, or its key unreadable
+};
+
+Coverage coverageOf(const WalletController* controller, wallet::Network network, quint32 wallet)
+{
+    Coverage out;
+    const wallet::WalletModel* model = controller->model();
+    for (const wallet::WalletEntry& entry : controller->store().wallets) {
+        if (wallet != 0 && entry.id != wallet)
+            continue;
+        for (const wallet::AccountKey& account : entry.accounts) {
+            if (!account.serves(network))
+                continue;
+            out.watched = true;
+            if (model->find(account.wallet, network, account.type, account.account, 0, 0) < 0)
+                out.missing = true;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------- the figures ----
+
+Holding holdingOf(const WalletController* controller, wallet::Asset asset, quint32 wallet)
+{
+    Holding h;
+    h.asset = asset;
+    const wallet::WalletModel* model = controller ? controller->model() : nullptr;
+    if (!model)
+        return h;
+    const wallet::AssetInfo& info = wallet::assetInfo(asset);
+    const Coverage coverage = coverageOf(controller, info.network, wallet);
+    h.watched = coverage.watched;
+    h.pending = wallet != 0 ? model->uncheckedOn(info.network, wallet) : model->uncheckedOn(info.network);
+    h.complete = h.watched && h.pending == 0 && !coverage.missing && !controller->addressLimitReached() && !controller->loadingSaved()
+                 && !controller->hasUnreadKeys();
+    h.holders = wallet != 0 ? model->holders(asset, wallet) : model->holders(asset);
+    h.price = controller->prices() ? controller->prices()->usd(asset) : 0.0;
+    h.amount = wallet != 0 ? model->total(asset, wallet) : model->total(asset);
+    try {
+        h.usd = h.amount.toDouble(info.decimals) * h.price;
+    } catch (const std::exception&) {
+        // chain:: reports a value it cannot convert by throwing: no figure pretends to include it.
+        h.readable = false;
+        h.usd = 0.0;
+    }
+    return h;
+}
+
+QString Holding::amountText() const
+{
+    if (!watched || !readable)
+        return figures::dash();
+    const wallet::AssetInfo& info = wallet::assetInfo(asset);
+    try {
+        if (!complete && !holds())
+            return figures::dash();
+        const QString shown = figures::formatAmount(amount, info) + QLatin1Char(' ') + info.symbol;
+        return complete ? shown : figures::atLeast(shown);
+    } catch (const std::exception&) {
+        return figures::dash();
+    }
+}
+
+QString Holding::usdText() const
+{
+    if (!watched || !readable || price <= 0.0 || (!complete && !holds()))
+        return figures::dash();
+    const QString shown = figures::formatUsd(usd);
+    return complete ? shown : figures::atLeast(shown);
+}
+
+ScopeTotal totalOf(const WalletController* controller, quint32 wallet)
+{
+    ScopeTotal total;
+    total.known = true;
+    total.complete = true;
+    bool anyWatched = false;
+    bool anyPrice = false;
+    for (const wallet::AssetInfo& info : wallet::assets()) {
+        const Holding h = holdingOf(controller, info.asset, wallet);
+        if (!h.watched)
+            continue;
+        anyWatched = true;
+        if (!h.readable || (h.holds() && h.price <= 0.0))
+            total.known = false;
+        anyPrice = anyPrice || h.price > 0.0;
+        total.complete = total.complete && h.complete;
+        total.usd += h.usd;
+    }
+    if (!anyWatched || !anyPrice)
+        total.known = false;
+    return total;
+}
+
+QString ScopeTotal::text() const
+{
+    // While nothing is known the total stays "—", never "$0.00".
+    if (!known || (!complete && usd <= 0.0))
+        return figures::dash();
+    const QString shown = figures::formatUsd(usd);
+    return complete ? shown : figures::atLeast(shown);
+}
+
+// ---------------------------------------------------------------- the bar ----
+
+AllocationBar::AllocationBar(QWidget* parent) : QWidget(parent)
+{
+    setFixedHeight(8);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+}
+
+void AllocationBar::setParts(const QList<Part>& parts)
+{
+    parts_.clear();
+    total_ = 0.0;
+    for (const Part& part : parts) {
+        if (part.usd > 0.0) {
+            parts_.append(part);
+            total_ += part.usd;
+        }
+    }
+    std::stable_sort(parts_.begin(), parts_.end(), [](const Part& a, const Part& b) { return a.usd > b.usd; });
+    setVisible(total_ > 0.0);
+    update();
+}
+
+void AllocationBar::paintEvent(QPaintEvent*)
+{
+    if (total_ <= 0.0)
+        return;
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    QPainterPath clip;
+    const qreal radius = page::corner(height() / 2.0);
+    clip.addRoundedRect(QRectF(rect()), radius, radius);
+    p.setClipPath(clip);
+    p.setPen(Qt::NoPen);
+    constexpr qreal kGap = 2.0;
+    qreal x = 0.0;
+    for (const Part& part : std::as_const(parts_)) {
+        const qreal share = width() * part.usd / total_;
+        p.setBrush(part.color);
+        // No sliver of nothing: a part too thin for a gap gets none.
+        p.drawRect(QRectF(x, 0, std::max(share - (share > 2 * kGap ? kGap : 0.0), 1.0), height()));
+        x += share;
+    }
+}
+
+bool AllocationBar::event(QEvent* event)
+{
+    if (event->type() == QEvent::ToolTip && total_ > 0.0) {
+        const auto* help = static_cast<QHelpEvent*>(event);
+        qreal x = 0.0;
+        for (const Part& part : std::as_const(parts_)) {
+            x += width() * part.usd / total_;
+            if (help->pos().x() <= x) {
+                QToolTip::showText(help->globalPos(), QStringLiteral("%1 · %2 · %3%").arg(part.name, figures::formatUsd(part.usd)).arg(part.usd / total_ * 100.0, 0, 'f', 1), this);
+                return true;
+            }
+        }
+    }
+    return QWidget::event(event);
+}
+
+// ---------------------------------------------------------------- the table ----
+
+struct HoldingsTable::Ui : QObject
+{
+    using QObject::QObject;
+
+    HoldingsModel* model = nullptr;
+    HoldingsFilter* filter = nullptr;
+    HoverRowTableView* view = nullptr;
+    QTimer* refresh = nullptr;
+
+    Kind kind = Kind::Coins;
+    quint32 wallet = 0;
+    wallet::Asset asset{};
+    wallet::AddressRow row;
+};
+
+HoldingsTable::HoldingsTable(WalletController* controller, QWidget* parent)
+    : QWidget(parent), controller_(controller)
+{
+    ui_ = new Ui(this);
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    ui_->model = new HoldingsModel(this);
+    ui_->filter = new HoldingsFilter(this);
+    ui_->filter->setSourceModel(ui_->model);
+    ui_->filter->setSortRole(kSortRole);
+    ui_->filter->setSortCaseSensitivity(Qt::CaseInsensitive);
+
+    auto* view = new HoverRowTableView(this);
+    view->setObjectName(QStringLiteral("holdingsTable"));
+    ui_->view = view;
+    view->setModel(ui_->filter);
+    page::configureTable(view, 52);
+    view->setMouseTracking(true);
+    view->setWordWrap(false);
+    view->setSelectionMode(QAbstractItemView::NoSelection);
+    view->setFocusPolicy(Qt::StrongFocus);
+    view->setItemDelegateForColumn(ColName, new NameDelegate(view));
+    QHeaderView* header = view->horizontalHeader();
+    header->setSectionsClickable(true);
+    header->setSortIndicatorClearable(false);
+    header->setHighlightSections(false);
+    header->setStretchLastSection(false);
+    view->setSortingEnabled(true);
+    header->setSortIndicator(ColValue, Qt::DescendingOrder);
+    header->setSectionResizeMode(QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(ColName, QHeaderView::Stretch);
+    root->addWidget(view);
+
+    ui_->refresh = new QTimer(this);
+    ui_->refresh->setSingleShot(true);
+    ui_->refresh->setInterval(kRefreshMs);
+    connect(ui_->refresh, &QTimer::timeout, this, [this] {
+        if (isVisible())
+            refresh();
+    });
+
+    const auto open = [this](const QModelIndex& index) {
+        // What opened this list was a click, and maybe the first of two.
+        if (sinceOpened_.isValid() && sinceOpened_.elapsed() < QApplication::doubleClickInterval())
+            return;
+        const QModelIndex source = ui_->filter->mapToSource(index);
+        if (!source.isValid() || source.row() >= ui_->model->lines().size())
+            return;
+        const Line& line = ui_->model->lines().at(source.row());
+        if (!line.chosen)
+            return;
+        if (ui_->kind == Kind::WalletsOfCoin)
+            emit walletChosen(line.wallet);
+        else
+            emit coinChosen(line.asset);
+    };
+    connect(view, &QAbstractItemView::clicked, this, open);
+    connect(view, &QAbstractItemView::activated, this, open);
+
+    connect(LanguageManager::instance(), &LanguageManager::changed, this, [this] {
+        ui_->model->repaintHeaders();
+        refresh();
+    });
+    if (controller_) {
+        connect(controller_, &WalletController::totalsChanged, this, &HoldingsTable::queueRefresh);
+        connect(controller_, &WalletController::statusChanged, this, &HoldingsTable::queueRefresh);
+        connect(controller_, &WalletController::walletChanged, this, &HoldingsTable::queueRefresh);
+    }
+    applyKind();
+}
+
+void HoldingsTable::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    refresh();
+}
+
+void HoldingsTable::queueRefresh()
+{
+    if (!ui_->refresh->isActive())
+        ui_->refresh->start();
+}
+
+void HoldingsTable::opened()
+{
+    sinceOpened_.start();
+    applyKind();
+    refresh();
+    ui_->filter->sort(ColValue, Qt::DescendingOrder);
+    ui_->view->horizontalHeader()->setSortIndicator(ColValue, Qt::DescendingOrder);
+}
+
+void HoldingsTable::showCoins(quint32 wallet)
+{
+    ui_->kind = Kind::Coins;
+    ui_->wallet = wallet;
+    opened();
+}
+
+void HoldingsTable::showWallets(wallet::Asset asset)
+{
+    ui_->kind = Kind::WalletsOfCoin;
+    ui_->asset = asset;
+    opened();
+}
+
+void HoldingsTable::showAddress(const wallet::AddressRow& row)
+{
+    ui_->kind = Kind::AssetsOfAddress;
+    ui_->row = row;
+    opened();
+}
+
+void HoldingsTable::applyKind()
+{
+    ui_->model->kind = ui_->kind;
+    ui_->model->repaintHeaders();
+    QTableView* view = ui_->view;
+    view->setColumnHidden(ColPrice, ui_->kind == Kind::WalletsOfCoin);
+    view->setColumnHidden(ColAddresses, ui_->kind == Kind::AssetsOfAddress);
+    view->setColumnHidden(ColGo, ui_->kind == Kind::AssetsOfAddress);
+    view->viewport()->setCursor(ui_->kind == Kind::AssetsOfAddress ? Qt::ArrowCursor : Qt::PointingHandCursor);
+}
+
+void HoldingsTable::setHideZero(bool hide)
+{
+    ui_->filter->setHide(hide);
+}
+
+bool HoldingsTable::hideZero() const
+{
+    return ui_->filter->hide();
+}
+
+QTableView* HoldingsTable::view() const
+{
+    return ui_->view;
+}
+
+int HoldingsTable::rowsShown() const
+{
+    return ui_->filter->rowCount();
+}
+
+int HoldingsTable::rowsHolding() const
+{
+    const QList<Line>& lines = ui_->model->lines();
+    return int(std::count_if(lines.cbegin(), lines.cend(), [](const Line& line) { return line.holding.holds(); }));
+}
+
+int HoldingsTable::rowsTotal() const
+{
+    return int(ui_->model->lines().size());
+}
+
+QList<AllocationBar::Part> HoldingsTable::parts() const
+{
+    QList<AllocationBar::Part> out;
+    if (ui_->kind == Kind::WalletsOfCoin)
+        return out;
+    for (const Line& line : ui_->model->lines())
+        out.append({coinColor(wallet::assetInfo(line.asset)), line.holding.usd, line.name});
+    return out;
+}
+
+void HoldingsTable::refresh()
+{
+    ui_->refresh->stop();
+    QList<Line> lines;
+    if (!controller_) {
+        ui_->model->setLines(lines);
+        return;
+    }
+    if (ui_->kind == Kind::WalletsOfCoin) {
+        const wallet::AssetInfo& info = wallet::assetInfo(ui_->asset);
+        for (const wallet::WalletEntry& entry : controller_->store().wallets) {
+            Line line;
+            line.wallet = entry.id;
+            line.asset = ui_->asset;
+            line.name = entry.label;
+            line.sub = entry.fromKeys ? trText(QStringLiteral("Public keys")) : trText(QStringLiteral("Seed"));
+            line.icon = nameIcon(entry.label);
+            line.holding = holdingOf(controller_, info.asset, entry.id);
+            line.note = noteOf(controller_, line.holding);
+            line.chosen = line.holding.watched;
+            lines.append(line);
+        }
+    } else if (ui_->kind == Kind::Coins) {
+        for (const wallet::AssetInfo& info : wallet::assets()) {
+            Line line;
+            line.asset = info.asset;
+            line.name = info.name;
+            line.sub = info.standard.isEmpty() ? info.symbol : QStringLiteral("%1 · %2").arg(info.symbol, info.standard);
+            line.icon = coinIcon(info);
+            line.holding = holdingOf(controller_, info.asset, ui_->wallet);
+            line.note = noteOf(controller_, line.holding);
+            line.chosen = line.holding.watched;
+            lines.append(line);
+        }
+    } else {
+        // One address: as it stands now, not as it stood when it was opened.
+        const wallet::WalletModel* model = controller_->model();
+        const wallet::AddressRow& opened = ui_->row;
+        const int position = model->find(opened.wallet, opened.network, opened.type, opened.account, opened.change, opened.index);
+        if (position >= 0) {
+            const wallet::AddressRow& row = model->at(position);
+            for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
+                const wallet::AssetInfo& info = wallet::assetInfo(asset);
+                Line line;
+                line.asset = asset;
+                line.name = info.name;
+                line.sub = info.standard.isEmpty() ? info.symbol : QStringLiteral("%1 · %2").arg(info.symbol, info.standard);
+                line.icon = coinIcon(info);
+                line.chosen = false;
+                Holding& h = line.holding;
+                h.asset = asset;
+                h.amount = row.amount(asset);
+                h.watched = true;
+                h.complete = row.checked;
+                h.pending = row.checked ? 0 : 1;
+                h.holders = h.holds() ? 1 : 0;
+                h.price = controller_->prices() ? controller_->prices()->usd(asset) : 0.0;
+                try {
+                    h.usd = h.amount.toDouble(info.decimals) * h.price;
+                } catch (const std::exception&) {
+                    h.readable = false;
+                }
+                line.note = noteOf(controller_, h);
+                lines.append(line);
+            }
+        }
+    }
+    double all = 0.0;
+    bool every = true;
+    for (const Line& line : std::as_const(lines)) {
+        all += line.holding.usd;
+        every = every && (!line.holding.holds() || line.holding.price > 0.0);
+    }
+    for (Line& line : lines) {
+        if (all > 0.0 && every && line.holding.watched)
+            line.share = line.holding.usd / all;
+    }
+    ui_->model->setLines(std::move(lines));
+    ui_->filter->linesChanged();
+    emit refreshed();
+}
+
+} // namespace app::ui

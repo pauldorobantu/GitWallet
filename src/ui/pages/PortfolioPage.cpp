@@ -1,11 +1,13 @@
-#include "ui/pages/OverviewPage.h"
+#include "ui/pages/PortfolioPage.h"
 
 #include "app/WalletController.h"
 #include "chain/Address.h"
 #include "chain/Amount.h"
+#include "core/SettingsRepo.h"
 #include "net/PriceFeed.h"
 #include "ui/Feedback.h"
 #include "ui/Figures.h"
+#include "ui/Holdings.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
@@ -15,6 +17,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QCheckBox>
 #include <QDate>
 #include <QDateTime>
 #include <QFormLayout>
@@ -31,7 +34,6 @@
 #include <QtNumeric>
 
 #include <algorithm>
-#include <exception>
 
 namespace app::ui {
 
@@ -45,18 +47,8 @@ constexpr int kAgeCheckMs = 60 * 1000;
 // A scan signals per address: the page follows that many times a second at most.
 constexpr int kRowsThrottleMs = 200;
 
-using figures::atLeast;
 using figures::dash;
-using figures::formatAmount;
 using figures::formatCount;
-using figures::formatUsd;
-
-// The card's second line: what the symbol stands for, and which tokens are counted:
-// those of this network's standard only.
-QString assetName(const wallet::AssetInfo& info)
-{
-    return info.standard.isEmpty() ? info.name : QStringLiteral("%1 · %2").arg(info.name, info.standard);
-}
 
 // Why a figure is not final yet: how many addresses have no answer, or, while
 // an account has no rows at all (not derived yet, or its key unreadable), just
@@ -107,7 +99,7 @@ void setServer(QLabel* label, const wallet::NetworkStatus& status)
 
 } // namespace
 
-OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
+PortfolioPage::PortfolioPage(WalletController* controller, QWidget* parent)
     : QWidget(parent)
     , controller_(controller)
 {
@@ -121,7 +113,7 @@ OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
     rowsTimer_ = new QTimer(this);
     rowsTimer_->setSingleShot(true);
     rowsTimer_->setInterval(kRowsThrottleMs);
-    connect(rowsTimer_, &QTimer::timeout, this, &OverviewPage::scheduleRefresh);
+    connect(rowsTimer_, &QTimer::timeout, this, &PortfolioPage::scheduleRefresh);
     if (wallet::WalletModel* model = controller_ ? controller_->model() : nullptr) {
         // How many balances still lack an answer: the model keeps the count.
         const auto rowsMoved = [this] {
@@ -130,7 +122,7 @@ OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
         };
         connect(model, &wallet::WalletModel::rowsAppended, this, rowsMoved);
         connect(model, &wallet::WalletModel::rowChanged, this, rowsMoved);
-        connect(model, &wallet::WalletModel::cleared, this, &OverviewPage::scheduleRefresh);
+        connect(model, &wallet::WalletModel::cleared, this, &PortfolioPage::scheduleRefresh);
     }
 
     if (controller_) {
@@ -138,13 +130,14 @@ OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
         // it at once, before it is shown, so its first layout already fits the
         // final texts (no stale labels, no row growing a frame late).
         connect(controller_, &WalletController::walletChanged, this, [this] {
+            table_->refresh();
             refreshView();
             showState();
         });
         connect(controller_, &WalletController::totalsChanged, this,
-                &OverviewPage::scheduleRefresh);
+                &PortfolioPage::scheduleRefresh);
         connect(controller_, &WalletController::statusChanged, this,
-                &OverviewPage::scheduleRefresh);
+                &PortfolioPage::scheduleRefresh);
     }
 
     // A price says how old it is, and the time it shows gains its date on another day,
@@ -154,14 +147,15 @@ OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
     auto* ageCheck = new QTimer(this);
     ageCheck->setTimerType(Qt::VeryCoarseTimer);
     ageCheck->setInterval(kAgeCheckMs);
-    connect(ageCheck, &QTimer::timeout, this, &OverviewPage::scheduleRefresh);
+    connect(ageCheck, &QTimer::timeout, this, &PortfolioPage::scheduleRefresh);
     ageCheck->start();
 
+    table_->refresh();
     refreshView();
     showState();
 }
 
-QWidget* OverviewPage::buildEmptyState()
+QWidget* PortfolioPage::buildEmptyState()
 {
     QWidget* empty = page::makeEmptyState(
         this, static_cast<int>(icon::Kind::Dashboard), QStringLiteral("No wallet yet"),
@@ -173,10 +167,10 @@ QWidget* OverviewPage::buildEmptyState()
     row->setSpacing(page::kToolbarSpacing);
     auto* manyButton = new QPushButton(QStringLiteral("Add many"), actions);
     manyButton->setToolTip(QStringLiteral("A list of seeds or public keys, pasted or from a file"));
-    connect(manyButton, &QPushButton::clicked, this, &OverviewPage::importManyRequested);
+    connect(manyButton, &QPushButton::clicked, this, &PortfolioPage::importManyRequested);
     auto* importButton = new QPushButton(QStringLiteral("Add wallet"), actions);
     importButton->setObjectName(QStringLiteral("primaryButton"));
-    connect(importButton, &QPushButton::clicked, this, &OverviewPage::importRequested);
+    connect(importButton, &QPushButton::clicked, this, &PortfolioPage::importRequested);
     row->addWidget(manyButton);
     row->addWidget(importButton);
 
@@ -193,48 +187,53 @@ QWidget* OverviewPage::buildEmptyState()
     return empty;
 }
 
-QWidget* OverviewPage::buildWalletState()
+QWidget* PortfolioPage::buildWalletState()
 {
     auto* host = new QWidget(this);
     auto* root = new QVBoxLayout(host);
     page::applyPageLayout(root);
 
-    // The grand total in the kit's dashboard figure (#statValue), and where
-    // the prices behind it come from.
-    const page::Section total = page::makeSection(host, QStringLiteral("Total balance"));
-    totalLabel_ = new QLabel(dash(), total.card);
-    totalLabel_->setObjectName(QStringLiteral("statValue"));
+    // The grand total, where the prices behind it come from, and what it is made of.
+    auto* hero = new QFrame(host);
+    hero->setObjectName(QStringLiteral("cardPanel"));
+    auto* heroColumn = new QVBoxLayout(hero);
+    heroColumn->setContentsMargins(page::kSectionPadX, page::kSectionPadY, page::kSectionPadX, page::kSectionPadY);
+    heroColumn->setSpacing(page::kToolbarSpacing);
+    auto* heroRow = new QHBoxLayout;
+    heroRow->setSpacing(page::kFormHSpacing);
+    auto* figures = new QVBoxLayout;
+    figures->setSpacing(2);
+    auto* title = new QLabel(QStringLiteral("Total balance"), hero);
+    setTone(title, Tone::Muted);
+    totalLabel_ = new QLabel(dash(), hero);
+    totalLabel_->setObjectName(QStringLiteral("heroValue"));
     totalLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    pricesLabel_ = new QLabel(dash(), total.card);
+    pricesLabel_ = new QLabel(dash(), hero);
+    pricesLabel_->setObjectName(QStringLiteral("portfolioCaption"));
+    pricesLabel_->setWordWrap(true);
     setTone(pricesLabel_, Tone::Muted);
-    total.body->addWidget(totalLabel_);
-    total.body->addWidget(pricesLabel_);
-    root->addWidget(total.card);
+    figures->addWidget(title);
+    figures->addWidget(totalLabel_);
+    figures->addWidget(pricesLabel_);
+    heroRow->addLayout(figures, 1);
+    auto* receive = new QPushButton(QStringLiteral("Receive"), hero);
+    receive->setObjectName(QStringLiteral("primaryButton"));
+    connect(receive, &QPushButton::clicked, this, &PortfolioPage::receiveRequested);
+    heroRow->addWidget(receive, 0, Qt::AlignTop);
+    heroColumn->addLayout(heroRow);
+    allocation_ = new AllocationBar(hero);
+    heroColumn->addWidget(allocation_);
+    root->addWidget(hero);
 
-    // One card per asset, in the display order of wallet::assets().
-    auto* cards = new QHBoxLayout;
-    cards->setContentsMargins(0, 0, 0, 0);
-    cards->setSpacing(page::kPageSpacing);
-    for (const wallet::AssetInfo& info : wallet::assets()) {
-        const page::Section card = page::makeSection(host, info.symbol, assetName(info));
-        auto* amount = new QLabel(dash(), card.card);
-        amount->setObjectName(QStringLiteral("statValue"));
-        amount->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        auto* usd = new QLabel(dash(), card.card);
-        setTone(usd, Tone::Muted);
-        // "≥ $1,234.56 · 297 addresses not checked yet" wraps in a narrow
-        // card instead of widening the row of cards past the window.
-        usd->setWordWrap(true);
-        card.body->addWidget(amount);
-        card.body->addWidget(usd);
-        card.body->addStretch(1); // top-aligned when a wrapped name makes a sibling taller
-        cards->addWidget(card.card, 1);
-        amountLabels_.append(amount);
-        usdLabels_.append(usd);
-    }
-    root->addLayout(cards);
+    table_ = new HoldingsTable(controller_, host);
+    table_->setObjectName(QStringLiteral("portfolioCoins"));
+    table_->showCoins();
+    root->addWidget(table_, 1);
+    connect(table_, &HoldingsTable::coinChosen, this, &PortfolioPage::coinChosen);
+    connect(table_, &HoldingsTable::refreshed, this, [this] { allocation_->setParts(table_->parts()); });
 
     const page::Section status = page::makeSection(host, QStringLiteral("Status"));
+    details_ = status.card;
     QFormLayout* form = page::addSectionForm(status);
     // Every value label starts with text, and the chip as a chip: rows laid
     // out for an empty, unstyled label grow once the first values arrive, one
@@ -258,10 +257,29 @@ QWidget* OverviewPage::buildWalletState()
         serverLabels_.append(addValueRow(QStringLiteral("%1 server").arg(network.name)));
     page::finishForms({form});
     root->addWidget(status.card);
-
-    root->addStretch(1); // keeps the action bar on the bottom edge
+    details_->hide();
 
     const page::ActionBar bar = page::makeActionBar(host);
+    hideZero_ = new QCheckBox(QStringLiteral("Hide zero balances"), bar.widget);
+    hideZero_->setObjectName(QStringLiteral("hideZero"));
+    hideZero_->setToolTip(QStringLiteral("A coin that holds nothing leaves this list. One nobody has answered for yet stays."));
+    hideZero_->setChecked(SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
+    table_->setHideZero(hideZero_->isChecked());
+    connect(hideZero_, &QCheckBox::toggled, this, [this](bool on) {
+        SettingsRepo().set(QStringLiteral("ui.hideZero"), on ? QStringLiteral("1") : QStringLiteral("0"));
+        table_->setHideZero(on);
+        refreshView();
+    });
+    bar.left->addWidget(hideZero_);
+    countLabel_ = page::makeBarCount(bar.widget);
+    bar.left->addWidget(countLabel_);
+    bar.left->addStretch(1);
+
+    detailsButton_ = new QPushButton(QStringLiteral("Details"), bar.widget);
+    detailsButton_->setCheckable(true);
+    detailsButton_->setToolTip(QStringLiteral("How the scan stands, and on which servers"));
+    connect(detailsButton_, &QPushButton::toggled, details_, &QWidget::setVisible);
+    bar.right->addWidget(detailsButton_);
     refreshButton_ = new QPushButton(QStringLiteral("Refresh"), bar.widget);
     refreshButton_->setToolTip(
         QStringLiteral("Fetch prices and read the balances that are not followed live, now."));
@@ -287,13 +305,19 @@ QWidget* OverviewPage::buildWalletState()
     return host;
 }
 
-void OverviewPage::showState()
+void PortfolioPage::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    hideZero_->setChecked(SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
+}
+
+void PortfolioPage::showState()
 {
     const bool hasWallet = controller_ && controller_->hasWallet();
     states_->setCurrentWidget(hasWallet ? walletState_ : emptyState_);
 }
 
-void OverviewPage::scheduleRefresh()
+void PortfolioPage::scheduleRefresh()
 {
     // A scan emits these signals for every address it checks; the labels only
     // need the state at the end of each burst, so one repaint per event-loop
@@ -307,34 +331,28 @@ void OverviewPage::scheduleRefresh()
     });
 }
 
-void OverviewPage::refreshView()
+void PortfolioPage::refreshView()
 {
     const QDate today = QDate::currentDate();
     if (!controller_ || !controller_->hasWallet())
         return;
 
     const wallet::WalletModel* model = controller_->model();
-    const net::PriceFeed* prices = controller_->prices();
 
     // An account whose first row does not exist yet has not been derived (or its key
     // could not be read): no balance of that network is known.
     const QList<wallet::AccountKey> accounts = controller_->store().allAccounts();
-    QSet<wallet::Network> watched;
     QSet<wallet::Network> missing;
     for (const wallet::AccountKey& account : accounts) {
         for (const wallet::NetworkInfo& network : wallet::networks()) {
-            if (!account.serves(network.network))
-                continue;
-            watched.insert(network.network);
-            if (!model || model->find(account.wallet, network.network, account.type, account.account, 0, 0) < 0)
+            if (account.serves(network.network) && model && model->find(account.wallet, network.network, account.type, account.account, 0, 0) < 0)
                 missing.insert(network.network);
         }
     }
 
-    // The scan state, per network. The address limit is reported for the wallet as a
-    // whole, so it holds back every figure. Figures of a network from an earlier round
-    // (a server on another chain, a round that could not answer every address) say
-    // since when, or, before any round answered in full, why not.
+    // The scan state, per network. Figures of a network from an earlier round (a server
+    // on another chain, a round that could not answer every address) say since when, or,
+    // before any round answered in full, why not.
     QHash<wallet::Network, wallet::NetworkStatus> states;
     for (const wallet::NetworkInfo& network : wallet::networks())
         states.insert(network.network, controller_->networkStatus(network.network));
@@ -342,12 +360,6 @@ void OverviewPage::refreshView()
     const bool saved = controller_->showingSaved();
     const bool loading = controller_->loadingSaved(); // part of what the database kept
     const bool unread = controller_->hasUnreadKeys(); // a key's coins are in no figure
-    const auto asOfText = [&](const wallet::NetworkStatus& st) {
-        if (st.balancesAt.isValid())
-            return trText(QStringLiteral("as of %1")).arg(shownTime(st.balancesAt, today));
-        return st.wrongChain ? trText(QStringLiteral("server on another chain"))
-                             : trText(QStringLiteral("lookups failing"));
-    };
     QString staleCaption; // under the total, and on the chip for a failed refresh
     bool anyWrongChain = false;
     bool anyFailing = false;
@@ -370,94 +382,10 @@ void OverviewPage::refreshView()
         }
     }
 
-    // A card, and the total, read plain only once every balance behind them
-    // has answered: a "0" for an address nobody has answered for (a scan in
-    // progress, every endpoint failing) would claim the funds are
-    // gone. Until then they show what is known as a lower bound ("≥"), or "—"
-    // while nothing is, and say how many addresses are still unchecked; so
-    // too while the address limit leaves addresses unchecked. Figures that
-    // are known but may have moved since (a chain still scanning, figures from an
-    // earlier round) stay plain and say so. An asset with a
-    // balance but no price would make the total silently too low, so then it
-    // is not shown at all.
-    bool anyPrice = false;
-    bool totalComplete = true;
-    bool anyIncomplete = false;
-    const QList<wallet::AssetInfo>& list = wallet::assets();
-    for (qsizetype i = 0; i < list.size() && i < amountLabels_.size(); ++i) {
-        const wallet::AssetInfo& info = list.at(i);
-        const wallet::NetworkInfo& network = wallet::networkInfo(info.network);
-        const wallet::NetworkStatus& st = states[info.network];
-        // No wallet has a key on this chain: nothing was looked at, so no zero.
-        if (!watched.contains(info.network)) {
-            amountLabels_.at(i)->setText(dash());
-            usdLabels_.at(i)->setText(trText(QStringLiteral("No wallet has a key on %1")).arg(network.name));
-            continue;
-        }
-        const double price = prices ? prices->usd(info.asset) : 0.0;
-        const int pending = model ? model->uncheckedOn(info.network) : 0;
-        const bool unchecked = pending > 0 || missing.contains(info.network);
-        const bool incomplete = unchecked || limit || loading || unread;
-        QString amountText = dash();
-        QString usdText = dash();
-        bool hasBalance = false;
-        try {
-            const chain::Amount amount = model ? model->total(info.asset) : chain::Amount();
-            hasBalance = !amount.isZero();
-            if (!incomplete || hasBalance) {
-                const QString shown = formatAmount(amount, info);
-                amountText = incomplete ? atLeast(shown) : shown;
-                if (price > 0) {
-                    const QString usd = formatUsd(controller_->usdValue(info.asset));
-                    usdText = incomplete ? atLeast(usd) : usd;
-                }
-            }
-        } catch (const std::exception&) {
-            // chain:: reports a value it cannot convert by throwing: the card
-            // shows "—" and the total does not pretend to include it.
-            totalComplete = false;
-        }
-        // Under the figure: its dollar value, then why the figure is not final
-        // (what is still unchecked), then how current the known part is.
-        QStringList parts;
-        if (usdText != dash())
-            parts << usdText;
-        if (unchecked)
-            parts << uncheckedNote(pending, parts.isEmpty());
-        if (limit)
-            parts << trText(QStringLiteral("address limit reached"));
-        if (st.wrongChain || st.failing)
-            parts << asOfText(st);
-        else if (st.connecting && st.balancesAt.isValid())
-            parts << asOfText(st); // no server to say what has moved since
-        else if (!incomplete && st.scanning)
-            parts << (saved ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning")));
-        QString usdLine = parts.isEmpty() ? dash() : parts.join(QStringLiteral(" · "));
-        if (!usdLine.isEmpty() && usdLine.at(0).isLower())
-            usdLine[0] = usdLine.at(0).toUpper(); // a note that opens the line
-        anyIncomplete = anyIncomplete || incomplete;
-        amountLabels_.at(i)->setText(amountText);
-        usdLabels_.at(i)->setText(usdLine);
-        if (price > 0)
-            anyPrice = true;
-        else if (hasBalance)
-            totalComplete = false;
-    }
-
-    QString totalText = dash();
-    if (anyPrice && totalComplete) {
-        try {
-            const double total = controller_->totalUsd();
-            // While nothing is known yet the total stays "—", never "$0.00".
-            if (!anyIncomplete)
-                totalText = formatUsd(total);
-            else if (total > 0.0)
-                totalText = atLeast(formatUsd(total));
-        } catch (const std::exception&) {
-            totalText = dash();
-        }
-    }
-    totalLabel_->setText(totalText);
+    const ScopeTotal total = totalOf(controller_);
+    totalLabel_->setText(total.text());
+    allocation_->setParts(table_->parts());
+    const bool anyIncomplete = !total.complete;
 
     // Under the total: where the figures come from, why they are not final yet, if they
     // are not, then the prices and how old those are.
@@ -509,7 +437,8 @@ void OverviewPage::refreshView()
         setChip(scanLabel_, trText(QStringLiteral("Up to date")), Tone::Success);
     const int derived = model ? model->size() : 0;
     const int checked = model ? model->checkedCount() : 0;
-    walletsLabel_->setText(formatCount(int(controller_->store().wallets.size())));
+    const int walletCount = int(controller_->store().wallets.size());
+    walletsLabel_->setText(formatCount(walletCount));
     // Until the servers have answered, what a row says it knows is from an earlier run.
     scannedLabel_->setText(saved ? trText(QStringLiteral("%1 saved")).arg(formatCount(derived))
                            : checked >= derived
@@ -521,6 +450,9 @@ void OverviewPage::refreshView()
     const QList<wallet::NetworkInfo>& networkList = wallet::networks();
     for (qsizetype i = 0; i < networkList.size() && i < serverLabels_.size(); ++i)
         setServer(serverLabels_.at(i), states[networkList.at(i).network]);
+
+    countLabel_->setText(trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
+                             .arg(formatCount(walletCount), formatCount(model ? model->fundedCount() : 0), formatCount(derived)));
 }
 
 } // namespace app::ui

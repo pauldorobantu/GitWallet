@@ -363,6 +363,10 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
                 a.insert(QStringLiteral("network"), networkInfo(k.network).id);
             a.insert(QStringLiteral("account"), static_cast<qint64>(k.account));
             a.insert(QStringLiteral("xpub"), k.xpub);
+            if (k.issued > 0) {
+                a.insert(QStringLiteral("issued"), static_cast<qint64>(k.issued));
+                a.insert(QStringLiteral("issuedFrom"), static_cast<qint64>(k.issuedFrom));
+            }
             list.append(a);
         }
         for (const QJsonValue& kept : w.keptAccounts)
@@ -428,6 +432,9 @@ bool readAccounts(const QJsonValue& value, quint32 wallet, bool keepUnknown, QLi
         if (!readAccountIndex(o.value(QStringLiteral("account")), &k.account))
             return fail(why, QStringLiteral("an account has an invalid number"));
         k.xpub = o.value(QStringLiteral("xpub")).toString();
+        if ((o.contains(QStringLiteral("issued")) && !readAccountIndex(o.value(QStringLiteral("issued")), &k.issued))
+            || (o.contains(QStringLiteral("issuedFrom")) && !readAccountIndex(o.value(QStringLiteral("issuedFrom")), &k.issuedFrom)))
+            return fail(why, QStringLiteral("an account has an invalid number"));
         out->append(k);
     }
     return true;

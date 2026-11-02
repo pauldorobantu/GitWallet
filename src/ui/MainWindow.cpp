@@ -5,6 +5,7 @@
 #include "ui/Feedback.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
+#include "ui/Holdings.h"
 #include "ui/PageKit.h"
 #include "ui/SideNav.h"
 #include "ui/ThemeManager.h"
@@ -15,9 +16,12 @@
 #include "ui/pages/WalletsPage.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
-#include "ui/pages/OverviewPage.h"
+#include "ui/pages/HoldingsPage.h"
+#include "ui/pages/PortfolioPage.h"
+#include "ui/pages/ReceivePage.h"
 #include "ui/pages/SettingsPage.h"
 #include "wallet/Types.h"
+#include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
 #include <QDateTime>
@@ -48,7 +52,7 @@ namespace app::ui {
 namespace {
 
 // Page ids = the stacked-widget indices.
-enum PageId { PageOverview = 0, PageWallets, PageAddresses, PageHistory, PageSend, PageSettings };
+enum PageId { PagePortfolio = 0, PageWallets, PageAddresses, PageHistory, PageReceive, PageSend, PageSettings, PageHoldings };
 
 // What a notice depends on besides the wallet (Notice::depends). It goes when
 // one of them changes: the scanners then restart and report again whatever
@@ -247,56 +251,108 @@ void MainWindow::buildUi()
 
     nav_ = new SideNav(this);
     nav_->addSection(QStringLiteral("Wallet"));
-    nav_->addItem(PageOverview, QStringLiteral("Overview"), int(icon::Kind::Dashboard));
+    nav_->addItem(PagePortfolio, QStringLiteral("Portfolio"), int(icon::Kind::Dashboard));
     nav_->addItem(PageWallets, QStringLiteral("Wallets"), int(icon::Kind::Key));
     nav_->addItem(PageAddresses, QStringLiteral("Addresses"), int(icon::Kind::ListRows));
     nav_->addItem(PageHistory, QStringLiteral("History"), int(icon::Kind::Traffic));
+    nav_->addItem(PageReceive, QStringLiteral("Receive"), int(icon::Kind::ImportDown));
     nav_->addItem(PageSend, QStringLiteral("Send"), int(icon::Kind::ExternalLink));
     nav_->addItem(PageSettings, QStringLiteral("Settings"), int(icon::Kind::Settings));
     body->addWidget(nav_);
 
     stack_ = new QStackedWidget(this);
-    overview_ = new OverviewPage(controller_, stack_);
+    portfolio_ = new PortfolioPage(controller_, stack_);
     wallets_ = new WalletsPage(controller_, stack_);
     addresses_ = new AddressesPage(controller_, stack_);
     history_ = new HistoryPage(controller_, stack_);
+    receive_ = new ReceivePage(controller_, stack_);
     settings_ = new SettingsPage(controller_, stack_);
-    stack_->addWidget(overview_);
+    holdings_ = new HoldingsPage(controller_, stack_);
+    stack_->addWidget(portfolio_);
     stack_->addWidget(wallets_);
     stack_->addWidget(addresses_);
     stack_->addWidget(history_);
+    stack_->addWidget(receive_);
     // Spending comes once the history has been verified against other wallets and block explorers.
     stack_->addWidget(page::makeEmptyState(
         stack_, int(icon::Kind::ExternalLink), QStringLiteral("Send"),
         QStringLiteral("Consolidating funds is added in the next stage, once balances are verified.")));
     stack_->addWidget(settings_);
+    stack_->addWidget(holdings_);
 
-    // The notice bar sits above whichever page is open.
+    // The notice bar sits above whichever page is open, and where the reader is under it.
     auto* column = new QVBoxLayout;
     column->setContentsMargins(0, 0, 0, 0);
     column->setSpacing(0);
     column->addWidget(buildNoticeBar());
+    placeBar_ = new PlaceBar(controller_, this);
+    column->addWidget(placeBar_);
     column->addWidget(stack_, 1);
     body->addLayout(column, 1);
 
     root_->addLayout(body, 1);
 
-    connect(overview_, &OverviewPage::importRequested, this, [this] { openImportDialog(false); });
-    connect(overview_, &OverviewPage::importManyRequested, this, [this] { openImportDialog(true); });
+    connect(portfolio_, &PortfolioPage::importRequested, this, [this] { openImportDialog(false); });
+    connect(portfolio_, &PortfolioPage::importManyRequested, this, [this] { openImportDialog(true); });
+    connect(portfolio_, &PortfolioPage::coinChosen, this, [this](wallet::Asset asset) {
+        Place place;
+        place.root = Place::Root::Portfolio;
+        place.asset = asset;
+        goTo(place, Place::Tab::Holdings);
+    });
+    connect(portfolio_, &PortfolioPage::receiveRequested, this, [this] { openPage(PageReceive); });
+    connect(holdings_->table(), &HoldingsTable::coinChosen, this, [this](wallet::Asset asset) {
+        Place place = placeBar_->place();
+        place.asset = asset;
+        goTo(place, Place::Tab::Addresses);
+    });
+    connect(holdings_->table(), &HoldingsTable::walletChosen, this, [this](quint32 wallet) {
+        Place place = placeBar_->place();
+        place.wallet = wallet;
+        goTo(place, Place::Tab::Addresses);
+    });
+    connect(placeBar_, &PlaceBar::placeChosen, this, [this](const Place& place) { goTo(place, place.firstTab()); });
+    connect(placeBar_, &PlaceBar::tabChosen, this, [this](Place::Tab tab) { goTo(placeBar_->place(), tab); });
+    connect(placeBar_, &PlaceBar::rootChosen, this, &MainWindow::openRoot);
+    connect(placeBar_, &PlaceBar::receiveRequested, this, [this](const Place& place) {
+        openPage(PageReceive);
+        receive_->showFor(place.wallet, place.asset);
+    });
+    connect(placeBar_, &PlaceBar::showAddressQr, this, [this](const Place& place) {
+        if (!place.address)
+            return;
+        openPage(PageReceive);
+        receive_->showAddress(*place.address);
+    });
+    connect(placeBar_, &PlaceBar::labelRequested, this, &MainWindow::editAddressLabel);
+    connect(receive_, &ReceivePage::openAddressRequested, this, [this](const wallet::AddressRow& row) {
+        Place place;
+        place.root = Place::Root::Addresses;
+        place.address = row;
+        goTo(place, Place::Tab::Holdings);
+    });
     connect(wallets_, &WalletsPage::addRequested, this, [this] { openImportDialog(false); });
     connect(wallets_, &WalletsPage::addManyRequested, this, [this] { openImportDialog(true); });
-    connect(wallets_, &WalletsPage::showAddressesRequested, this, [this](quint32 wallet) {
-        addresses_->showWallet(wallet);
-        openPage(PageAddresses);
-    });
-    connect(wallets_, &WalletsPage::showHistoryRequested, this, [this](quint32 wallet) {
-        history_->showWallet(wallet);
-        openPage(PageHistory);
-    });
-    connect(addresses_, &AddressesPage::showHistoryRequested, this, [this](wallet::Network network, const QString& scripthash, const QString& address) {
-        history_->showAddress(network, scripthash, address);
-        openPage(PageHistory);
-    });
+    const auto walletPlace = [](quint32 wallet) {
+        Place place;
+        place.root = Place::Root::Wallets;
+        place.wallet = wallet;
+        return place;
+    };
+    connect(wallets_, &WalletsPage::openRequested, this, [this, walletPlace](quint32 wallet) { goTo(walletPlace(wallet), Place::Tab::Holdings); });
+    connect(wallets_, &WalletsPage::showAddressesRequested, this, [this, walletPlace](quint32 wallet) { goTo(walletPlace(wallet), Place::Tab::Addresses); });
+    connect(wallets_, &WalletsPage::showHistoryRequested, this, [this, walletPlace](quint32 wallet) { goTo(walletPlace(wallet), Place::Tab::History); });
+    const auto addressPlace = [this](const wallet::AddressRow& row) {
+        // Down from where the reader is, if that is on the way to it.
+        Place place = placeBar_->isVisibleTo(this) ? placeBar_->place() : Place();
+        if (!placeBar_->isVisibleTo(this))
+            place.root = Place::Root::Addresses;
+        place.address = row;
+        return place;
+    };
+    connect(addresses_, &AddressesPage::openAddressRequested, this, [this, addressPlace](const wallet::AddressRow& row) { goTo(addressPlace(row), Place::Tab::Holdings); });
+    connect(addresses_, &AddressesPage::showHistoryRequested, this, [this, addressPlace](const wallet::AddressRow& row) { goTo(addressPlace(row), Place::Tab::History); });
+    connect(controller_, &WalletController::walletChanged, this, &MainWindow::afterWalletChange);
 
     connect(title_, &TitleBar::minimised, this, &QWidget::showMinimized);
     connect(title_, &TitleBar::maximised, this, [this] {
@@ -309,12 +365,11 @@ void MainWindow::buildUi()
             [](const QString& code) { LanguageManager::instance()->setLanguage(code); });
     connect(title_, &TitleBar::settingsRequested, this, [this] { openPage(PageSettings); });
 
-    connect(nav_, &SideNav::navigate, this,
-            [this](int pageId, int) { stack_->setCurrentIndex(pageId); });
+    connect(nav_, &SideNav::navigate, this, [this](int pageId, int) { openPage(pageId); });
     connect(nav_, &SideNav::toggleRequested, this,
             [this] { nav_->setCollapsed(!nav_->isCollapsed()); });
 
-    nav_->select(PageOverview);
+    nav_->select(PagePortfolio);
 }
 
 QWidget* MainWindow::buildNoticeBar()
@@ -362,10 +417,12 @@ QWidget* MainWindow::buildNoticeBar()
 void MainWindow::showPage(const QString& name)
 {
     static const QHash<QString, int> ids = {
-        {QStringLiteral("overview"), PageOverview},
+        {QStringLiteral("portfolio"), PagePortfolio},
+        {QStringLiteral("overview"), PagePortfolio},
         {QStringLiteral("wallets"), PageWallets},
         {QStringLiteral("addresses"), PageAddresses},
         {QStringLiteral("history"), PageHistory},
+        {QStringLiteral("receive"), PageReceive},
         {QStringLiteral("send"), PageSend},
         {QStringLiteral("settings"), PageSettings},
     };
@@ -376,9 +433,97 @@ void MainWindow::showPage(const QString& name)
 
 void MainWindow::openPage(int pageId)
 {
+    leavePlace();
     // SideNav::select() only moves the highlight; the page is switched here.
     nav_->select(pageId);
     stack_->setCurrentIndex(pageId);
+    if (pageId == PageReceive)
+        receive_->showFor(0, std::nullopt); // what is next, rather than the one last looked at
+}
+
+void MainWindow::leavePlace()
+{
+    if (!placeBar_->isVisibleTo(this))
+        return;
+    placeBar_->hide();
+    addresses_->clearPlace();
+    history_->clearPlace();
+}
+
+void MainWindow::openRoot(Place::Root root)
+{
+    switch (root) {
+    case Place::Root::Portfolio: openPage(PagePortfolio); return;
+    case Place::Root::Wallets: openPage(PageWallets); return;
+    case Place::Root::Addresses: openPage(PageAddresses); return;
+    }
+}
+
+void MainWindow::goTo(Place place, Place::Tab tab)
+{
+    // One wallet: a step through it says nothing.
+    const QList<wallet::WalletEntry>& wallets = controller_->store().wallets;
+    if (place.asset && place.wallet == 0 && wallets.size() == 1) {
+        place.wallet = wallets.first().id;
+        place.onlyWallet = true;
+    }
+    if ((tab == Place::Tab::Holdings && !place.hasHoldings()) || (tab == Place::Tab::Addresses && !place.hasAddressesTab()))
+        tab = place.firstTab();
+
+    switch (place.root) {
+    case Place::Root::Portfolio: nav_->select(PagePortfolio); break;
+    case Place::Root::Wallets: nav_->select(PageWallets); break;
+    case Place::Root::Addresses: nav_->select(PageAddresses); break;
+    }
+    // Each narrowed as it comes up, and first, so that what is left of the last place never shows.
+    switch (tab) {
+    case Place::Tab::Holdings:
+        if (place.address)
+            holdings_->table()->showAddress(*place.address);
+        else if (place.asset)
+            holdings_->table()->showWallets(*place.asset);
+        else
+            holdings_->table()->showCoins(place.wallet);
+        stack_->setCurrentWidget(holdings_);
+        break;
+    case Place::Tab::Addresses:
+        addresses_->showPlace(place.wallet, place.asset);
+        stack_->setCurrentWidget(addresses_);
+        break;
+    case Place::Tab::History:
+        if (place.address)
+            history_->showPlace(place.address->wallet, place.address->network, place.address->scripthash, place.address->address);
+        else
+            history_->showPlace(place.wallet, place.network(), QString(), QString());
+        stack_->setCurrentWidget(history_);
+        break;
+    }
+    placeBar_->showPlace(place, tab);
+}
+
+void MainWindow::afterWalletChange()
+{
+    if (!placeBar_->isVisibleTo(this))
+        return;
+    Place place = placeBar_->place();
+    const wallet::WalletStore& store = controller_->store();
+    const bool walletGone = place.wallet != 0 && !store.find(place.wallet);
+    const bool addressGone = place.address && !store.find(place.address->wallet);
+    if (walletGone || addressGone) {
+        openRoot(place.root);
+        return;
+    }
+    // Its name may have changed; one wallet may have become two, or the reverse.
+    if (place.onlyWallet && store.wallets.size() != 1) {
+        place.onlyWallet = false;
+        goTo(place, placeBar_->tab());
+    }
+    placeBar_->showPlace(placeBar_->place(), placeBar_->tab());
+}
+
+void MainWindow::editAddressLabel(const QString& address)
+{
+    addresses_->editLabel(address);
 }
 
 void MainWindow::openImportDialog(bool many)

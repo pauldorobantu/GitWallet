@@ -99,6 +99,9 @@ QString readAsset(const QJsonObject& o, const NetworkInfo& network, bool token, 
     out->dollar = o.value(QLatin1String("dollar")).toBool();
     out->contract = o.value(QLatin1String("contract")).toString();
     out->maxSupply = o.value(QLatin1String("maxSupply")).toDouble();
+    const QJsonObject icon = o.value(QLatin1String("icon")).toObject();
+    out->iconColor = icon.value(QLatin1String("color")).toString();
+    out->iconGlyph = icon.value(QLatin1String("glyph")).toString();
     const QJsonObject prices = o.value(QLatin1String("prices")).toObject();
     out->defillamaId = prices.value(QLatin1String("defillama")).toString();
     out->coingeckoId = prices.value(QLatin1String("coingecko")).toString();

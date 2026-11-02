@@ -5,6 +5,7 @@
 #include <QList>
 #include <QWidget>
 
+class QCheckBox;
 class QLabel;
 class QPushButton;
 class QStackedLayout;
@@ -16,26 +17,31 @@ class WalletController;
 
 namespace app::ui {
 
-// The Overview page. Without a wallet: an empty state with an "Add wallet" primary
-// button and "Add many" beside it (importRequested, importManyRequested). With
-// wallets: the grand total in USD,
-// one card per asset (BTC, ETH, USDT, USDC: amount in its own unit + USD), the
-// scan progress and when the prices were last updated, and a Refresh action in
-// the bottom action bar. A figure reads plain only once every balance behind it
-// has answered; until then it reads "—" (nothing known yet) or "≥ X" (what is
-// known so far), next to how many addresses are still unchecked (or that the
-// address limit leaves some unchecked). Figures from an earlier round (a server on
-// another chain, a refresh failing) say since when, and so do those the database kept,
-// until the servers have answered.
-class OverviewPage : public QWidget
+class AllocationBar;
+class HoldingsTable;
+
+// The page the app opens on. Without a wallet: an empty state with an "Add wallet" primary button
+// and "Add many" beside it (importRequested, importManyRequested). With wallets: the grand total in
+// USD and what it is made of, then one row per coin, which opens to that coin. A figure reads plain
+// only once every balance behind it has answered; until then it reads "—" (nothing known yet) or
+// "≥ X" (what is known so far), and the line under the total says why. How the scan stands and on
+// which servers is under Details, as is usual: detail stays hidden until asked for.
+class PortfolioPage : public QWidget
 {
     Q_OBJECT
 public:
-    explicit OverviewPage(WalletController* controller, QWidget* parent = nullptr);
+    explicit PortfolioPage(WalletController* controller, QWidget* parent = nullptr);
+
+    HoldingsTable* table() const { return table_; }
 
 signals:
     void importRequested();
     void importManyRequested();
+    void coinChosen(wallet::Asset asset);
+    void receiveRequested();
+
+protected:
+    void showEvent(QShowEvent* event) override; // the box follows the one on the pages below
 
 private:
     QWidget* buildEmptyState();
@@ -50,8 +56,12 @@ private:
     QWidget* walletState_ = nullptr;
     QLabel* totalLabel_ = nullptr;
     QLabel* pricesLabel_ = nullptr; // under the total: why it is not final yet, then the prices
-    QList<QLabel*> amountLabels_; // one per wallet::assets() entry, in that order
-    QList<QLabel*> usdLabels_;
+    AllocationBar* allocation_ = nullptr;
+    HoldingsTable* table_ = nullptr;
+    QCheckBox* hideZero_ = nullptr;
+    QLabel* countLabel_ = nullptr;
+    QWidget* details_ = nullptr;
+    QPushButton* detailsButton_ = nullptr;
     // Chip: "Connecting…" / "Address limit reached" / "Ethereum endpoint answers for
     // another network" / "ETH balances from 14:02" / "Scanning…" / "Incomplete" / "Up to date"
     QLabel* scanLabel_ = nullptr;

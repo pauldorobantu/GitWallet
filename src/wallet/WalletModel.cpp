@@ -34,6 +34,9 @@ void WalletModel::resetCounts()
     walletCounts_.clear();
     rowsOn_.clear();
     uncheckedOn_.clear();
+    walletUnchecked_.clear();
+    holders_.clear();
+    walletHolders_.clear();
 }
 
 void WalletModel::clear()
@@ -218,6 +221,23 @@ int WalletModel::uncheckedOn(Network network) const
     return uncheckedOn_.value(network);
 }
 
+int WalletModel::uncheckedOn(Network network, quint32 wallet) const
+{
+    const auto own = walletUnchecked_.constFind(wallet);
+    return own == walletUnchecked_.cend() ? 0 : own->value(network);
+}
+
+int WalletModel::holders(Asset a) const
+{
+    return holders_.value(a);
+}
+
+int WalletModel::holders(Asset a, quint32 wallet) const
+{
+    const auto own = walletHolders_.constFind(wallet);
+    return own == walletHolders_.cend() ? 0 : own->value(a);
+}
+
 void WalletModel::addLookups(const AddressRow& row, int index)
 {
     // Account rows have no scripthash; an empty key would make every one of them collide.
@@ -255,6 +275,7 @@ void WalletModel::countRow(const AddressRow& row, int sign)
         own.checked += sign;
     } else {
         uncheckedOn_[row.network] += sign;
+        walletUnchecked_[row.wallet][row.network] += sign;
     }
 }
 
@@ -265,6 +286,8 @@ bool WalletModel::addToTotals(const AddressRow& row)
         holds = true;
         totals_[asset] += amount;
         walletTotals_[row.wallet][asset] += amount;
+        ++holders_[asset];
+        ++walletHolders_[row.wallet][asset];
     });
     return holds;
 }
@@ -276,6 +299,8 @@ bool WalletModel::takeFromTotals(const AddressRow& row)
         holds = true;
         totals_[asset] -= amount;
         walletTotals_[row.wallet][asset] -= amount;
+        --holders_[asset];
+        --walletHolders_[row.wallet][asset];
     });
     return holds;
 }

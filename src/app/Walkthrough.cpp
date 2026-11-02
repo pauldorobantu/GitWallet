@@ -5,8 +5,13 @@
 #include "ui/MainWindow.h"
 #include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/HistoryTableModel.h"
+#include "ui/Holdings.h"
+#include "ui/PlaceBar.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
+#include "ui/pages/HoldingsPage.h"
+#include "ui/pages/PortfolioPage.h"
+#include "ui/pages/ReceivePage.h"
 #include "ui/pages/SettingsPage.h"
 #include "ui/pages/WalletsPage.h"
 #include "wallet/History.h"
@@ -17,6 +22,7 @@
 #include <QAbstractButton>
 #include <QAbstractItemModel>
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDialog>
@@ -29,9 +35,12 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QScreen>
 #include <QSpinBox>
+#include <QStackedWidget>
+#include <QTabBar>
 #include <QTableView>
 #include <QTableWidget>
 #include <QTimer>
@@ -88,6 +97,27 @@ QString walletCell(QTableView* table, const QString& name, const QString& title)
         }
     }
     return {};
+}
+
+// A real click on a row: what it does is up to its table.
+void clickRow(QTableView* view, int row)
+{
+    if (!view || row < 0)
+        return;
+    const QPoint at = view->visualRect(view->model()->index(row, 0)).center();
+    QMouseEvent press(QEvent::MouseButtonPress, at, view->viewport()->mapToGlobal(at), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(view->viewport(), &press);
+    QMouseEvent release(QEvent::MouseButtonRelease, at, view->viewport()->mapToGlobal(at), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(view->viewport(), &release);
+}
+
+int rowNamed(const QTableView* view, const QString& name)
+{
+    for (int row = 0; view && row < view->model()->rowCount(); ++row) {
+        if (view->model()->index(row, 0).data().toString() == name)
+            return row;
+    }
+    return -1;
 }
 
 template <typename T>
@@ -250,6 +280,18 @@ void Walkthrough::buildSteps()
     auto historyBook = [controller]() -> wallet::HistoryBook* { return controller()->histories().first()->book(); };
     auto historyDone = [controller] { return !controller()->histories().first()->progress().working(); };
     auto labelledTx = std::make_shared<chain::Hash256>();
+    auto coinTable = [this]() -> QTableView* { return window_->findChild<ui::PortfolioPage*>()->table()->view(); };
+    auto placeTable = [this]() -> QTableView* { return window_->findChild<ui::HoldingsPage*>()->table()->view(); };
+    auto receivePage = [this]() -> ui::ReceivePage* { return window_->findChild<ui::ReceivePage*>(); };
+    auto path = [this] { return window_->placeBar()->pathTexts(); };
+    auto placeTabs = [this] {
+        QStringList out;
+        const auto* tabs = window_->placeBar()->findChild<QTabBar*>(QStringLiteral("placeTabs"));
+        for (int i = 0; tabs && i < tabs->count(); ++i)
+            out << tabs->tabText(i);
+        return out;
+    };
+    auto shownPage = [this] { return window_->findChild<QStackedWidget*>()->currentWidget(); };
     auto confirmBox = [this]() -> QMessageBox* {
         for (QMessageBox* box : window_->findChildren<QMessageBox*>())
             if (box->isVisible()) return box;
@@ -277,7 +319,7 @@ void Walkthrough::buildSteps()
          [this, controller] {
              expect(!controller()->hasWallet(), QStringLiteral("first start: no wallet"));
              expect(findButton(window_, QStringLiteral("Add wallet")) != nullptr,
-                    QStringLiteral("the Overview offers \"Add wallet\""));
+                    QStringLiteral("the Portfolio offers \"Add wallet\""));
              expect(findButton(window_, QStringLiteral("Add many")) != nullptr,
                     QStringLiteral("and \"Add many\" beside it"));
              const QRect room = QGuiApplication::primaryScreen()->availableGeometry();
@@ -500,10 +542,203 @@ void Walkthrough::buildSteps()
              }
          },
          nullptr},
+        // The way the wallets people know are read: a total, a list that opens downward, and a path.
+        {QStringLiteral("portfolio"),
+         [this] {
+             window_->showPage(QStringLiteral("portfolio"));
+             if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")))
+                 hide->setChecked(false);
+         },
+         nullptr, 1000,
+         [this, coinTable, controller] {
+             expect(coinTable()->model()->rowCount() == wallet::assets().size(), QStringLiteral("the Portfolio has a row per coin"));
+             auto* total = window_->findChild<QLabel*>(QStringLiteral("heroValue"));
+             expect(total && !total->text().isEmpty() && total->text() != QStringLiteral("—") && !total->text().startsWith(QStringLiteral("≥")),
+                    QStringLiteral("with the whole total on top (%1)").arg(total ? total->text() : QString()));
+             expect(!window_->placeBar()->isVisible(), QStringLiteral("and no path above it"));
+             expect(findButton(window_, QStringLiteral("Receive")) != nullptr, QStringLiteral("and Receive at hand"));
+             const int bitcoin = rowNamed(coinTable(), QStringLiteral("Bitcoin"));
+             expect(bitcoin >= 0, QStringLiteral("Bitcoin is one of them"));
+             double sum = 0.0;
+             for (const ui::AllocationBar::Part& part : window_->findChild<ui::PortfolioPage*>()->table()->parts())
+                 sum += part.usd;
+             expect(qAbs(sum - controller()->totalUsd()) < 0.01, QStringLiteral("what it is made of adds up to it"));
+         },
+         nullptr},
+        {QStringLiteral("coin"),
+         [coinTable] { clickRow(coinTable(), rowNamed(coinTable(), QStringLiteral("Bitcoin"))); },
+         nullptr, 1000,
+         [this, path, placeTabs, placeTable, shownPage, controller] {
+             expect(path() == QStringList({QStringLiteral("Portfolio"), QStringLiteral("Bitcoin")}), QStringLiteral("a coin opens, and the path says where: %1").arg(path().join(QLatin1Char('>'))));
+             expect(placeTabs() == QStringList({QStringLiteral("Wallets"), QStringLiteral("Addresses"), QStringLiteral("History")}), QStringLiteral("with its tabs"));
+             expect(shownPage() == window_->findChild<ui::HoldingsPage*>(), QStringLiteral("on what each wallet holds of it"));
+             expect(placeTable()->model()->rowCount() == controller()->store().wallets.size(), QStringLiteral("every wallet that has a key for it (%1)").arg(placeTable()->model()->rowCount()));
+             auto* title = window_->placeBar()->findChild<QLabel*>(QStringLiteral("placeTitle"));
+             expect(title && title->text().contains(QLatin1String("BTC")), QStringLiteral("with what they hold together on top (%1)").arg(title ? title->text() : QString()));
+         },
+         nullptr},
+        {QStringLiteral("coin-of-wallet"),
+         [placeTable] { clickRow(placeTable(), rowNamed(placeTable(), kFirstName)); },
+         nullptr, 1000,
+         [this, path, placeTabs, shownPage] {
+             expect(path() == QStringList({QStringLiteral("Portfolio"), QStringLiteral("Bitcoin"), kFirstName}), QStringLiteral("a wallet goes on down the path: %1").arg(path().join(QLatin1Char('>'))));
+             expect(placeTabs() == QStringList({QStringLiteral("Addresses"), QStringLiteral("History")}), QStringLiteral("to two tabs"));
+             expect(shownPage() == window_->findChild<ui::AddressesPage*>(), QStringLiteral("on its addresses"));
+         },
+         nullptr},
+        {QStringLiteral("coin-of-wallet-history"),
+         [this] {
+             auto* tabs = window_->placeBar()->findChild<QTabBar*>(QStringLiteral("placeTabs"));
+             tabs->setCurrentIndex(1);
+             emit tabs->tabBarClicked(1);
+         },
+         nullptr, 1000,
+         [this, shownPage, historyModel, controller] {
+             expect(shownPage() == window_->findChild<ui::HistoryPage*>(), QStringLiteral("its History tab is the History page"));
+             expect(historyModel()->filter().wallet == controller()->store().wallets.first().id, QStringLiteral("narrowed to the wallet"));
+         },
+         nullptr},
+        {QStringLiteral("path-back"),
+         [this] {
+             if (auto* link = findButton(window_->placeBar(), QStringLiteral("Bitcoin")))
+                 static_cast<QAbstractButton*>(link)->click();
+         },
+         nullptr, 1000,
+         [this, path, shownPage] {
+             expect(path() == QStringList({QStringLiteral("Portfolio"), QStringLiteral("Bitcoin")}), QStringLiteral("a step of the path goes back to it"));
+             expect(shownPage() == window_->findChild<ui::HoldingsPage*>(), QStringLiteral("on what it opened on"));
+         },
+         nullptr},
+        {QStringLiteral("token-history"),
+         [this] {
+             ui::Place place;
+             place.asset = wallet::findAsset(QStringLiteral("ethereum/usdt"))->asset;
+             window_->goTo(place, ui::Place::Tab::History);
+         },
+         nullptr, 1000,
+         [this, shownPage] {
+             expect(shownPage() == window_->findChild<ui::HistoryPage*>(), QStringLiteral("a token has a History tab too"));
+             expect(visibleText(shownPage()).contains(QLatin1String("Not read yet")), QStringLiteral("which says it is not read yet, rather than that nothing happened"));
+         },
+         nullptr},
+        {QStringLiteral("wallet-place"),
+         [this, controller] {
+             ui::Place place;
+             place.root = ui::Place::Root::Wallets;
+             place.wallet = controller()->store().wallets.first().id;
+             window_->goTo(place, ui::Place::Tab::Holdings);
+         },
+         nullptr, 1000,
+         [this, path, placeTabs, placeTable] {
+             expect(path() == QStringList({QStringLiteral("Wallets"), kFirstName}), QStringLiteral("the other way down starts at a wallet: %1").arg(path().join(QLatin1Char('>'))));
+             expect(placeTabs() == QStringList({QStringLiteral("Coins"), QStringLiteral("Addresses"), QStringLiteral("History")}), QStringLiteral("with its coins"));
+             expect(rowNamed(placeTable(), QStringLiteral("Bitcoin")) >= 0, QStringLiteral("Bitcoin among them"));
+         },
+         nullptr},
+        {QStringLiteral("wallet-coin"),
+         [placeTable] { clickRow(placeTable(), rowNamed(placeTable(), QStringLiteral("Bitcoin"))); },
+         nullptr, 1000,
+         [this, path, shownPage] {
+             expect(path() == QStringList({QStringLiteral("Wallets"), kFirstName, QStringLiteral("Bitcoin")}), QStringLiteral("and a coin after that: %1").arg(path().join(QLatin1Char('>'))));
+             expect(shownPage() == window_->findChild<ui::AddressesPage*>(), QStringLiteral("on the same addresses"));
+         },
+         nullptr},
+        {QStringLiteral("address-place"),
+         [this, controller] {
+             const wallet::WalletModel* m = controller()->model();
+             for (int i = 0; i < m->size(); ++i) {
+                 const wallet::AddressRow& row = m->at(i);
+                 if (row.isUtxo() || row.balances.isEmpty())
+                     continue;
+                 ui::Place place = window_->placeBar()->place();
+                 place.asset.reset();
+                 place.wallet = 0;
+                 place.root = ui::Place::Root::Addresses;
+                 place.address = row;
+                 window_->goTo(place, ui::Place::Tab::Holdings);
+                 return;
+             }
+             // The public seeds may have nothing on Ethereum at the moment.
+             if (m->size() > 0) {
+                 ui::Place place;
+                 place.root = ui::Place::Root::Addresses;
+                 place.address = m->at(0);
+                 window_->goTo(place, ui::Place::Tab::Holdings);
+             }
+         },
+         nullptr, 1000,
+         [this, placeTabs, placeTable] {
+             expect(placeTabs() == QStringList({QStringLiteral("Assets"), QStringLiteral("History")}), QStringLiteral("an address opens to its assets and its history"));
+             expect(placeTable()->model()->rowCount() >= 1, QStringLiteral("each asset in its own coin (%1)").arg(placeTable()->model()->rowCount()));
+             auto* detail = window_->placeBar()->findChild<QLabel*>(QStringLiteral("placeDetail"));
+             expect(detail && detail->text().contains(QLatin1String("m/")), QStringLiteral("with its path and wallet"));
+             expect(findButton(window_->placeBar(), QStringLiteral("Copy address")) != nullptr && findButton(window_->placeBar(), QStringLiteral("Show QR")) != nullptr, QStringLiteral("and what can be done with it"));
+         },
+         nullptr},
+        {QStringLiteral("receive"),
+         [this, walletsPage, receivePage, controller] {
+             window_->showPage(QStringLiteral("receive"));
+             receivePage()->showFor(controller()->store().wallets.first().id, wallet::findAsset(QStringLiteral("bitcoin/btc"))->asset);
+         },
+         nullptr, 1000,
+         [this, receivePage, controller] {
+             const quint32 id = controller()->store().wallets.first().id;
+             const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
+             const wallet::ReceiveOffer offer = controller()->nextReceive(id, bitcoin, chain::ScriptType::P2WPKH);
+             expect(offer.state == wallet::ReceiveOffer::State::Ready, QStringLiteral("Receive has an address to offer"));
+             expect(receivePage()->shownAddress() == offer.address, QStringLiteral("the next unused one: %1").arg(offer.path));
+             const int position = controller()->model()->find(id, bitcoin, chain::ScriptType::P2WPKH, 0, 0, offer.index);
+             expect(position >= 0 && !controller()->model()->at(position).used, QStringLiteral("no server knows of any use of it"));
+             expect(receivePage()->shownPayload() == offer.address, QStringLiteral("and its QR code says just that"));
+             auto* qr = receivePage()->findChild<QLabel*>(QStringLiteral("receiveQr"));
+             expect(qr && !qr->pixmap().isNull(), QStringLiteral("and is on screen"));
+             givenOutAddress_ = offer.address;
+             givenOutIndex_ = offer.index;
+         },
+         nullptr},
+        {QStringLiteral("receive-copied"),
+         [this, receivePage, clickLater] {
+             if (auto* label = receivePage()->findChild<QLineEdit*>(QStringLiteral("receiveLabel")))
+                 label->setText(QStringLiteral("Order 1001"));
+             clickLater(findButton(receivePage(), QStringLiteral("Copy address")));
+         },
+         nullptr, 1000,
+         [this, receivePage, controller] {
+             const quint32 id = controller()->store().wallets.first().id;
+             const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
+             expect(receivePage()->shownAddress() == givenOutAddress_, QStringLiteral("copied, it stays on screen"));
+             expect(controller()->nextReceive(id, bitcoin, chain::ScriptType::P2WPKH).index > givenOutIndex_, QStringLiteral("but will not be offered again"));
+             expect(controller()->addressLabel(givenOutAddress_) == QLatin1String("Order 1001"), QStringLiteral("and has its label"));
+             expect(visibleText(receivePage()).contains(QLatin1String("Given out")), QStringLiteral("and says it was given out"));
+         },
+         nullptr},
+        {QStringLiteral("receive-new"),
+         [this, receivePage, clickLater] { clickLater(findButton(receivePage(), QStringLiteral("New address"))); },
+         nullptr, 1000,
+         [this, receivePage] {
+             expect(!receivePage()->shownAddress().isEmpty() && receivePage()->shownAddress() != givenOutAddress_, QStringLiteral("New address gives another"));
+             auto* list = receivePage()->findChild<QTableWidget*>(QStringLiteral("receiveList"));
+             expect(list && list->rowCount() > 0 && list->item(0, 0)->text() == givenOutAddress_, QStringLiteral("and the one before it is listed"));
+             expect(list && list->item(0, 1)->text() == QLatin1String("Order 1001"), QStringLiteral("with its label"));
+         },
+         nullptr},
+        {QStringLiteral("receive-token"),
+         [this, receivePage] {
+             auto* coin = receivePage()->findChild<QComboBox*>(QStringLiteral("receiveCoin"));
+             coin->setCurrentIndex(coin->findData(int(wallet::findAsset(QStringLiteral("ethereum/usdt"))->asset)));
+         },
+         nullptr, 1000,
+         [this, receivePage] {
+             expect(receivePage()->shownAddress().startsWith(QLatin1String("0x")), QStringLiteral("a token comes in on its network's address: %1").arg(receivePage()->shownAddress()));
+             expect(visibleText(receivePage()).contains(QLatin1String("Ethereum network")), QStringLiteral("and it says on which network"));
+             auto* coin = receivePage()->findChild<QComboBox*>(QStringLiteral("receiveCoin"));
+             coin->setCurrentIndex(coin->findData(int(wallet::findAsset(QStringLiteral("bitcoin/btc"))->asset)));
+         },
+         nullptr},
         {QStringLiteral("wallet-states"),
          [this] {
              // The page repaints as it comes into view.
-             window_->showPage(QStringLiteral("overview"));
+             window_->showPage(QStringLiteral("portfolio"));
              window_->showPage(QStringLiteral("wallets"));
          },
          nullptr, 3000,
@@ -801,28 +1036,30 @@ void Walkthrough::buildSteps()
          nullptr},
         {QStringLiteral("address-history"),
          [this, controller, historyBook] {
-             // A used address, as a double click on its row does.
+             // A used address, as a double click on its row and then its History tab do.
              const wallet::WalletModel* m = controller()->model();
-             auto* page = window_->findChild<ui::HistoryPage*>();
              for (int i = 0; i < m->size(); ++i) {
                  const wallet::AddressRow& row = m->at(i);
                  if (row.isUtxo() && row.used && historyBook()->netOf(row.scripthash) == row.confirmed + row.unconfirmed && historyBook()->findAddress(row.scripthash) >= 0) {
-                     page->showAddress(row.network, row.scripthash, row.address);
+                     ui::Place place;
+                     place.root = ui::Place::Root::Addresses;
+                     place.address = row;
+                     window_->goTo(place, ui::Place::Tab::History);
                      break;
                  }
              }
          },
          nullptr, 2000,
-         [this, historyLines, historyPage] {
+         [this, historyLines] {
              expect(historyLines() > 0, QStringLiteral("an address opens to its own transactions (%1)").arg(historyLines()));
-             auto* title = historyPage()->findChild<QLabel*>(QStringLiteral("historyScopeTitle"));
-             auto* text = historyPage()->findChild<QLabel*>(QStringLiteral("historyScopeText"));
+             auto* title = window_->placeBar()->findChild<QLabel*>(QStringLiteral("placeTitle"));
+             auto* text = window_->placeBar()->findChild<QLabel*>(QStringLiteral("placeDetail"));
              expect(title && title->isVisible() && !title->text().isEmpty(), QStringLiteral("under the address"));
              expect(text && text->text().contains(QLatin1String("BTC")) && text->text().contains(QLatin1String("m/")), QStringLiteral("its path and what it holds"));
          },
          nullptr},
         {QStringLiteral("history-all-again"),
-         [historyPage] { static_cast<ui::HistoryPage*>(historyPage())->showAll(); },
+         [this] { window_->showPage(QStringLiteral("history")); },
          nullptr, 1000,
          [this, historyLines, historyBook] { expect(historyLines() == historyBook()->lineCount(), QStringLiteral("Show all brings back every line")); },
          nullptr},
@@ -921,6 +1158,16 @@ void Walkthrough::buildSteps()
          },
          nullptr},
         // The totals are compared once the reopened window's are final too.
+        {QStringLiteral("reopened-receive"), nullptr,
+         [controller] { return !controller()->loadingSaved(); }, 15000,
+         [this, controller] {
+             const wallet::WalletEntry* first = controller()->store().wallets.isEmpty() ? nullptr : &controller()->store().wallets.first();
+             const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
+             const QList<wallet::AccountKey> keys = first ? controller()->receiveKeys(first->id, bitcoin) : QList<wallet::AccountKey>();
+             expect(!keys.isEmpty() && keys.first().issued > givenOutIndex_, QStringLiteral("what was given out is still written down (%1)").arg(keys.isEmpty() ? 0 : keys.first().issued));
+             expect(controller()->addressLabel(givenOutAddress_) == QLatin1String("Order 1001"), QStringLiteral("with its label"));
+         },
+         nullptr},
         {QStringLiteral("reopened-checked"), nullptr,
          [this, controller] {
              return scanFinished_ && controller()->hasWallet() && controller()->balancesComplete();
@@ -1230,13 +1477,13 @@ void Walkthrough::buildSteps()
              expect(!controller()->hasWallet(), QStringLiteral("every wallet is gone"));
              expect(!QFile::exists(wallet::WalletStore::filePath()), QStringLiteral("wallet.dat was deleted"));
              expect(controller()->model()->size() == 0, QStringLiteral("no addresses are shown any more"));
-             window_->showPage(QStringLiteral("overview"));
+             window_->showPage(QStringLiteral("portfolio"));
          },
          nullptr},
         {QStringLiteral("back-to-empty"), nullptr, nullptr, 3000,
          [this] {
              expect(findButton(window_, QStringLiteral("Add wallet")) != nullptr,
-                    QStringLiteral("the Overview offers \"Add wallet\" again"));
+                    QStringLiteral("the Portfolio offers \"Add wallet\" again"));
          },
          nullptr},
         {QStringLiteral("empty-many-dialog"),
@@ -1244,7 +1491,7 @@ void Walkthrough::buildSteps()
          [importDialog] { return importDialog() != nullptr; }, 5000,
          [this, dialogFocus] {
              expect(dialogFocus() == QStringLiteral("seedList"),
-                    QStringLiteral("the empty Overview's Add many opens the list of seeds"));
+                    QStringLiteral("the empty Portfolio's Add many opens the list of seeds"));
          },
          importDialog},
         {QStringLiteral("empty-many-cancelled"),
@@ -1253,7 +1500,7 @@ void Walkthrough::buildSteps()
          [this, controller] {
              expect(!controller()->hasWallet(), QStringLiteral("cancelled, it adds nothing"));
              expect(findButton(window_, QStringLiteral("Add many")) != nullptr,
-                    QStringLiteral("and the Overview stays as it was"));
+                    QStringLiteral("and the Portfolio stays as it was"));
          },
          nullptr},
     };

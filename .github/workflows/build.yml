@@ -82,6 +82,17 @@ jobs:
           Get-Content selftest.txt
           exit $code
 
+      # Decoders that have nothing to do with the app, on a machine that has nothing else to do.
+      - name: Other readers read the QR codes
+        shell: pwsh
+        run: |
+          ./.github/start-gitwallet.ps1 -Arguments '--qr-samples', "$env:RUNNER_TEMP\qr"
+          if ($LASTEXITCODE -ne 0) { 'the codes were not written'; exit 1 }
+          python -m pip install --quiet "zxing-cpp>=2.2,<3" "opencv-python-headless>=4.8,<5"
+          if ($LASTEXITCODE -ne 0) { 'the decoders did not install'; exit 1 }
+          python .github/check-qr.py "$env:RUNNER_TEMP\qr"
+          exit $LASTEXITCODE
+
       - name: Store test
         shell: pwsh
         run: |

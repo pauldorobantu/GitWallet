@@ -75,6 +75,7 @@ public:
     void stop() override;
     // A round begins now, if none is under way: what is followed live needs no asking.
     void refreshNow() override;
+    void noteIssued(const AccountKey& key) override;
     void restoreTimes(const QDateTime& balancesAt, const QDateTime& noncesAt, const NonceSweep& sweep) override;
 
     bool hasAccounts() const override { return !accounts_.isEmpty(); }
@@ -112,11 +113,12 @@ private:
         int next = 0;         // next index to derive (or adopt from the model)
         int lastUsed = -1;    // highest index this run has seen used
         int savedUsed = -1;   // highest index the rows in the model say is used: only says what to follow first
+        int issued = 0;       // rows below this were given out: a payment comes to those, so they count as used
         bool reuse = true;    // the rows already in the model came from this xpub
 
-        int window() const;   // max(floor, lastUsed + 1 + gap); may exceed what may be derived
+        int window() const;   // max(floor, the later of lastUsed + 1 and issued, + gap); may exceed what may be derived
         int target() const;   // window() capped at the end of the chain's indices
-        int base() const;     // the start of the window derived whatever the row limit: max(floor, gap)
+        int base() const;     // the start of the window derived whatever the row limit: max(floor, issued + gap)
     };
 
     enum class SubState : quint8 {

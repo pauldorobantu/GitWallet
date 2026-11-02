@@ -39,6 +39,8 @@ struct AssetInfo {
     QString defillamaId; // "coingecko:bitcoin", "ethereum:0xdAC1…"
     QString coingeckoId; // "bitcoin"
     QString coinbaseSymbol; // "BTC"; symbols collide, so it is only ever asked about a listed asset
+    QString iconColor;   // "#F7931A"; empty: one is made up from the key
+    QString iconGlyph;   // what its round mark shows; empty: the first letter of the symbol
 
     bool isToken() const { return !contract.isEmpty(); }
 };

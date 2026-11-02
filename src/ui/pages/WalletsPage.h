@@ -13,8 +13,8 @@ namespace app::ui {
 // glance what each one holds. A figure reads plain only once every balance behind
 // it has answered and the scan reached all it should, as on the Overview page; a
 // chain the wallet has no key for reads "—", and the State column says how current
-// the row is. From here a wallet is added, renamed, removed, opened on the Addresses
-// page (also by double-clicking it) and its public keys shown.
+// the row is. From here a wallet is added, renamed, removed, opened on what it holds (a
+// double click) or on its addresses or history, and its public keys shown.
 class WalletsPage : public QWidget
 {
     Q_OBJECT
@@ -24,6 +24,7 @@ public:
 signals:
     void addRequested();
     void addManyRequested();
+    void openRequested(quint32 wallet);
     void showAddressesRequested(quint32 wallet);
     void showHistoryRequested(quint32 wallet);
 

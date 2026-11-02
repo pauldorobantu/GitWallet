@@ -58,6 +58,9 @@ public:
     WalletCounts counts(quint32 wallet) const;
     int rowsOn(Network network) const;      // rows of one network
     int uncheckedOn(Network network) const; // those not checked
+    int uncheckedOn(Network network, quint32 wallet) const; // those of one wallet
+    int holders(Asset a) const;             // rows that hold some of it
+    int holders(Asset a, quint32 wallet) const;
 
 signals:
     void rowsAppended(int first, int last);
@@ -103,6 +106,9 @@ private:
     QHash<quint32, WalletCounts> walletCounts_;
     QHash<Network, int> rowsOn_;
     QHash<Network, int> uncheckedOn_;
+    QHash<quint32, QHash<Network, int>> walletUnchecked_;
+    QHash<Asset, int> holders_;
+    QHash<quint32, QHash<Asset, int>> walletHolders_;
 };
 
 } // namespace wallet

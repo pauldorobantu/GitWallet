@@ -357,6 +357,10 @@ int main(int argc, char** argv)
         return st.ok && coinsProblem.isEmpty() ? 0 : 1;
     }
 
+    const QString qrSamples = argValue(args, QStringLiteral("--qr-samples"));
+    if (!qrSamples.isEmpty())
+        return app::writeQrSamples(qrSamples) ? 0 : 1;
+
     // A separate data folder (tests, screenshots, a second wallet). Trimmed as
     // WalletStore::setDataDir trims it, so a blank value counts as no
     // --data-dir (the real wallet) in the check below as well.
@@ -369,7 +373,7 @@ int main(int argc, char** argv)
     // folder WalletStore actually resolved is the real wallet's after all.
     for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
                                 QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
-                                QStringLiteral("--store-test"), QStringLiteral("--demo-wallets"),
+                                QStringLiteral("--store-test"), QStringLiteral("--screens-test"), QStringLiteral("--screen-pictures"), QStringLiteral("--demo-wallets"),
                                 QStringLiteral("--coins-file"), QStringLiteral("--live-places"),
                                 QStringLiteral("--scale-test")}) {
         if (!args.contains(name)) continue;
@@ -382,7 +386,7 @@ int main(int argc, char** argv)
     }
     // These two write and delete wallet.dat as part of the test, so a folder that
     // already holds one (--data-dir can be a second wallet) is not theirs to use.
-    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--store-test"), QStringLiteral("--scale-test")}) {
+    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--store-test"), QStringLiteral("--screens-test"), QStringLiteral("--screen-pictures"), QStringLiteral("--scale-test")}) {
         if (args.contains(name) && QFile::exists(wallet::WalletStore::filePath())) {
             attachParentConsole();
             std::fprintf(stderr, "%s needs a --data-dir without a wallet.dat\n", qPrintable(name));
@@ -396,9 +400,9 @@ int main(int argc, char** argv)
 
     // --store-test: the wallet file and the address model without a window or a
     // network, on the separate --data-dir checked above.
-    if (args.contains(QStringLiteral("--store-test"))) {
+    if (args.contains(QStringLiteral("--store-test")) || args.contains(QStringLiteral("--screens-test"))) {
         attachParentConsole();
-        const app::StoreTestResult result = app::runStoreTest();
+        const app::StoreTestResult result = args.contains(QStringLiteral("--store-test")) ? app::runStoreTest() : app::runScreensTestAlone();
         std::fputs(result.report.toUtf8().constData(), stdout);
         std::fprintf(stdout, "GitWallet store test: %d/%d passed\n", result.passed, result.total);
         std::fflush(stdout);
@@ -407,6 +411,9 @@ int main(int argc, char** argv)
 
     app::ui::theme::ThemeManager::instance()->loadFromSettings();
     app::ui::theme::ThemeManager::instance()->apply();
+    const QString screenPictures = argValue(args, QStringLiteral("--screen-pictures"));
+    if (!screenPictures.isEmpty())
+        return app::writeScreenPictures(screenPictures) ? 0 : 1;
     // The walkthrough finds buttons by their English text, whatever this user chose.
     if (!args.contains(QStringLiteral("--walkthrough")))
         app::ui::LanguageManager::instance()->loadFromSettings();
@@ -529,6 +536,29 @@ int main(int argc, char** argv)
 
     const QString page = argValue(args, QStringLiteral("--page"));
     if (!page.isEmpty()) window.showPage(page);
+
+    // --place coin:<key>,wallet:<number>,tab:<holdings|addresses|history>: for a picture of one.
+    const QString placeSpec = argValue(args, QStringLiteral("--place"));
+    if (!placeSpec.isEmpty()) {
+        QTimer::singleShot(2000, &window, [&window, controller, placeSpec] {
+            app::ui::Place place;
+            app::ui::Place::Tab tab = app::ui::Place::Tab::Holdings;
+            for (const QString& part : placeSpec.split(QLatin1Char(','))) {
+                const QString value = part.section(QLatin1Char(':'), 1);
+                if (part.startsWith(QLatin1String("coin:"))) {
+                    if (const wallet::AssetInfo* asset = wallet::findAsset(value))
+                        place.asset = asset->asset;
+                } else if (part.startsWith(QLatin1String("wallet:"))) {
+                    place.wallet = controller->store().wallets.value(value.toInt()).id;
+                    if (!place.asset)
+                        place.root = app::ui::Place::Root::Wallets;
+                } else if (part.startsWith(QLatin1String("tab:"))) {
+                    tab = value == QLatin1String("addresses") ? app::ui::Place::Tab::Addresses : value == QLatin1String("history") ? app::ui::Place::Tab::History : app::ui::Place::Tab::Holdings;
+                }
+            }
+            window.goTo(place, tab);
+        });
+    }
 
     const QString shot = argValue(args, QStringLiteral("--screenshot"));
     const QString reportPath = argValue(args, QStringLiteral("--scan-report"));

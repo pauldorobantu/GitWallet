@@ -4,6 +4,8 @@
 
 #include <QWidget>
 
+#include <optional>
+
 namespace app {
 class WalletController;
 }
@@ -15,8 +17,8 @@ class HistoryTableModel;
 // The History page: every transaction of every wallet, newest first, with what it did in the
 // coin and in USD now and then, its fee and how far it is believed; filters by wallet, type,
 // state and period, a search over ids, addresses, labels and notes, and an export of what those
-// leave. It narrows to one wallet or one address, and then says what that holds. Opening a line
-// shows the transaction whole.
+// leave. It narrows to a wallet, a network or one address, which PlaceBar then says. Opening a
+// line shows the transaction whole.
 class HistoryPage : public QWidget
 {
     Q_OBJECT
@@ -28,8 +30,10 @@ public:
 
     void showAll();
     void showWallet(quint32 id);
-    // One address: what it holds, then its transactions.
-    void showAddress(wallet::Network network, const QString& scripthash, const QString& address);
+    // Part of a place: to a wallet, a network, one address, or what they leave, and the combo that
+    // would say otherwise goes. A network with no history here yet says so.
+    void showPlace(quint32 wallet, std::optional<wallet::Network> network, const QString& scripthash, const QString& address);
+    void clearPlace();
 
     // The lines the filters leave, in the table's order, at once. False + a sentence on failure.
     bool exportCsvNow(const QString& path, QString* error);
@@ -57,7 +61,6 @@ private:
     QString headerLine() const;
     bool writeLines(int from, int to, QString* error);
     void updateState();
-    void updateScope();
     void rememberPlace();
     void restorePlace();
 

@@ -91,6 +91,16 @@ public:
         if (wallet != wallet_)
             change([&] { wallet_ = wallet; });
     }
+    // With the state Funded, it is this asset the row has to hold.
+    void setHeld(std::optional<wallet::Asset> asset, const wallet::WalletModel* model)
+    {
+        if (asset != held_) {
+            change([&] {
+                held_ = asset;
+                model_ = model;
+            });
+        }
+    }
     // A combo narrows the list (the search text is reported separately).
     bool filtered() const { return wallet_ != 0 || chain_ != kAllChains || state_ != StateAll; }
     // The search text or a combo hides rows; otherwise every row passes.
@@ -114,6 +124,8 @@ protected:
             // Used includes Funded: an address holding coins has received them.
             const bool funded = state == wallet::AddressState::Funded;
             if (state_ == StateFunded ? !funded : !(funded || state == wallet::AddressState::Used))
+                return false;
+            if (state_ == StateFunded && held_ && model_ && sourceRow < model_->size() && model_->at(sourceRow).amount(*held_).isZero())
                 return false;
         }
         if (query_.isEmpty())
@@ -150,6 +162,8 @@ private:
     quint32 wallet_ = 0; // 0: every wallet
     int chain_ = kAllChains;
     int state_ = StateAll;
+    std::optional<wallet::Asset> held_;
+    const wallet::WalletModel* model_ = nullptr;
 };
 
 // The row's amount of `info` in whole units, every digit kept; empty for an asset
@@ -235,6 +249,7 @@ struct AddressesPage::Ui : QObject
     QTimer* update = nullptr;    // batches recounts while a scan streams rows in
     QTimer* searchPause = nullptr; // on a large list, the query waits for the typing to stop
     QTimer* cooldown = nullptr;  // Refresh stays disabled while it runs
+    bool inPlace = false;        // the wallet and chain come from the place, and their combos are gone
 };
 
 AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
@@ -318,7 +333,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     bar.right->addWidget(ui_->label);
     ui_->history = new QPushButton(QStringLiteral("History"), bar.widget);
     ui_->history->setObjectName(QStringLiteral("primaryButton"));
-    ui_->history->setToolTip(trText(QStringLiteral("Every transaction of this address. A double click opens it too.")));
+    ui_->history->setToolTip(trText(QStringLiteral("Every transaction of this address")));
     bar.right->addWidget(ui_->history);
     root->addWidget(bar.widget);
 
@@ -369,7 +384,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->refresh->setEnabled(false);
     });
     connect(ui_->exportCsv, &QPushButton::clicked, this, &AddressesPage::chooseExportFile);
-    connect(view, &QAbstractItemView::doubleClicked, this, &AddressesPage::openHistoryOf);
+    connect(view, &QAbstractItemView::doubleClicked, this, &AddressesPage::openAddressOf);
     connect(ui_->history, &QPushButton::clicked, this, [this] {
         const QModelIndexList rows = ui_->view->selectionModel()->selectedRows();
         if (!rows.isEmpty())
@@ -427,8 +442,9 @@ void AddressesPage::rebuildWalletFilter()
         ui_->wallet->setProperty("i18nOrig_items", QVariant());
     }
     ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
-    ui_->wallet->setVisible(wallets.size() > 1);
-    ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallets.size() < 2);
+    ui_->wallet->setVisible(wallets.size() > 1 && !ui_->inPlace);
+    if (!ui_->inPlace)
+        ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallets.size() < 2);
 }
 
 void AddressesPage::showWallet(quint32 id)
@@ -437,18 +453,75 @@ void AddressesPage::showWallet(quint32 id)
     ui_->wallet->setCurrentIndex(index >= 0 ? index : 0);
 }
 
+void AddressesPage::showPlace(quint32 wallet, std::optional<wallet::Asset> asset)
+{
+    ui_->inPlace = true;
+    ui_->filter->setHeld(asset, controller_ ? controller_->model() : nullptr);
+    {
+        const QSignalBlocker quietWallet(ui_->wallet);
+        const QSignalBlocker quietChain(ui_->chain);
+        const QSignalBlocker quietState(ui_->state);
+        const QSignalBlocker quietSearch(ui_->search);
+        const int walletAt = ui_->wallet->findData(wallet);
+        ui_->wallet->setCurrentIndex(walletAt >= 0 ? walletAt : 0);
+        const int chainAt = asset ? ui_->chain->findData(int(wallet::assetInfo(*asset).network)) : 0;
+        ui_->chain->setCurrentIndex(chainAt >= 0 ? chainAt : 0);
+        ui_->state->setCurrentIndex(asset ? StateFunded : StateAll);
+        ui_->search->clear();
+    }
+    ui_->filter->setQuery(QString());
+    ui_->filter->setWallet(wallet);
+    ui_->filter->setChain(ui_->chain->currentData().toInt());
+    ui_->filter->setState(ui_->state->currentIndex());
+    ui_->wallet->setVisible(false);
+    ui_->chain->setVisible(!asset.has_value());
+    ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
+    ui_->view->setColumnHidden(AddressTableModel::ColChain, asset.has_value());
+    updateState();
+}
+
+void AddressesPage::clearPlace()
+{
+    if (!ui_->inPlace)
+        return;
+    ui_->inPlace = false;
+    ui_->filter->setHeld(std::nullopt, nullptr);
+    {
+        const QSignalBlocker quietWallet(ui_->wallet);
+        const QSignalBlocker quietChain(ui_->chain);
+        const QSignalBlocker quietState(ui_->state);
+        const QSignalBlocker quietSearch(ui_->search);
+        ui_->wallet->setCurrentIndex(0);
+        ui_->chain->setCurrentIndex(0);
+        ui_->state->setCurrentIndex(StateAll);
+        ui_->search->clear();
+    }
+    ui_->filter->setQuery(QString());
+    ui_->filter->setWallet(0);
+    ui_->filter->setChain(kAllChains);
+    ui_->filter->setState(StateAll);
+    ui_->chain->setVisible(true);
+    ui_->view->setColumnHidden(AddressTableModel::ColChain, false);
+    rebuildWalletFilter();
+    updateState();
+}
+
 void AddressesPage::openHistoryOf(const QModelIndex& index)
 {
     const QModelIndex source = ui_->filter->mapToSource(index);
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
     if (!model || !source.isValid() || source.row() >= model->size())
         return;
-    const wallet::AddressRow& row = model->at(source.row());
-    if (!row.isUtxo()) {
-        Feedback::show(ui_->history, Feedback::Type::Info, trText(QStringLiteral("Ethereum transactions come in the next stage")));
+    emit showHistoryRequested(model->at(source.row()));
+}
+
+void AddressesPage::openAddressOf(const QModelIndex& index)
+{
+    const QModelIndex source = ui_->filter->mapToSource(index);
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (!model || !source.isValid() || source.row() >= model->size())
         return;
-    }
-    emit showHistoryRequested(row.network, row.scripthash, row.address);
+    emit openAddressRequested(model->at(source.row()));
 }
 
 void AddressesPage::editLabelOfSelected()
@@ -460,8 +533,11 @@ void AddressesPage::editLabelOfSelected()
     const QModelIndex source = ui_->filter->mapToSource(rows.first());
     if (!source.isValid() || source.row() >= model->size())
         return;
-    const QString address = model->at(source.row()).address;
+    editLabel(model->at(source.row()).address);
+}
 
+void AddressesPage::editLabel(const QString& address)
+{
     auto* dialog = new QDialog(this);
     dialog->setObjectName(QStringLiteral("addressLabelDialog"));
     dialog->setWindowTitle(trText(QStringLiteral("Label")));

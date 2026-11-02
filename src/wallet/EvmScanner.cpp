@@ -723,17 +723,17 @@ void EvmScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
     }
 }
 
-// lastUsed + 1 + gap, but never past an index that failed to derive, nor past
-// kMaxEthRows.
+// The later of lastUsed + 1 and what was given out, + gap, but never past an index that
+// failed to derive, nor past kMaxEthRows.
 qint64 EvmScanner::windowEnd(const AccountState& account) const
 {
-    return qMin(qMin(account.lastUsed + 1 + gap_, account.limit), kMaxEthRows);
+    return qMin(qMin(qMax(account.lastUsed + 1, qint64(account.key.issued)) + gap_, account.limit), kMaxEthRows);
 }
 
 // The rows the window wants past kMaxEthRows are neither derived nor checked.
 bool EvmScanner::cutAtLimit(const AccountState& account) const
 {
-    return qMin(account.lastUsed + 1 + gap_, account.limit) > kMaxEthRows;
+    return qMin(qMax(account.lastUsed + 1, qint64(account.key.issued)) + gap_, account.limit) > kMaxEthRows;
 }
 
 // Derives (and, during a pass, queues) the part below `upTo` of the rows the window
@@ -786,8 +786,28 @@ void EvmScanner::startPass()
 bool EvmScanner::hotRow(const AccountState& account, const AddressRow& row) const
 {
     const qint64 index = row.index;
+    // What was given out and has not been paid yet, then the unused ones after that.
     const qint64 last = qMax(account.lastUsed, account.savedUsed);
-    return !row.balances.isEmpty() || (index > last && index <= last + kHotAhead);
+    return !row.balances.isEmpty() || (index > last && index <= qMax(last, qint64(account.key.issued) - 1) + kHotAhead);
+}
+
+void EvmScanner::noteIssued(const AccountKey& key)
+{
+    if (!running_)
+        return; // the next start() reads it from the key
+    for (int i = 0; i < acc_.size(); ++i) {
+        if (acc_.at(i).key.wallet != key.wallet || acc_.at(i).key.account != key.account)
+            continue;
+        acc_[i].key.issued = qMax(acc_.at(i).key.issued, key.issued);
+        if (acc_.at(i).end >= windowEnd(acc_.at(i)))
+            return;
+        // In the pass under way, or one now: the next address must not wait for a refresh.
+        if (!passActive_)
+            refreshNow();
+        else if (!growing_.contains(i))
+            growing_.append(i);
+        return;
+    }
 }
 
 // A pass longer than the refresh interval must not leave a fresh address waiting for

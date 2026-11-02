@@ -7,10 +7,11 @@ generate many addresses (e.g. a shop that makes a fresh address per order), wher
 ordinary wallets stop scanning after the first gap and miss funds further down.
 
 > **Status: view-only, on Bitcoin and Ethereum (ETH, USDT, USDC), with every Bitcoin
-> transaction in a History.** Coins and networks are data, what the wallets show is kept in
-> an encrypted database, and a start shows it at once. Where it goes from here, with Ethereum's
-> history, many more coins and spending, is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending
-> is tested on test networks before it touches real funds.
+> transaction in a History, and a Receive that hands out a fresh address per payment.** Coins and
+> networks are data, what the wallets show is kept in an encrypted database, and a start shows it at
+> once. Where it goes from here, with payment alerts, Ethereum's history, many more coins and spending,
+> is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on test networks before it touches real
+> funds.
 
 ![Overview](docs/screenshot-overview.png)
 
@@ -36,9 +37,16 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
    the first are not scanned yet, and the Add dialog says so. The Wallets page lists what
    each wallet holds; each address shows its wallet, balance and state, can be
    filtered by wallet, chain and state, and what the filters leave exports to
-   CSV for the books; the Overview shows the totals in each coin and in USD, with
-   where the prices come from and how old they are. Addresses another app creates
-   later from the same seed appear by themselves.
+   CSV for the books. Addresses another app creates later from the same seed appear by
+   themselves.
+
+   It opens on a **Portfolio**, as the wallets people know do: the grand total in USD, what it is made
+   of, and one row per coin with its price, what is held, what that is worth and its share. One click
+   goes down, a coin to the wallets that hold it, a wallet to its addresses, and a wallet opens the same
+   way from the other side, to its coins. A clickable path along the top says where the reader is, and
+   each place has its tabs: what it holds, its addresses, its history. An address opens to every asset in
+   its own coin with USD. What holds nothing can be hidden; what nobody has answered for yet never is,
+   as a dash is no zero.
 2. **History** *(done for Bitcoin)* — every transaction of every wallet: overall, per wallet
    (Wallets > History) and per address (a double click on its row, which also says what it
    holds). Each says what it did in the coin and in USD now and when it happened, its fee, and how
@@ -59,16 +67,23 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
    proven: only the chain does, when blocks give way. What an address's transactions add up to, without
    any whose proof failed, is compared with its balance, and if it differs the title says so on every
    page. What was replaced or dropped stays in the list for 90 days, longer with a note.
-3. **Send BTC** *(next)* — sweep selected or all addresses into one transaction.
-4. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
+3. **Receive** *(done)* — a wallet and a coin, and the next address nobody has been given, as text and
+   as a QR code; on Bitcoin an amount can go into the code (BIP 21). Copying it or saving its code marks
+   it as given out, and it is never offered again; **New address** goes on to the next. A label says who
+   it is for and stays on this PC, out of the code. What was given out is listed under it with what came
+   of it. An address is derived from the key each time it is shown, and if what is kept says another, none
+   is offered. Those given out count as used for the gap and are followed ahead of the rest, so a payment to
+   one shows as soon as any. No address is offered until a server has said it has no history.
+4. **Send BTC** *(later)* — sweep selected or all addresses into one transaction.
+5. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
    needs one transaction per address; gas is funded automatically for tokens).
 
 **Size.** 500 wallets at the default gaps are 425,000 addresses. Everything fits a
 connection's live places on a small wallet, so nothing changes there. Past 40,000
 Bitcoin addresses, the next unused addresses of each chain stay followed live, and up to
 10,000 of those holding coins; the rest are read again and again in long rounds, about 30
-minutes at that size, and Refresh starts one if none is under way; the Overview says how
-long, and says so if a round fails or runs far past that. An address a server refuses to
+minutes at that size, and Refresh starts one if none is under way; Details on the Portfolio says
+how long, and says so if a round fails or runs far past that. An address a server refuses to
 follow is read the same way, and a server that refuses everything is left for the next. On
 Ethereum, a pass that takes longer than the refresh lets the next unused addresses and those
 holding a balance go first, every refresh. What was measured to get there is in
@@ -82,8 +97,8 @@ compare with the other wallet.
 
 - `wallet.dat`, encrypted for the current Windows user with DPAPI: each wallet's name
   and **account-level public keys** (zpub / ypub / xpub at `m/84'/0'/0'`, `m/49'/0'/0'`,
-  `m/44'/0'/0'`, `m/44'/60'/0'`, or those you pasted), the scan settings and the key
-  of the database below. A seed is used once to derive those keys and is then scrubbed
+  `m/44'/0'/0'`, `m/44'/60'/0'`, or those you pasted), how far each has given out addresses, the
+  scan settings and the key of the database below. A seed is used once to derive those keys and is then scrubbed
   from memory; it is never written anywhere. Public keys can show balances but cannot
   spend. A `wallet.dat` from an earlier version loads as it was, and a copy stays beside it
   as `wallet.dat.format<N>-<date>`, since that version cannot read what is written next.
@@ -171,6 +186,7 @@ Every claim below is reproducible with the public BIP39 test mnemonic
 | Every Ethereum address's nonce, ETH, USDT and USDC vs a **different RPC node**, with plain calls instead of Multicall | 297 / 297 identical |
 | `--walkthrough`: the real UI driven like a user — a seed with three kinds of mistakes, a second seed, the same seed refused, public keys, totals per wallet adding up, filter, CSV, rename, settings, close and reopen with the figures there at once and marked as saved, remove one, a list of seeds and of public keys from a file and a paste, remove all | run on every push (see below) |
 | `--store-test`: every `wallet.dat` format, ids, repeated keys, public-key parsing, reading lists, adding in a batch, per-wallet totals against 4,000 random changes, the database (every field back as written, nothing readable without its key, another key refused, a wallet removed staying gone), the price sources against a local server (one failing, all failing, one behind, one that makes no sense), 425,000 addresses written in any order, read and into the model, and both scanners against servers on the same PC that refuse, lie, answer for another chain, cap a batch or go away, offline | run on every push (see below) |
+| QR codes, every size at every level, read back by the store test and in CI by **ZXing-C++** and **OpenCV**, which have nothing to do with the app | run on every push (see below) |
 | `--scale-test 425000`: the real window with that many rows: chunks, sorting, searching, filtering and exporting, each timed, with what it shows checked against the rows | run on every push (see below) |
 | `.github/compare-scans.ps1`, live: a scan read in rounds gives every address the same status and balance as one followed live; one more network from a file has its rows, its prices and the same address | run on every push (see below) |
 

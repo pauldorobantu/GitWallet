@@ -18,5 +18,11 @@ struct StoreTestResult {
 // and only the public BIP39 test mnemonics, so main() runs it on a separate
 // --data-dir alone.
 StoreTestResult runStoreTest();
+StoreTestResult runScreensTestAlone(); // the part of it that is about the screens
+
+// QR codes of every size, in pictures with a list of what each says, for other decoders to read.
+bool writeQrSamples(const QString& folder);
+// The screens with made-up figures in them, as pictures. On a throw-away --data-dir.
+bool writeScreenPictures(const QString& folder);
 
 } // namespace app

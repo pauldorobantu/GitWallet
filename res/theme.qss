@@ -259,6 +259,14 @@ QToolButton#tbClose:pressed { background-color: rgba(0,0,0,0.28); color: #ffffff
 /* ===== Pages ===== */
 #pageStack { background-color: %BG%; }
 #statValue { color: %TEXT%; font-size: 22px; font-weight: 600; background: transparent; }
+#heroValue { color: %TEXT%; font-size: 34px; font-weight: 600; background: transparent; }
+#placeTitle { color: %TEXT%; font-size: 20px; font-weight: 600; background: transparent; }
+#receiveQr { background: white; border-radius: %RSMALL%px; }
+#receiveAddress { color: %TEXT%; font-family: Consolas, "Cascadia Mono", monospace; font-size: 16px; background: transparent; }
+#pathHere { color: %TEXT%; font-size: %FBODY%px; font-weight: 600; background: transparent; }
+QPushButton#pathLink { background: transparent; border: none; color: %MUTED%; padding: 0 2px; min-height: 20px; max-height: 20px; font-weight: 400; }
+QPushButton#pathLink:hover { background: transparent; color: %ACCENT%; }
+QPushButton#pathLink:pressed { background: transparent; color: %ACCENT%; }
 #pageTitle { color: %TEXT%; font-size: %FTITLE%px; font-weight: 600; background: transparent; }
 /* "Hero" titles (About, Service settings): full text color, not textSoft. */
 #mimName { color: %TEXT%; font-weight: 700; background: transparent; }

@@ -263,6 +263,8 @@ bool HistoryTableModel::lineOf(wallet::HistoryBook* book, const chain::Hash256& 
     const int position = book->find(txid);
     if (position < 0)
         return false;
+    if (filter_.network >= 0 && int(book->network()) != filter_.network)
+        return false;
     const int scope = filter_.scripthash.isEmpty() ? -1 : book->findAddress(filter_.scripthash);
     if (!filter_.scripthash.isEmpty() && scope < 0)
         return false;
@@ -328,6 +330,8 @@ void HistoryTableModel::rebuildNow()
         const QList<wallet::UtxoHistory*> histories = controller_->histories();
         for (const wallet::UtxoHistory* history : histories) {
             wallet::HistoryBook* book = history->book();
+            if (filter_.network >= 0 && int(book->network()) != filter_.network)
+                continue;
             const int scope = filter_.scripthash.isEmpty() ? -1 : book->findAddress(filter_.scripthash);
             if (!filter_.scripthash.isEmpty() && scope < 0)
                 continue;

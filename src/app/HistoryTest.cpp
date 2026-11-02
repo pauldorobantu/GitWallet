@@ -2751,10 +2751,10 @@ void testWindow(const Check& check, const wallet::AccountKey& key)
         period->setCurrentIndex(1);
         type->setCurrentIndex(2);
         check(lines->rowCount() == 0, QStringLiteral("a filter left on hides nearly all of it"));
-        page.showAddress(key.network, first.scripthash, first.address);
+        page.showPlace(0, key.network, first.scripthash, first.address);
         check(lines->rowCount() == 3 && period->currentIndex() == 0 && type->currentIndex() == 0, QStringLiteral("an address opens to all of its own"));
-        page.showAll();
-        check(lines->rowCount() == 4, QStringLiteral("and Show all to all there is"));
+        page.clearPlace();
+        check(lines->rowCount() == 4, QStringLiteral("and leaving it to all there is"));
     }
 
     // Labels: secrets stay out, an id these wallets know is no secret.
@@ -2820,7 +2820,7 @@ void testWindow(const Check& check, const wallet::AccountKey& key)
     check(controller.labelCount(wallet) >= 1, QStringLiteral("what would go with this wallet is known before it goes"));
 
     // Narrowed to an address, and its wallet goes: the page goes back to what there is.
-    page.showAddress(key.network, first.scripthash, first.address);
+    page.showPlace(0, key.network, first.scripthash, first.address);
     check(controller.removeAllWallets(&error), QStringLiteral("and it can all be removed"));
     check(controller.labelCount() == 0, QStringLiteral("with its labels and notes"));
     check(lines->filter().scripthash.isEmpty(), QStringLiteral("and a page narrowed to one of its addresses no longer is"));

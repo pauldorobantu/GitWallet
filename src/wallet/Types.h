@@ -22,6 +22,8 @@ struct AccountKey {
     Network network{};  // a UTXO type's network; an Evm account serves every Evm network
     quint32 account = 0;
     QString xpub; // serialized with chain::xpubVersionFor(type)
+    quint32 issued = 0;     // receive addresses below this index are never offered again
+    quint32 issuedFrom = 0; // the first one Receive gave out: before it, what was used was used elsewhere
 
     // Parses `xpub`; throws std::runtime_error if it is not a valid extended key.
     chain::HdPubKey node() const;
@@ -60,6 +62,23 @@ struct NonceSweep {
     quint32 account = 0;
     quint32 index = 0;
     bool clears = false; // the endpoints changed: what an earlier one said of an address goes too
+};
+
+// An address to give to whoever is to pay: the first of a receive chain that has no history and
+// that nobody has been given.
+struct ReceiveOffer {
+    enum class State {
+        Ready,    // `address` comes from the key, just now
+        Checking, // the next one has no answer yet, so nobody can say it is unused
+        NoKey,    // the wallet has no key for this
+        Failed,   // the row kept for it is not what the key gives: `why`
+    };
+    State state = State::NoKey;
+    QString address;
+    QString path;
+    quint32 account = 0;
+    quint32 index = 0;
+    QString why;
 };
 
 // What a scanner's problem report is about, so the UI reacts to the kind and

@@ -45,6 +45,7 @@ public:
     struct Filter {
         quint32 wallet = 0;
         QString scripthash;   // one address
+        int network = -1;     // int(wallet::Network) of one network; -1: every one
         int kind = -1;        // int(TxKind)
         int state = -1;       // kStateActive and so on
         qint64 from = 0;      // seconds since the epoch

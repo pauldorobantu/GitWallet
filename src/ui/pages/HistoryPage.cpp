@@ -118,11 +118,6 @@ struct HistoryPage::Ui : QObject
     HistoryTableModel* model = nullptr;
     HoverRowTableView* view = nullptr;
     QLabel* status = nullptr;
-    QFrame* scope = nullptr;
-    QLabel* scopeTitle = nullptr;
-    QLabel* scopeText = nullptr;
-    QPushButton* scopeCopy = nullptr;
-    QPushButton* scopeExplorer = nullptr;
     QLineEdit* search = nullptr;
     QComboBox* wallet = nullptr;
     QComboBox* type = nullptr;
@@ -134,14 +129,16 @@ struct HistoryPage::Ui : QObject
     QWidget* noWallet = nullptr;
     QWidget* waiting = nullptr;
     QWidget* noResults = nullptr;
+    QWidget* notRead = nullptr; // a network whose history is not read yet
     QTimer* searchPause = nullptr;
     QTimer* update = nullptr;
     QTimer* periodAgain = nullptr;
 
-    // One address the page is narrowed to.
-    wallet::Network addressNetwork{};
+    // What a place narrows the page to.
+    std::optional<wallet::Network> network;
     QString scripthash;
     QString address;
+    bool inPlace = false;
 
     // Where the reader was, across a change of the list.
     wallet::HistoryBook* topBook = nullptr;
@@ -168,38 +165,6 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_ = new Ui(this);
     auto* root = new QVBoxLayout(this);
     page::applyPageLayout(root);
-
-    // What the page is narrowed to, and what that holds.
-    ui_->scope = new QFrame(this);
-    ui_->scope->setObjectName(QStringLiteral("cardPanel"));
-    auto* scopeRow = new QHBoxLayout(ui_->scope);
-    scopeRow->setContentsMargins(page::kSectionPadX, page::kFormVSpacing, page::kSectionPadX, page::kFormVSpacing);
-    scopeRow->setSpacing(page::kFormHSpacing);
-    auto* scopeColumn = new QVBoxLayout;
-    scopeColumn->setSpacing(2);
-    ui_->scopeTitle = new QLabel(ui_->scope);
-    ui_->scopeTitle->setObjectName(QStringLiteral("historyScopeTitle"));
-    ui_->scopeTitle->setTextFormat(Qt::PlainText);
-    ui_->scopeTitle->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    // On a narrow window the text is cut, never a button.
-    ui_->scopeTitle->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    ui_->scopeText = new QLabel(ui_->scope);
-    ui_->scopeText->setObjectName(QStringLiteral("historyScopeText"));
-    ui_->scopeText->setTextFormat(Qt::PlainText);
-    ui_->scopeText->setWordWrap(true);
-    ui_->scopeText->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    setTone(ui_->scopeText, Tone::Muted);
-    scopeColumn->addWidget(ui_->scopeTitle);
-    scopeColumn->addWidget(ui_->scopeText);
-    scopeRow->addLayout(scopeColumn, 1);
-    ui_->scopeCopy = new QPushButton(QStringLiteral("Copy address"), ui_->scope);
-    ui_->scopeExplorer = new QPushButton(QStringLiteral("Open in explorer"), ui_->scope);
-    auto* scopeAll = new QPushButton(QStringLiteral("Show all"), ui_->scope);
-    scopeRow->addWidget(ui_->scopeCopy, 0, Qt::AlignVCenter);
-    scopeRow->addWidget(ui_->scopeExplorer, 0, Qt::AlignVCenter);
-    scopeRow->addWidget(scopeAll, 0, Qt::AlignVCenter);
-    root->addWidget(ui_->scope);
-    ui_->scope->hide();
 
     ui_->status = new QLabel(this);
     ui_->status->setObjectName(QStringLiteral("historyStatus"));
@@ -232,9 +197,13 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->waiting = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("No transactions yet"),
                                         QStringLiteral("Every transaction of every address shows here, as servers tell of it and proofs check out."));
     ui_->noResults = page::makeNoResultsState(this);
+    ui_->notRead = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("Not read yet on this network"),
+                                        QStringLiteral("The history of Ethereum, USDT and USDC comes in the next stage. Balances are read already, and an address opens on a block explorer."));
     root->addWidget(ui_->noWallet, 1);
     root->addWidget(ui_->waiting, 1);
     root->addWidget(ui_->noResults, 1);
+    root->addWidget(ui_->notRead, 1);
+    ui_->notRead->hide();
 
     const page::ActionBar bar = page::makeActionBar(this);
     ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search id, address, label or note"));
@@ -325,18 +294,9 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &HistoryPage::updateState);
     connect(ui_->details, &QPushButton::clicked, this, &HistoryPage::openSelected);
     connect(ui_->exportCsv, &QPushButton::clicked, this, &HistoryPage::chooseExportFile);
-    connect(scopeAll, &QPushButton::clicked, this, &HistoryPage::showAll);
-    connect(ui_->scopeCopy, &QPushButton::clicked, this, [this] {
-        copyTextToClipboard(ui_->scopeCopy, ui_->address, trText(QStringLiteral("Address copied")));
-    });
-    connect(ui_->scopeExplorer, &QPushButton::clicked, this, [this] {
-        QString url = wallet::networkInfo(ui_->addressNetwork).addressUrl;
-        QDesktopServices::openUrl(QUrl(url.replace(QLatin1String("{id}"), ui_->address)));
-    });
 
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this, &HistoryPage::applyColumnWidths);
     const auto setTips = [this] {
-        ui_->scopeExplorer->setToolTip(trText(QStringLiteral("Opens the address on a public block explorer, in your browser")));
         ui_->type->setToolTip(trText(QStringLiteral("Moved: every output came back to the addresses shown, so only a fee left.")));
         ui_->exportCsv->setToolTip(trText(QStringLiteral("Save the lines shown to a spreadsheet file. It is not encrypted: anyone who reads it "
                                                          "sees these transactions, labels and notes.")));
@@ -347,13 +307,12 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
         setTips();
         applyColumnWidths();
         updateState();
-        updateScope();
     });
     if (controller_) {
         connect(controller_, &WalletController::walletChanged, this, [this] {
             rebuildWalletFilter();
             // One address the page was narrowed to, and its wallet is gone.
-            if (!ui_->scripthash.isEmpty() && controller_->model()->findByScripthash(ui_->addressNetwork, ui_->scripthash) < 0) {
+            if (!ui_->scripthash.isEmpty() && ui_->network && controller_->model()->findByScripthash(*ui_->network, ui_->scripthash) < 0) {
                 ui_->scripthash.clear();
                 ui_->address.clear();
                 applyFilter();
@@ -368,8 +327,6 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
             if (!ui_->update->isActive())
                 ui_->update->start();
         });
-        connect(controller_, &WalletController::totalsChanged, this, &HistoryPage::updateScope);
-        connect(controller_, &WalletController::labelsChanged, this, &HistoryPage::updateScope);
     }
     rebuildWalletFilter();
     ui_->model->rebuildNow();
@@ -427,8 +384,9 @@ void HistoryPage::rebuildWalletFilter()
         ui_->wallet->setCurrentIndex(keep >= 0 ? keep : 0);
         ui_->wallet->setProperty("i18nOrig_items", QVariant());
     }
-    ui_->wallet->setVisible(wallets.size() > 1);
-    ui_->view->setColumnHidden(HistoryTableModel::ColWallet, wallets.size() < 2);
+    ui_->wallet->setVisible(wallets.size() > 1 && !ui_->inPlace);
+    if (!ui_->inPlace)
+        ui_->view->setColumnHidden(HistoryTableModel::ColWallet, wallets.size() < 2);
     if (chosen != ui_->wallet->currentData().toUInt())
         applyFilter();
 }
@@ -452,7 +410,7 @@ void HistoryPage::showAll()
 {
     ui_->scripthash.clear();
     ui_->address.clear();
-    ui_->scope->hide();
+    ui_->network.reset();
     resetFilters();
     applyFilter();
 }
@@ -461,6 +419,7 @@ void HistoryPage::showWallet(quint32 id)
 {
     ui_->scripthash.clear();
     ui_->address.clear();
+    ui_->network.reset();
     resetFilters();
     {
         const QSignalBlocker quiet(ui_->wallet);
@@ -470,13 +429,30 @@ void HistoryPage::showWallet(quint32 id)
     applyFilter();
 }
 
-void HistoryPage::showAddress(wallet::Network network, const QString& scripthash, const QString& address)
+void HistoryPage::showPlace(quint32 wallet, std::optional<wallet::Network> network, const QString& scripthash, const QString& address)
 {
-    ui_->addressNetwork = network;
+    ui_->inPlace = true;
+    ui_->network = network;
     ui_->scripthash = scripthash;
     ui_->address = address;
     resetFilters();
+    {
+        const QSignalBlocker quiet(ui_->wallet);
+        const int index = ui_->wallet->findData(wallet);
+        ui_->wallet->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    ui_->wallet->setVisible(false);
+    ui_->view->setColumnHidden(HistoryTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
     applyFilter();
+}
+
+void HistoryPage::clearPlace()
+{
+    if (!ui_->inPlace)
+        return;
+    ui_->inPlace = false;
+    showAll();
+    rebuildWalletFilter();
 }
 
 void HistoryPage::applyFilter()
@@ -485,6 +461,7 @@ void HistoryPage::applyFilter()
     HistoryTableModel::Filter filter;
     filter.wallet = ui_->wallet->currentData().toUInt();
     filter.scripthash = ui_->scripthash;
+    filter.network = ui_->network ? int(*ui_->network) : -1;
     filter.kind = ui_->type->currentData().toInt();
     filter.state = ui_->state->currentData().toInt();
     filter.query = ui_->search->text().trimmed();
@@ -511,48 +488,7 @@ void HistoryPage::applyFilter()
         break;
     }
     ui_->model->setFilter(filter);
-    updateScope();
     updateState();
-}
-
-void HistoryPage::updateScope()
-{
-    if (ui_->scripthash.isEmpty()) {
-        ui_->scope->hide();
-        return;
-    }
-    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
-    const int row = model ? model->findByScripthash(ui_->addressNetwork, ui_->scripthash) : -1;
-    QStringList parts;
-    const QString label = controller_ ? controller_->addressLabel(ui_->address) : QString();
-    ui_->scopeTitle->setText(label.isEmpty() ? ui_->address : QStringLiteral("%1 · %2").arg(label, ui_->address));
-    if (row >= 0) {
-        const wallet::AddressRow& r = model->at(row);
-        parts << r.path();
-        if (const wallet::WalletEntry* entry = controller_->store().find(r.wallet))
-            parts << entry->label;
-        try {
-            double usd = 0.0;
-            bool priced = true;
-            QStringList held;
-            for (const wallet::Asset asset : wallet::networkInfo(r.network).assets) {
-                const wallet::AssetInfo& info = wallet::assetInfo(asset);
-                const chain::Amount amount = r.amount(asset);
-                if (amount.isZero() && asset != wallet::networkInfo(r.network).coin)
-                    continue;
-                held << figures::formatAmount(amount, info) + QLatin1Char(' ') + info.symbol;
-                const double price = controller_->prices()->usd(asset);
-                priced = priced && (price > 0.0 || amount.isZero());
-                usd += amount.toDouble(info.decimals) * price;
-            }
-            parts << held.join(QStringLiteral(" · "));
-            if (priced)
-                parts << figures::formatUsd(usd);
-        } catch (const std::exception&) {
-        }
-    }
-    ui_->scopeText->setText(parts.join(QStringLiteral(" · ")));
-    ui_->scope->show();
 }
 
 void HistoryPage::updateState()
@@ -635,6 +571,21 @@ void HistoryPage::updateState()
     setTone(ui_->status, tone);
     ui_->status->setVisible(!said.isEmpty());
 
+    // A network with no book: nothing below could say anything of it.
+    const bool notRead = ui_->network && controller_ && !controller_->historyOf(*ui_->network);
+    ui_->notRead->setVisible(notRead);
+    for (QWidget* control : std::initializer_list<QWidget*>{ui_->search, ui_->type, ui_->state, ui_->period, ui_->count})
+        control->setVisible(!notRead && (control != ui_->count || hasWallet));
+    ui_->exportCsv->setVisible(!notRead);
+    ui_->details->setVisible(!notRead);
+    if (notRead) {
+        ui_->status->hide();
+        ui_->view->hide();
+        ui_->noWallet->hide();
+        ui_->waiting->hide();
+        ui_->noResults->hide();
+        return;
+    }
     QWidget* empty = hasWallet ? ui_->waiting : ui_->noWallet;
     (hasWallet ? ui_->noWallet : ui_->waiting)->hide();
     const HistoryTableModel::Filter& filter = ui_->model->filter();
