@@ -21,6 +21,9 @@ class HistoryPage : public QWidget
 {
     Q_OBJECT
 public:
+    // What Copy gives of a cell: what it means, whole. Empty: it says there is nothing.
+    static QString textToCopy(const QModelIndex& cell);
+
     explicit HistoryPage(WalletController* controller, QWidget* parent = nullptr);
 
     void showAll();

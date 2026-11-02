@@ -564,7 +564,9 @@ void testLedgerAsync(const Check& check)
         ledger.open(path, wallet::WalletStore::newDatabaseKey(), {3});
         check(waitFor([&loaded] { return loaded; }, 15000) && model.size() == 0 && ledger.isOpen(),
               QStringLiteral("a database under another key is not read"));
-        const QStringList aside = store::Ledger::keptAsideFiles(path);
+        // With what says its labels have yet to come over, for when that key is back.
+        QStringList aside = store::Ledger::keptAsideFiles(path);
+        aside.removeIf([](const QString& name) { return name.endsWith(QLatin1String(".labels-pending")); });
         check(aside.size() == 1 && notice.endsWith(aside.value(0)), QStringLiteral("it is kept aside, and the user is told its name"));
         ledger.destroy(path);
         check(!QFile::exists(path) && !QFile::exists(path + QStringLiteral("-wal"))

@@ -102,6 +102,7 @@ QString columnScripthash(sqlite3_stmt* stmt, int column)
 
 // For the walk in index order, whose rows lie wherever they were first written. Decrypting a
 // page costs more than keeping it.
+int gBusyTimeoutMs = 5000;
 constexpr const char* kLoadCache = "PRAGMA cache_size = -64000";
 constexpr const char* kUsualCache = "PRAGMA cache_size = -8000";
 
@@ -147,7 +148,7 @@ LedgerDb::Open LedgerDb::open(const QString& path, const QByteArray& key, QStrin
         close();
         return Open::Failed;
     }
-    sqlite3_busy_timeout(db_, 5000);
+    sqlite3_busy_timeout(db_, gBusyTimeoutMs);
 
     // The raw key form: the key is random and full length, so nothing is gained from
     // stretching it, and opening stays instant.
@@ -411,8 +412,14 @@ int LedgerDb::nameId(const QString& text, QString* why)
     return id;
 }
 
+void LedgerDb::setBusyTimeoutForTest(int ms)
+{
+    gBusyTimeoutMs = ms > 0 ? ms : 5000;
+}
+
 bool LedgerDb::loadRows(const QSet<quint32>& wallets, int chunk,
-                        const std::function<void(QVector<wallet::AddressRow>&&)>& sink, QString* why)
+                        const std::function<void(QVector<wallet::AddressRow>&&)>& sink, QString* why,
+                        quint32 nextWallet, QStringList* labelsGone)
 {
     readDamaged_ = false;
     if (!db_) {
@@ -443,7 +450,7 @@ bool LedgerDb::loadRows(const QSet<quint32>& wallets, int chunk,
         if (step != SQLITE_DONE)
             return failed();
         for (const quint32 id : std::as_const(gone))
-            removeWallet(id, nullptr);
+            removeWallet(id, nullptr, id < nextWallet ? labelsGone : nullptr);
     }
 
     // Few rows hold anything, and the rows come in another order than their ids.

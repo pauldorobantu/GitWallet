@@ -187,7 +187,7 @@ public:
     // A wallet was removed: its addresses go, with what touches only those, and the notes on it.
     void forgetWallet(quint32 wallet);
     // Those of wallets no longer in the file go the same way.
-    void keepWallets(const QSet<quint32>& wallets);
+    void keepWallets(const QSet<quint32>& wallets, quint32 nextWallet = 0);
     // What was replaced or dropped before this moment goes too, unless it has a note, or something
     // spends what it paid.
     void forgetGoneBefore(qint64 seconds);

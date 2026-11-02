@@ -144,6 +144,7 @@ public:
     // The database is still handing over what it kept: whatever is there is part of it.
     bool loadingSaved() const { return waitingForLedger_; }
     bool keepingSaved() const; // the database is open, so what happens now is there at the next start
+    bool labelsOwed() const;   // those of a file kept aside have yet to come over, and none can change until they have
 
     // "Prices: DefiLlama · 14:02", beside any USD figure: where the prices of what the wallets
     // hold come from and how old the oldest is, with the date once it is not today, and
@@ -221,6 +222,7 @@ private:
     void importNextPart(const std::shared_ptr<LabelImport>& import);
     // A key among what looks like one: the id of a transaction these wallets know, or that a file of
     // labels names, is no secret.
+    bool historiesRead() const; // every history has read all there is, as far as anyone can tell
     bool holdsSecret(const QString& text, const QSet<chain::Hash256>& alsoKnown = {}) const;
     int differingAddresses() const;
     void saveTimes();  // when each network last had a whole answer

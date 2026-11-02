@@ -36,9 +36,16 @@ public:
 
     // Opens the database at `path` and starts reading. A file that is not a database
     // under this key, or is damaged, is moved aside, never written to, and a new one is made.
-    void open(const QString& path, const QByteArray& key, const QSet<quint32>& wallets);
+    // `nextWallet`: the id the next wallet would get, so that one below it not among `wallets` is
+    // known to have been removed.
+    void open(const QString& path, const QByteArray& key, const QSet<quint32>& wallets, quint32 nextWallet = 0);
     bool isOpen() const { return open_; }
     bool isLoading() const { return loading_; }
+    // Labels and notes of a file set aside could not be written into this one. What is here would
+    // then stand against them, so nothing about them should change until they have come over. That is
+    // tried again in a while, or now by bringOverOwed().
+    bool labelsOwed() const { return labelsOwed_; }
+    void bringOverOwed();
 
     void forgetWallet(quint32 wallet); // its rows leave the database, and any still on their way are dropped
     // Every row the model has and no other, with the next write.
@@ -76,6 +83,8 @@ signals:
     void setAside(const QString& file, int recovered, bool whole);
     // Those of a wallet removed, which the window may not have had a row for.
     void labelsRemoved(const QStringList& addresses);
+    // labelsOwed() moved. `why`: what stood in the way, if it is on.
+    void labelsOwedChanged(const QString& why);
 
 private:
     void noteRows(int first, int last);
@@ -90,6 +99,8 @@ private:
     void writeLabels(const QHash<QString, QString>& labels);
     void flushLabels();
     void noteLabelsWrite(bool ok, const QString& why);
+    bool bringOverPending(const QString& path, const QByteArray& key, QString* why); // on the worker; true: some are still owed
+    bool handOverLabels(quint64 run, QString* why);                                   // on the worker
     template <typename Work>
     void onWorker(Work work);
 
@@ -99,6 +110,9 @@ private:
     QObject* worker_ = nullptr;  // lives on thread_
     LedgerDb* db_ = nullptr;     // touched on thread_ only
     QTimer* timer_ = nullptr;
+    QTimer* owedTimer_ = nullptr;
+    QString path_;
+    QByteArray key_;
     QSet<int> dirty_;            // positions in the model
     QSet<quint32> wallets_;      // whose rows may still arrive
     QSet<wallet::HistoryBook*> historyWriting_; // one write of a book at a time: a later one must not stand on one that failed
@@ -109,6 +123,7 @@ private:
     QHash<QString, quint64> labelSerials_;
     quint64 labelWrites_ = 0;
     bool labelsFailing_ = false;
+    bool labelsOwed_ = false;
     bool rewrite_ = false;
     bool open_ = false;
     bool loading_ = false;

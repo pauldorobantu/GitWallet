@@ -72,9 +72,12 @@ public:
     // Every row of these wallets, by wallet, chain and index, `chunk` rows at a time, and
     // drops the rows of any other wallet: nothing left behind by a wallet removed while the
     // database could not be written stays on disk, as far as it can be written now. False +
-    // why when reading fails; readDamaged() then says if the file is at fault.
+    // why when reading fails; readDamaged() then says if the file is at fault. Of an id below
+    // `nextWallet`, which that wallet.dat gave out and no longer has, the removal finishes, labels
+    // and all: `labelsGone` names them. Any other may be a wallet.dat from before it was added.
     bool loadRows(const QSet<quint32>& wallets, int chunk,
-                  const std::function<void(QVector<wallet::AddressRow>&&)>& sink, QString* why);
+                  const std::function<void(QVector<wallet::AddressRow>&&)>& sink, QString* why,
+                  quint32 nextWallet = 0, QStringList* labelsGone = nullptr);
     bool saveRows(const QVector<wallet::AddressRow>& rows, QString* why);
     bool replaceRows(const QVector<wallet::AddressRow>& rows, QString* why); // of the networks on the list, these and no others
     // Its rows go, with the labels of those addresses unless another wallet has them too:
@@ -110,6 +113,7 @@ public:
 
     // Whatever can still be read of labels and notes in a file set aside, which stays as it is.
     static SavedLabels salvageLabels(const QString& path, const QByteArray& key);
+    static void setBusyTimeoutForTest(int ms);
     // Into this one, leaving what it holds already: that is newer.
     bool restoreLabels(const SavedLabels& labels, QString* why);
 

@@ -663,15 +663,19 @@ void HistoryBook::forgetWallet(quint32 wallet)
     forget(going);
 }
 
-void HistoryBook::keepWallets(const QSet<quint32>& wallets)
+void HistoryBook::keepWallets(const QSet<quint32>& wallets, quint32 nextWallet)
 {
+    QSet<QString> removed;
     QSet<QString> going;
     for (const AddressEntry& entry : std::as_const(addresses_)) {
         if (entry.wallet != 0 && !wallets.contains(entry.wallet))
-            going.insert(entry.scripthash);
+            (entry.wallet < nextWallet ? removed : going).insert(entry.scripthash);
     }
-    // Nobody removed it: a wallet.dat from before it was added comes to the same. What only this PC
-    // has stays, for when it is back; a removal is what takes that.
+    // One this wallet.dat gave out and no longer has was removed, and that did not get as far as the
+    // database: it finishes now.
+    forget(removed);
+    // Nobody removed the others: a wallet.dat from before they were added comes to the same. What only
+    // this PC has stays, for when they are back; a removal is what takes that.
     const QHash<chain::Hash256, TxNote> notes = notes_;
     forget(going);
     if (notes_.size() != notes.size()) {

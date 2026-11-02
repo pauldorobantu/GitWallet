@@ -25,6 +25,7 @@ Q_STATIC_LOGGING_CATEGORY(lcLedger, "gitwallet.ledger")
 constexpr int kFlushMs = 5000;
 constexpr int kChunk = 5000;
 constexpr int kMaxRetryMs = 5 * 60 * 1000;
+constexpr int kOwedRetryMs = 60 * 1000;
 
 // The file beside `path` a database moved aside goes by.
 QString asideName(const QString& path)
@@ -51,6 +52,10 @@ Ledger::Ledger(wallet::WalletModel* model, QObject* parent) : QObject(parent), m
     timer_->setSingleShot(true);
     timer_->setInterval(kFlushMs);
     connect(timer_, &QTimer::timeout, this, &Ledger::flush);
+
+    owedTimer_ = new QTimer(this);
+    owedTimer_->setInterval(kOwedRetryMs);
+    connect(owedTimer_, &QTimer::timeout, this, &Ledger::bringOverOwed);
 
     if (model_) {
         connect(model_, &wallet::WalletModel::rowsAppended, this, &Ledger::noteRows);
@@ -90,7 +95,77 @@ void Ledger::onWorker(Work work)
     QMetaObject::invokeMethod(worker_, std::move(work), Qt::QueuedConnection);
 }
 
-void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32>& wallets)
+// A mark that leads to no file is none. One whose file cannot be read just now, held by another
+// program or under another key, says nothing of what that holds, and is all that leads back to it.
+bool Ledger::bringOverPending(const QString& path, const QByteArray& key, QString* why)
+{
+    const QFileInfo info(path);
+    // The newest first: what stands in the file by then stays, so the newer word is the one kept.
+    const QStringList marks = info.dir().entryList({info.fileName() + QStringLiteral(".unread-*") + pendingMark()}, QDir::Files, QDir::Name | QDir::Reversed);
+    bool owed = false;
+    for (const QString& name : marks) {
+        const QString mark = info.dir().filePath(name);
+        const QString aside = mark.chopped(pendingMark().size());
+        if (!QFile::exists(aside)) {
+            QFile::remove(mark);
+            continue;
+        }
+        const SavedLabels saved = LedgerDb::salvageLabels(aside, key);
+        QFile::remove(aside + QStringLiteral("-shm"));
+        if (!saved.read)
+            continue;
+        if (saved.count() == 0 || db_->restoreLabels(saved, why))
+            QFile::remove(mark);
+        else
+            owed = true;
+    }
+    return owed;
+}
+
+// What can be edited on a line has to be there before the line is.
+bool Ledger::handOverLabels(quint64 run, QString* why)
+{
+    const QPointer<Ledger> self(this);
+    const QHash<QString, QString> labels = db_->loadAddressLabels(why);
+    if (db_->readFailed())
+        return false;
+    for (wallet::HistoryBook* book : std::as_const(books_)) {
+        const QHash<chain::Hash256, wallet::TxNote> notes = db_->loadNotes(book->network(), why);
+        if (db_->readFailed())
+            return false;
+        QMetaObject::invokeMethod(this, [self, run, book, notes, this] {
+            if (self && run == loadRun_) book->addSavedNotes(notes);
+        }, Qt::QueuedConnection);
+    }
+    QMetaObject::invokeMethod(this, [this, self, run, labels] {
+        if (self && run == loadRun_) emit labelsRead(labels);
+    }, Qt::QueuedConnection);
+    return true;
+}
+
+void Ledger::bringOverOwed()
+{
+    if (!open_ || loading_ || !labelsOwed_)
+        return;
+    const quint64 run = loadRun_;
+    const QPointer<Ledger> self(this);
+    onWorker([this, self, run, path = path_, key = key_] {
+        QString why;
+        if (bringOverPending(path, key, &why)) {
+            qCInfo(lcLedger).noquote() << "labels and notes could not be brought over yet:" << why;
+            return;
+        }
+        handOverLabels(run, &why);
+        QMetaObject::invokeMethod(this, [this, self, run] {
+            if (!self || run != loadRun_) return;
+            labelsOwed_ = false;
+            owedTimer_->stop();
+            emit labelsOwedChanged(QString());
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32>& wallets, quint32 nextWallet)
 {
     wallets_ = wallets;
     open_ = true;
@@ -98,6 +173,10 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
     reported_ = false;
     writesFailing_ = false;
     labelsFailing_ = false;
+    labelsOwed_ = false;
+    owedTimer_->stop();
+    path_ = path;
+    key_ = key;
     retryMs_ = 0;
     timer_->setInterval(kFlushMs);
     dirty_.clear();
@@ -110,8 +189,11 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
     const bool hadRows = model_ && model_->checkedCount() > 0;
     const quint64 run = ++loadRun_;
     const QPointer<Ledger> self(this);
-    onWorker([this, self, run, hadRows, path, key, wallets] {
+    onWorker([this, self, run, hadRows, path, key, wallets, nextWallet] {
         QString why;
+        bool owed = false;
+        QString owedWhy;
+        QStringList labelsGone;
         LedgerDb::Open opened = db_->open(path, key, &why);
         // Another key's, or damaged: never written over. wallet.dat was replaced, or this
         // file was. All but its labels and notes can be read again from the servers, and those are
@@ -120,7 +202,12 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
             qCWarning(lcLedger).noquote() << "the database is set aside:" << why;
             db_->close();
             const QString aside = asideName(path);
+            // Before it moves: from there on all that leads back to it is this, whatever stops what
+            // comes next, a full disk or the power. It goes when what it holds has come over.
+            const QString mark = aside + pendingMark();
+            QFile(mark).open(QIODevice::WriteOnly);
             if (!QFile::rename(path, aside)) {
+                QFile::remove(mark);
                 // Another program holds it: it stays as it is, WAL included, for the next start.
                 why = QStringLiteral("it is damaged and could not be moved aside");
                 opened = LedgerDb::Open::Failed;
@@ -138,17 +225,19 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
             opened = db_->open(path, key, &why);
             int recovered = saved.read ? saved.count() : -1;
             bool whole = saved.whole;
+            bool over = saved.read && saved.count() == 0;
             if (saved.count() > 0) {
                 QString lost = why;
-                if (opened != LedgerDb::Open::Ready || !db_->restoreLabels(saved, &lost)) {
-                    // Not said to have come along, and asked for again at the next start.
+                over = opened == LedgerDb::Open::Ready && db_->restoreLabels(saved, &lost);
+                if (!over) {
+                    // Not said to have come along, and asked for again.
                     qCWarning(lcLedger).noquote() << "labels and notes could not be brought over:" << lost;
                     recovered = -1;
                     whole = false;
-                    QFile mark(aside + pendingMark());
-                    mark.open(QIODevice::WriteOnly);
                 }
             }
+            if (over)
+                QFile::remove(mark);
             QMetaObject::invokeMethod(this, [this, self, run, hadRows, aside, recovered, whole] {
                 if (!self || run != loadRun_) return;
                 // What it handed over before it failed is no more to be trusted than the rest.
@@ -160,37 +249,6 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                 rewrite_ = false;
                 emit setAside(aside, recovered, whole);
             }, Qt::QueuedConnection);
-        };
-        const auto bringOverPending = [&]() {
-            const QFileInfo info(path);
-            const QStringList marks = info.dir().entryList({info.fileName() + QStringLiteral(".unread-*") + pendingMark()}, QDir::Files);
-            for (const QString& name : marks) {
-                const QString mark = info.dir().filePath(name);
-                const QString aside = mark.chopped(pendingMark().size());
-                QString lost;
-                const SavedLabels saved = LedgerDb::salvageLabels(aside, key);
-                QFile::remove(aside + QStringLiteral("-shm"));
-                if (saved.count() == 0 || db_->restoreLabels(saved, &lost))
-                    QFile::remove(mark);
-            }
-        };
-        // What can be edited on a line has to be there before the line is.
-        const auto handOverLabels = [&]() {
-            const QHash<QString, QString> labels = db_->loadAddressLabels(&why);
-            if (db_->readFailed())
-                return false;
-            for (wallet::HistoryBook* book : std::as_const(books_)) {
-                const QHash<chain::Hash256, wallet::TxNote> notes = db_->loadNotes(book->network(), &why);
-                if (db_->readFailed())
-                    return false;
-                QMetaObject::invokeMethod(this, [self, run, book, notes, this] {
-                    if (self && run == loadRun_) book->addSavedNotes(notes);
-                }, Qt::QueuedConnection);
-            }
-            QMetaObject::invokeMethod(this, [this, self, run, labels] {
-                if (self && run == loadRun_) emit labelsRead(labels);
-            }, Qt::QueuedConnection);
-            return true;
         };
         if (opened == LedgerDb::Open::NotOurs)
             moveAside();
@@ -236,15 +294,18 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                 }
                 return true;
             };
-            bringOverPending();
-            if (handOverLabels() && db_->loadRows(wallets, kChunk, chunk, &why) && history()) {
+            owed = bringOverPending(path, key, &owedWhy);
+            if (handOverLabels(run, &why) && db_->loadRows(wallets, kChunk, chunk, &why, nextWallet, &labelsGone) && history()) {
                 prices = db_->loadPrices(nullptr);
                 times = db_->loadTimes(nullptr);
             } else if (db_->readDamaged()) {
                 // The check passed, or could not run, and a page still fails.
                 moveAside();
-                if (opened == LedgerDb::Open::Ready && !handOverLabels())
-                    opened = LedgerDb::Open::Failed;
+                if (opened == LedgerDb::Open::Ready) {
+                    owed = bringOverPending(path, key, &owedWhy);
+                    if (!handOverLabels(run, &why))
+                        opened = LedgerDb::Open::Failed;
+                }
             } else {
                 // The disk's doing, or a full one: nothing wrong with the file, which stays.
                 opened = LedgerDb::Open::Failed;
@@ -266,13 +327,20 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
             }, Qt::QueuedConnection);
             return;
         }
-        QMetaObject::invokeMethod(this, [this, self, run, hadRows, prices, times] {
+        QMetaObject::invokeMethod(this, [this, self, run, hadRows, prices, times, owed, owedWhy, labelsGone] {
             if (!self || run != loadRun_) return;
             loading_ = false;
             // A clear while it was reading: only now is the model all there is to write.
             rewrite_ = rewrite_ || hadRows;
             if (rewrite_ || !dirty_.isEmpty())
                 schedule();
+            if (!labelsGone.isEmpty())
+                emit labelsRemoved(labelsGone);
+            if (owed) {
+                labelsOwed_ = true;
+                owedTimer_->start();
+                emit labelsOwedChanged(owedWhy);
+            }
             emit loaded(prices, times);
         }, Qt::QueuedConnection);
     });
@@ -609,6 +677,9 @@ void Ledger::close()
     flush();
     open_ = false;
     loading_ = false;
+    labelsOwed_ = false;
+    owedTimer_->stop();
+    key_.clear();
     historyWriting_.clear();
     // BlockingQueuedConnection: everything queued before this has run when it returns.
     if (thread_.isRunning())

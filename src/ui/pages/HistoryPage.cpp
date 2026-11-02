@@ -88,11 +88,12 @@ public:
 protected:
     void keyPressEvent(QKeyEvent* event) override
     {
-        // What the row means, whole, and past the clipboard's history as every copy here is. Not the
-        // cell as it is drawn: an id with its middle left out names nothing.
+        // Past the clipboard's history, as every copy here is. What says there is nothing leaves what
+        // the clipboard holds as it is.
         if (event->matches(QKeySequence::Copy) && currentIndex().isValid()) {
-            const QVariant whole = currentIndex().data(kCopyRole);
-            copyTextToClipboard(this, whole.isValid() ? whole.toString() : currentIndex().data().toString(), trText(QStringLiteral("Copied")));
+            const QString text = HistoryPage::textToCopy(currentIndex());
+            if (!text.isEmpty())
+                copyTextToClipboard(this, text, trText(QStringLiteral("Copied")));
             event->accept();
             return;
         }
@@ -101,6 +102,14 @@ protected:
 };
 
 } // namespace
+
+// Not the cell as it is drawn: an id with its middle left out names nothing.
+QString HistoryPage::textToCopy(const QModelIndex& cell)
+{
+    const QVariant whole = cell.data(kCopyRole);
+    const QString text = (whole.isValid() ? whole.toString() : cell.data().toString()).trimmed();
+    return text == figures::dash() ? QString() : text;
+}
 
 struct HistoryPage::Ui : QObject
 {
@@ -141,6 +150,7 @@ struct HistoryPage::Ui : QObject
     chain::Hash256 chosenTx{};
     bool hadPlace = false;
     bool placeHeld = false; // read before a book moved everything: the next rebuild goes by that
+    int chosenColumn = -1;  // the cell Copy goes by
     int yearOfFilter = 0;   // what "this year" and "last year" were worked out from
 
     // An export on its way, a chunk per event-loop turn.
@@ -639,6 +649,7 @@ void HistoryPage::rememberPlace()
     QTableView* view = ui_->view;
     ui_->hadPlace = false;
     ui_->chosenBook = nullptr;
+    ui_->chosenColumn = view->currentIndex().column();
     const QModelIndexList chosen = view->selectionModel()->selectedRows();
     if (!chosen.isEmpty()) {
         if (const HistoryTableModel::Line* line = ui_->model->lineAt(chosen.first().row())) {
@@ -665,6 +676,9 @@ void HistoryPage::restorePlace()
             // Chosen is all it is: the reader stays where the reader is.
             view->setAutoScroll(false);
             view->selectRow(row);
+            // It moves the current cell to the row's first column, and Copy goes by that.
+            if (ui_->chosenColumn >= 0)
+                view->selectionModel()->setCurrentIndex(ui_->model->index(row, ui_->chosenColumn), QItemSelectionModel::NoUpdate);
             view->setAutoScroll(true);
         }
     }

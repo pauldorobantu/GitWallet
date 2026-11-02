@@ -102,6 +102,7 @@ public:
     void setProofsForTest(const ChainProofs& proofs);
     static void setFirstPauseForTest(int ms);
     static void setMaxPendingForTest(int count);
+    static void setMaxTxBacklogForTest(int count);
     net::PriceHistory* prices() const { return prices_; }
 
 signals:
@@ -132,6 +133,7 @@ private:
     void onRowsAppended(int first, int last);
     void onRowsGone();
     void onClientReady();
+    void onServerTip(int height);
 
     void schedulePump();
     void pump();
@@ -155,6 +157,8 @@ private:
     void onTipMoved();
     void onTipWaitOver();
     void onReorg(int fromHeight);
+    QSet<QString> addressesReplacedFrom(int fromHeight, int toHeight) const;
+    void readListsAgain(const QSet<QString>& addresses);
     void onChainMisbehaved(const QString& why);
     void onHeadersRefused();
     void giveUpWaitingProofs();
@@ -208,7 +212,7 @@ private:
     QMultiHash<int, chain::Hash256> waitingHeader_;
     QSet<chain::Hash256> waitingTip_;
     QSet<chain::Hash256> refusedOnce_;     // still queued: asked once more in a while
-    QSet<chain::Hash256> failedProof_;     // did not hold, or refused twice: asked again when the chain or server moves
+    QSet<chain::Hash256> failedProof_;     // did not hold, refused twice, or past the server's tip: asked again when the chain or server moves
     QSet<int> doubtedHeights_;             // being looked into: is the server wrong, or the chain behind
     QSet<QString> refusedAddresses_;       // no answer whole on this connection: asked again on the next
     QSet<QString> retrying_;               // of those, on their way again: all is not well yet

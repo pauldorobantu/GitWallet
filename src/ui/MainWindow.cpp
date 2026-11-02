@@ -487,6 +487,11 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
         n.headline = trText(QStringLiteral("Labels and notes are not being saved"));
         n.depends = 0;
         break;
+    case wallet::Problem::LabelsOwed:
+        n.key = QStringLiteral("labels-owed");
+        n.headline = trText(QStringLiteral("The labels and notes of an older file have yet to come over"));
+        n.depends = 0;
+        break;
     case wallet::Problem::FilesLeft:
         n.key = QStringLiteral("files-left");
         n.headline = trText(QStringLiteral("Some files could not be deleted"));
@@ -599,6 +604,8 @@ bool MainWindow::pruneNotices()
             return !QFile::exists(n.file);
         if (n.key == QLatin1String("folder-held"))
             return controller_->keepingSaved();
+        if (n.key == QLatin1String("labels-owed"))
+            return !controller_->labelsOwed();
         if (was.wallet != now.wallet)
             return true; // another wallet, or none
         const bool btcGaps = was.receiveGap != now.receiveGap || was.changeGap != now.changeGap;

@@ -14,6 +14,7 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace wallet {
@@ -72,6 +73,7 @@ QString hexOf(const chain::Hash256& hash)
 
 int gFirstPauseMs = kFirstPauseMs;
 int gMaxPending = kMaxPending;
+int gMaxTxBacklog = int(kMaxTxBacklog);
 int gFirstPriceBackoffMs = 60'000;
 
 bool rawOf(const QJsonValue& result, chain::Bytes* out)
@@ -142,6 +144,7 @@ UtxoHistory::UtxoHistory(Network network, net::ElectrumClient* client, WalletMod
     connect(model_, &WalletModel::rowsDropped, this, &UtxoHistory::onRowsGone);
     connect(model_, &WalletModel::cleared, this, &UtxoHistory::onRowsGone);
     connect(client_, &net::ElectrumClient::ready, this, &UtxoHistory::onClientReady);
+    connect(client_, &net::ElectrumClient::tipChanged, this, &UtxoHistory::onServerTip);
     connect(chain_, &HeaderChain::headerReady, this, &UtxoHistory::onHeaderReady);
     connect(chain_, &HeaderChain::headerMoved, this, &UtxoHistory::onHeaderMoved);
     connect(chain_, &HeaderChain::tipMoved, this, &UtxoHistory::onTipMoved);
@@ -162,6 +165,11 @@ void UtxoHistory::setFirstPauseForTest(int ms)
 void UtxoHistory::setMaxPendingForTest(int count)
 {
     gMaxPending = count > 0 ? count : kMaxPending;
+}
+
+void UtxoHistory::setMaxTxBacklogForTest(int count)
+{
+    gMaxTxBacklog = count > 0 ? count : int(kMaxTxBacklog);
 }
 
 void UtxoHistory::setProofsForTest(const ChainProofs& proofs)
@@ -224,6 +232,7 @@ void UtxoHistory::start()
     chain_->start();
     // A header that no longer follows ended the chain there: what rested on it rests on nothing.
     book_->unproveFrom(chain_->tip() + 1);
+    readListsAgain(addressesReplacedFrom(chain_->tip() + 1, std::numeric_limits<int>::max()));
     considerAll();
     queueAllProofs();
     tokens_->start();
@@ -361,6 +370,23 @@ void UtxoHistory::onRowsGone()
     noteProgress();
 }
 
+void UtxoHistory::onServerTip(int height)
+{
+    if (!running_ || !client_->isReady())
+        return;
+    // It has come as far as what was not asked of it for being past it. The chain does not hear of
+    // that when it held those blocks already.
+    const QSet<chain::Hash256> failed = failedProof_;
+    for (const chain::Hash256& txid : failed) {
+        const int position = book_->find(txid);
+        if (position >= 0 && book_->at(position).height <= height) {
+            failedProof_.remove(txid);
+            queueProof(position);
+        }
+    }
+    noteProgress();
+}
+
 void UtxoHistory::onClientReady()
 {
     if (!running_)
@@ -435,10 +461,10 @@ void UtxoHistory::pump()
         ++turn_;
         // Lists and raw transactions by turns: what a list names is what makes a line, and is lost
         // with the connection until it is read. News stands first in each of them, whatever the
-        // first read of everything has put behind it.
+        // first read of everything has put behind it. A list's turn is never a proof's: it would be none.
         const bool listsWait = !addressNews_.empty() || !addressQueue_.empty();
-        const bool backlog = txQueue_.size() >= size_t(kMaxTxBacklog);
-        const bool txTurn = !listsWait || (backlog ? turn_ % kListEveryPastBacklog != 0 : turn_ % 2 == 0);
+        const bool backlog = txQueue_.size() >= size_t(gMaxTxBacklog);
+        const bool txTurn = !listsWait || (backlog ? turn_ % kListEveryPastBacklog != 1 : turn_ % 2 == 0);
         const auto takeTx = [this] {
             const chain::Hash256 txid = txQueue_.front();
             txQueue_.pop_front();
@@ -940,16 +966,17 @@ void UtxoHistory::proveNext(const chain::Hash256& txid)
         return;
     }
     const int height = tx.height;
-    // In a block this server does not say it has. If it listed that itself, that is its lie. If another
-    // did, or this one is only behind, there is nothing to ask of it: its own list will say.
-    if (height > client_->tipHeight() + kStatusAhead) {
+    // In a block this server does not say it has. Nothing can be asked of it. That leaves it unproven,
+    // whoever said so, until the server gets there or a list says otherwise; if this one listed that
+    // itself, it is also its lie. A status can be ahead of the notice of its block, by a little.
+    const bool named = namedHere_.contains(txid);
+    if (height > client_->tipHeight() + (named ? kStatusAhead : 0)) {
         proofQueued_.remove(txid);
         refusedOnce_.remove(txid);
-        if (namedHere_.contains(txid)) {
-            failedProof_.insert(txid);
-            compareTouching(position);
+        failedProof_.insert(txid);
+        compareTouching(position);
+        if (named && height > client_->tipHeight() + kStatusAhead)
             noteDishonest(QStringLiteral("it lists a transaction in a block it does not have"));
-        }
         noteProgress();
         return;
     }
@@ -1006,6 +1033,7 @@ void UtxoHistory::onHeaderMoved(int height)
         failedProof_.remove(txid);
         queueProof(position);
     }
+    readListsAgain(addressesReplacedFrom(height, height));
     retryRefused();
     schedulePump();
 }
@@ -1021,7 +1049,9 @@ void UtxoHistory::onTipMoved()
         if (position >= 0)
             queueProof(position);
     }
-    // A new block is as good a moment as any to ask again for what was refused.
+    // A new block is as good a moment as any to ask again for what was refused: with no other answer
+    // between them that is no burst, however many blocks it takes, and no reason to stop reading.
+    std::fill(std::begin(refused_), std::end(refused_), 0);
     retryRefused();
     schedulePump();
     noteProgress();
@@ -1037,20 +1067,18 @@ void UtxoHistory::onTipWaitOver()
         chain_->sync();
         return;
     }
-    // It said a block held them, and no such block has come. What another server said of them is not
-    // this one's to answer for: its own list will say.
+    // A block was said to hold them, and no such block has come: they stay unproven. If it was this
+    // server that said so, that is also its lie. What another said of them is not its to answer for.
     bool itSaidSo = false;
     const QSet<chain::Hash256> waiting = std::exchange(waitingTip_, {});
     for (const chain::Hash256& txid : waiting) {
         proofQueued_.remove(txid);
         refusedOnce_.remove(txid);
-        if (namedHere_.contains(txid)) {
-            failedProof_.insert(txid);
-            itSaidSo = true;
-            const int position = book_->find(txid);
-            if (position >= 0)
-                compareTouching(position);
-        }
+        failedProof_.insert(txid);
+        itSaidSo = itSaidSo || namedHere_.contains(txid);
+        const int position = book_->find(txid);
+        if (position >= 0)
+            compareTouching(position);
     }
     noteProgress();
     if (itSaidSo)
@@ -1063,22 +1091,60 @@ void UtxoHistory::onReorg(int fromHeight)
     // An address a server follows hears of this by itself. One read in rounds would not until its next
     // round, and until then its transactions would be asked for where they no longer are, of servers
     // that rightly refuse: read now, and its list says where they are.
-    QSet<QString> notFollowed;
+    QSet<QString> readAgain = addressesReplacedFrom(fromHeight, std::numeric_limits<int>::max());
+    QVector<int> waitingOnAList;
     for (int position = 0; position < book_->size(); ++position) {
-        if (book_->at(position).height < fromHeight)
+        if (book_->at(position).seen != TxSeen::Alive || book_->at(position).height < fromHeight)
             continue;
         bool followed = true;
         for (const TxEffect& effect : book_->effectsOf(position)) {
             const QString& scripthash = book_->addressAt(effect.address).scripthash;
             if (!client_->isFollowing(scripthash)) {
-                notFollowed.insert(scripthash);
+                readAgain.insert(scripthash);
                 followed = false;
             }
         }
         if (followed)
             queueProof(position);
+        else
+            waitingOnAList.append(position);
     }
-    for (const QString& scripthash : std::as_const(notFollowed)) {
+    readListsAgain(readAgain);
+    // Unless no list is on its way: nobody will read that address, or its row has gone.
+    for (const int position : std::as_const(waitingOnAList)) {
+        const QVector<TxEffect>& effects = book_->effectsOf(position);
+        const bool comes = std::any_of(effects.cbegin(), effects.cend(), [this](const TxEffect& effect) {
+            const QString& scripthash = book_->addressAt(effect.address).scripthash;
+            return queued_.contains(scripthash) || reading_.contains(scripthash);
+        });
+        if (!comes)
+            queueProof(position);
+    }
+    // A list that left out what was proven was right after all.
+    retryRefused();
+    schedulePump();
+}
+
+// What a proof took down has that proof alone against it. With the proof gone, nothing else would
+// look: the status of those addresses has not moved.
+QSet<QString> UtxoHistory::addressesReplacedFrom(int fromHeight, int toHeight) const
+{
+    QSet<QString> out;
+    for (int position = 0; position < book_->size(); ++position) {
+        if (book_->at(position).seen != TxSeen::Replaced)
+            continue;
+        const int by = book_->find(book_->at(position).replacedBy);
+        if (by < 0 || book_->at(by).proven || book_->at(by).height < fromHeight || book_->at(by).height > toHeight)
+            continue;
+        for (const TxEffect& effect : book_->effectsOf(position))
+            out.insert(book_->addressAt(effect.address).scripthash);
+    }
+    return out;
+}
+
+void UtxoHistory::readListsAgain(const QSet<QString>& addresses)
+{
+    for (const QString& scripthash : addresses) {
         const int row = model_->findByScripthash(network_, scripthash);
         if (row < 0)
             continue;
@@ -1086,9 +1152,6 @@ void UtxoHistory::onReorg(int fromHeight)
         book_->setStatus(scripthash, QString());
         consider(scripthash, model_->at(row).status, false);
     }
-    // A list that left out what was proven was right after all.
-    retryRefused();
-    schedulePump();
 }
 
 void UtxoHistory::giveUpWaitingProofs()

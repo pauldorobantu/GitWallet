@@ -70,6 +70,7 @@ public:
     QList<AccountKey> allAccounts() const; // every wallet's, in file order
     const WalletEntry* find(quint32 id) const; // nullptr if none
     quint32 takeWalletId();                    // the id for a new wallet
+    quint32 nextWalletId() const { return nextWalletId_; } // below it, one not in the file was removed from it
 
     // The format of the file load() read when it is older than what save() writes, else 0:
     // the build that wrote it cannot read what save() makes of it.

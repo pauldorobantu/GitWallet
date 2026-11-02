@@ -301,6 +301,11 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     connect(ledger_, &store::Ledger::labelsProblem, this, [this](const QString& message) {
         emit errorOccurred(wallet::Problem::LabelsNotKept, message, QString());
     });
+    connect(ledger_, &store::Ledger::labelsOwedChanged, this, [this](const QString& why) {
+        if (ledger_->labelsOwed())
+            emit errorOccurred(wallet::Problem::LabelsOwed, QStringLiteral("The labels and notes of a file kept aside could not be written into this one: %1. Until they have, none can be changed. This is tried again every minute.").arg(why), QString());
+        emit statusChanged();
+    });
     connect(ledger_, &store::Ledger::labelsRead, this, [this](const QHash<QString, QString>& labels) {
         addressLabels_ = labels;
         emit labelsChanged();
@@ -602,6 +607,11 @@ bool WalletController::removeWallet(quint32 id, QString* error)
         setError(error, QStringLiteral("The wallet was not removed: what is saved is still being read. Try again in a moment."));
         return false;
     }
+    // Its labels would come back with those.
+    if (ledger_->labelsOwed()) {
+        setError(error, QStringLiteral("The wallet was not removed: ") + labelsBlocker());
+        return false;
+    }
     const qsizetype position = std::find_if(store_.wallets.cbegin(), store_.wallets.cend(),
                                             [id](const wallet::WalletEntry& w) { return w.id == id; })
                                - store_.wallets.cbegin();
@@ -621,18 +631,26 @@ bool WalletController::removeWallet(quint32 id, QString* error)
 
     stopServices();
     // What only this PC knew of its addresses goes with them.
-    QStringList labelled;
+    QHash<QString, QString> labelled;
+    QSet<QString> elsewhere;
     for (int row = 0; row < model_->size(); ++row) {
         const wallet::AddressRow& r = model_->at(row);
-        if (r.wallet == id && addressLabels_.contains(r.address))
-            labelled.append(r.address);
+        if (!addressLabels_.contains(r.address))
+            continue;
+        if (r.wallet == id)
+            labelled.insert(r.address, QString());
+        else
+            elsewhere.insert(r.address);
     }
-    for (const QString& address : std::as_const(labelled)) {
-        addressLabels_.remove(address);
-        ledger_->saveAddressLabel(address, QString());
-    }
-    if (!labelled.isEmpty())
+    for (const QString& address : std::as_const(elsewhere))
+        labelled.remove(address);
+    if (!labelled.isEmpty()) {
+        for (auto it = labelled.cbegin(); it != labelled.cend(); ++it)
+            addressLabels_.remove(it.key());
+        // In one go: one by one, each is a flush to disk, and everything else waits behind those.
+        ledger_->saveAddressLabels(labelled);
         emit labelsChanged();
+    }
     const QList<wallet::HistoryBook*> books = scheduler_->books();
     for (wallet::HistoryBook* book : books)
         book->forgetWallet(id);
@@ -987,6 +1005,22 @@ bool WalletController::keepingSaved() const
     return ledger_->isOpen();
 }
 
+bool WalletController::labelsOwed() const
+{
+    return ledger_->labelsOwed();
+}
+
+bool WalletController::historiesRead() const
+{
+    if (!scheduler_->allAnswered())
+        return false;
+    const QList<wallet::UtxoHistory*> histories = scheduler_->histories();
+    return std::all_of(histories.cbegin(), histories.cend(), [](const wallet::UtxoHistory* history) {
+        const wallet::HistoryProgress progress = history->progress();
+        return history->running() && history->connected() && !progress.working() && progress.refused == 0;
+    });
+}
+
 bool WalletController::hasUnreadKeys() const
 {
     return std::any_of(store_.wallets.cbegin(), store_.wallets.cend(),
@@ -1105,6 +1139,8 @@ QString WalletController::labelsBlocker() const
         return ui::trText(QStringLiteral("A file of labels is still going in. Try again in a moment."));
     if (!ledger_->isOpen())
         return ui::trText(QStringLiteral("Labels and notes are not being kept: %1.")).arg(ledgerClosedWhy_.isEmpty() ? ui::trText(QStringLiteral("another GitWallet window holds this folder")) : ledgerClosedWhy_);
+    if (ledger_->labelsOwed())
+        return ui::trText(QStringLiteral("The labels and notes of an older file have yet to come over, and until they have none can be changed. This is tried again every minute: free some disk space if the disk is full."));
     return {};
 }
 
@@ -1371,14 +1407,16 @@ void WalletController::importNextPart(const std::shared_ptr<LabelImport>& import
     QHash<wallet::Network, QHash<chain::Hash256, wallet::TxNote>> notes;
     QHash<QString, QString> labels;
     const qsizetype to = qMin(import->at + kImportChunk, import->lines.size());
+    const bool allRead = historiesRead();
     for (; import->at < to; ++import->at) {
         const wallet::LabelLine& line = import->lines.at(import->at);
         const QString label = line.label.trimmed();
         const QString note = line.note.trimmed();
         // Whatever goes into a label ends up in an export. Like a wallet's name, it never holds a secret.
         if (import->suspect.contains(int(import->at)) && (holdsSecret(label, import->named) || holdsSecret(note, import->named))) {
-            // If all that looks like one is an id, it may be a transaction these wallets have yet to read.
-            if (!wallet::looksLikeSecret(withoutIds(label)) && !wallet::looksLikeSecret(withoutIds(note)))
+            // If all that looks like one is an id, it may be a transaction these wallets have yet to
+            // read. Once they have read all there is, it is not going to be.
+            if (!allRead && !wallet::looksLikeSecret(withoutIds(label)) && !wallet::looksLikeSecret(withoutIds(note)))
                 ++import->later;
             else
                 ++import->left;
@@ -1535,7 +1573,7 @@ void WalletController::openLedger()
     rowsBeforeLedger_ = model_->checkedCount();
     showingSaved_ = rowsBeforeLedger_ == 0; // part of what it kept, as it arrives
     savedAt_ = QDateTime();
-    ledger_->open(wallet::WalletStore::databasePath(), store_.databaseKey, ids);
+    ledger_->open(wallet::WalletStore::databasePath(), store_.databaseKey, ids, store_.nextWalletId());
 }
 
 void WalletController::tryLedgerAgain()
@@ -1571,7 +1609,7 @@ void WalletController::onLedgerLoaded(const QList<store::SavedPrice>& prices, co
         wallets.insert(w.id);
     const QList<wallet::HistoryBook*> books = scheduler_->books();
     for (wallet::HistoryBook* book : books)
-        book->keepWallets(wallets);
+        book->keepWallets(wallets, store_.nextWalletId());
 
     QList<net::PriceQuote> quotes;
     for (const store::SavedPrice& saved : prices) {

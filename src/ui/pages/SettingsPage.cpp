@@ -378,7 +378,7 @@ void SettingsPage::importLabels()
         if (later > 0) {
             // More than a toast has room for, and the one chance to say not to throw the file away.
             auto* box = new QMessageBox(QMessageBox::Information, trText(QStringLiteral("Import labels")),
-                                        trText(QStringLiteral("%1 lines name a transaction these wallets have not read yet, and look like a private key until they have. Keep the file, and import it again once the history is read."))
+                                        trText(QStringLiteral("%1 lines name a transaction these wallets have not read yet, and look like a private key until they have. Keep the file, and import it again once the history is read. What is still refused then is left out for good."))
                                             .arg(later),
                                         QMessageBox::Ok, this);
             box->setAttribute(Qt::WA_DeleteOnClose);
