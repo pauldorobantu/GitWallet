@@ -110,7 +110,7 @@ QString copyValue(const QModelIndex& index, const QSet<int>& columns)
     const QVariant custom = index.data(kCopyRole);
     const QString text = (custom.isValid() ? custom.toString() : index.data().toString())
                              .trimmed();
-    if (text.isEmpty() || text == QLatin1String("—")
+    if (text.isEmpty() || text == QStringLiteral("—")
         || text.endsWith(QLatin1String("(locked)")))
         return QString();
     return text;

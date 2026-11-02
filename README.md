@@ -19,6 +19,8 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
 
 ![Receive: the next unused address, its QR code, and what was given out](docs/screenshot-receive.png)
 
+![What came in, the latest first, with how each stands now](docs/screenshot-payments.png)
+
 *The wallets and figures in these pictures are made up, on the addresses of public test seeds. While
 something is still being read a figure says so: "≥" for what is known so far, "—" for nothing known.*
 

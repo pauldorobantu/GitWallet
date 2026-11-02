@@ -301,7 +301,7 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     check(listed(model->at(scene.rowOf(0)).address), QStringLiteral("and an address with nothing: it is no dust"));
     const int shownWithout = table->model()->rowCount();
     check(shownWithout == model->size() - 3, QStringLiteral("three rows left the list (%1 of %2)").arg(shownWithout).arg(model->size()));
-    check(countLine().contains(QStringLiteral("3 dust hidden")), QStringLiteral("and it says so: %1").arg(countLine()));
+    check(countLine().contains(QStringLiteral("funded · 3 dust hidden")), QStringLiteral("and it says so: %1").arg(countLine()));
     check(countLine().contains(QStringLiteral("· 4 funded")), QStringLiteral("what it calls funded is what it shows: %1").arg(countLine()));
     auto* search = addresses->findChild<QLineEdit*>();
     const QString dustAddress = model->at(scene.rowOf(1)).address;

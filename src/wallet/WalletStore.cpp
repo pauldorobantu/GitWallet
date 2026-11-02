@@ -768,6 +768,9 @@ bool WalletStore::save(QString* error, QByteArray* digest) const
     const QString path = filePath();
     const QString dir = QFileInfo(path).absolutePath();
 
+    // What this holds is nothing yet: written now, it would take the place of all that is under the password.
+    if (needsPassword())
+        return fail(error, QStringLiteral("The wallet was not saved: wallet.dat is under a password, and not open yet."));
     QString why;
     if (!checkWallets(wallets, &why))
         return fail(error, QStringLiteral("The wallet was not saved: %1.").arg(why));

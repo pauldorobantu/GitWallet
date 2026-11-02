@@ -631,6 +631,9 @@ void MainWindow::refreshBell()
 
 void MainWindow::openPayments()
 {
+    // A notification can be clicked with the window locked.
+    if (locked_)
+        return;
     auto* dialog = new PaymentsDialog(controller_, this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &PaymentsDialog::openAddressRequested, this, [this](const wallet::AddressRow& row) {
@@ -677,7 +680,7 @@ void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
     if (locked_)
         text = trText(QStringLiteral("A payment came in"));
     lastPaymentAlert_ = text;
-    if (isActiveWindow()) {
+    if (QGuiApplication::applicationState() == Qt::ApplicationActive) {
         Feedback::show(this, Feedback::Type::Success, text);
         return;
     }

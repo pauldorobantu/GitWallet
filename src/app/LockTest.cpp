@@ -7,6 +7,7 @@
 #include "ui/TitleBar.h"
 #include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/dialogs/PasswordDialog.h"
+#include "ui/dialogs/PaymentsDialog.h"
 #include "ui/pages/LockPage.h"
 #include "ui/pages/SettingsPage.h"
 #include "wallet/History.h"
@@ -223,6 +224,8 @@ void testStoreFile(const Check& check, const QList<wallet::AccountKey>& keys)
     error.clear();
     check(!reader.load(&error) && reader.needsPassword(), QStringLiteral("loading it asks for the password"));
     check(reader.wallets.isEmpty() && reader.databaseKey.isEmpty(), QStringLiteral("and holds nothing until then"));
+    const QByteArray onDisk = fileBytes(WalletStore::filePath());
+    check(!reader.save(&error) && fileBytes(WalletStore::filePath()) == onDisk, QStringLiteral("and nothing it would write takes the place of what is under the password"));
     const QByteArray wrong = seal::makeKey(seal::passwordBytes(QString::fromLatin1(kOtherPassword)), cost);
     check(!reader.openSealed(wrong, &error) && reader.needsPassword() && reader.wallets.isEmpty(), QStringLiteral("another password opens nothing: %1").arg(error));
     check(reader.openSealed(key, &error), QStringLiteral("the right one opens it: %1").arg(error));
@@ -341,6 +344,8 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         check(!shown.window->findChild<ui::SideNav*>()->isVisible() && !settings->isVisible(), QStringLiteral("and nothing else shows"));
         check(!shown.window->titleBar()->findChild<QWidget*>(QStringLiteral("tbBell"))->isVisible() && !shown.window->titleBar()->findChild<QWidget*>(QStringLiteral("tbLock"))->isVisible(), QStringLiteral("not even the bell"));
         check(shown.controller->hasWallet(), QStringLiteral("what runs goes on behind it"));
+        shown.window->openPayments();
+        check(!shown.window->findChild<ui::PaymentsDialog*>(), QStringLiteral("and a notification clicked on opens no list over it"));
         wallet::WalletModel* model = shown.controller->model();
         const int row = model->find(shown.controller->store().wallets.first().id, wallet::findNetwork(QStringLiteral("ethereum"))->network, chain::ScriptType::EthAccount, 0, 0, 1);
         if (row >= 0) {
@@ -389,6 +394,9 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         // How long, kept.
         auto* after = settings->findChild<QComboBox*>(QStringLiteral("lockAfter"));
         check(after && after->isVisible() && after->currentData().toInt() == wallet::WalletStore::kDefaultLockMinutes, QStringLiteral("it locks after a quarter of an hour unless told otherwise"));
+        after->setCurrentIndex(after->findData(30));
+        emit after->activated(after->currentIndex());
+        check(shown.controller->lockMinutes() == 30, QStringLiteral("the page changes it: %1").arg(shown.controller->lockMinutes()));
         check(shown.controller->setLockMinutes(5, &error), QStringLiteral("another time: %1").arg(error));
         check(after->currentData().toInt() == 5, QStringLiteral("shows"));
 

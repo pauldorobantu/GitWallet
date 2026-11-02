@@ -85,14 +85,14 @@ void setServer(QLabel* label, const wallet::NetworkStatus& status)
     QString text = status.server.isEmpty() ? trText(QStringLiteral("Not connected")) : status.server;
     if (status.tiers.rounds > 0) {
         const int minutes = qMax(1, status.tiers.roundSeconds / 60);
-        text += QLatin1String(" · ")
+        text += QStringLiteral(" · ")
                 + trText(QStringLiteral("%1 live, %2 read every %3 min"))
                       .arg(formatCount(status.tiers.live), formatCount(status.tiers.rounds), formatCount(minutes));
     }
     // Nonces are read now and then, and all they can add is a rare address. Long overdue, the
     // figures are as right as ever, but what lies past those windows is not looked at.
     if (status.noncesAt.isValid() && status.noncesAt.secsTo(QDateTime::currentDateTime()) > kNoncesOldSeconds)
-        text += QLatin1String(" · ") + trText(QStringLiteral("nonces from %1")).arg(shownTime(status.noncesAt, QDate::currentDate()));
+        text += QStringLiteral(" · ") + trText(QStringLiteral("nonces from %1")).arg(shownTime(status.noncesAt, QDate::currentDate()));
     label->setText(text);
     setTone(label, status.server.isEmpty() ? Tone::Muted : Tone::Neutral);
 }

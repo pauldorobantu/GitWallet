@@ -2,6 +2,7 @@
 
 #include "app/WalletController.h"
 #include "ui/DialogChrome.h"
+#include "ui/Feedback.h"
 #include "ui/Figures.h"
 #include "ui/HoverRowTable.h"
 #include "ui/Icons.h"
@@ -280,6 +281,7 @@ void PaymentsDialog::openChosen()
             return;
         }
     }
+    Feedback::show(this, Feedback::Type::Info, trText(QStringLiteral("That address is not among those followed now")));
 }
 
 void PaymentsDialog::done(int result)

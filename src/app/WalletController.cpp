@@ -380,8 +380,8 @@ WalletController::~WalletController()
         QString why;
         saveStore(&why);
     }
-    // A copy of the labels someone is counting on: nothing would otherwise be there, with part of it
-    // in the clear beside it.
+    // A copy of the labels or a backup someone is counting on: nothing would otherwise be there, with part of
+    // it in the clear beside it. And a key being made takes all the memory it was given until it is done.
     for (const QPointer<QThread>& thread : std::as_const(copiesBeingWritten_)) {
         if (thread)
             thread->wait();
@@ -1208,7 +1208,7 @@ QString WalletController::pricesLine() const
     }
     if (!doubted.isEmpty())
         parts << ui::trText(QStringLiteral("sources disagree on %1")).arg(doubted.join(QStringLiteral(", ")));
-    return parts.join(QLatin1String(" · "));
+    return parts.join(QStringLiteral(" · "));
 }
 
 wallet::UtxoHistory* WalletController::historyOf(wallet::Network network) const
@@ -1582,7 +1582,8 @@ void WalletController::openWithPassword(const QString& password, QObject* guard,
         return;
     }
     const QPointer<QObject> stillThere(guard);
-    offThisThread(this, [bytes = wallet::seal::passwordBytes(password), cost]() mutable {
+    copiesBeingWritten_.removeIf([](const QPointer<QThread>& thread) { return thread.isNull(); });
+    copiesBeingWritten_ += offThisThread(this, [bytes = wallet::seal::passwordBytes(password), cost]() mutable {
         const QByteArray key = wallet::seal::makeKey(bytes, cost);
         wallet::seal::wipe(bytes);
         return key;
@@ -1606,7 +1607,8 @@ void WalletController::openWithPassword(const QString& password, QObject* guard,
 void WalletController::checkPassword(const QString& password, QObject* guard, const std::function<void(bool)>& done)
 {
     const QPointer<QObject> stillThere(guard);
-    offThisThread(this, [bytes = wallet::seal::passwordBytes(password), cost = store_.passwordCost()]() mutable {
+    copiesBeingWritten_.removeIf([](const QPointer<QThread>& thread) { return thread.isNull(); });
+    copiesBeingWritten_ += offThisThread(this, [bytes = wallet::seal::passwordBytes(password), cost = store_.passwordCost()]() mutable {
         const QByteArray key = wallet::seal::makeKey(bytes, cost);
         wallet::seal::wipe(bytes);
         return key;
@@ -1627,7 +1629,8 @@ void WalletController::changePassword(const QString& current, const QString& fre
         wallet::seal::Cost cost;
     };
     const bool hadOne = store_.hasPassword();
-    offThisThread(this, [hadOne, currentBytes = wallet::seal::passwordBytes(current), freshBytes = wallet::seal::passwordBytes(fresh), costNow = store_.passwordCost()]() mutable {
+    copiesBeingWritten_.removeIf([](const QPointer<QThread>& thread) { return thread.isNull(); });
+    copiesBeingWritten_ += offThisThread(this, [hadOne, currentBytes = wallet::seal::passwordBytes(current), freshBytes = wallet::seal::passwordBytes(fresh), costNow = store_.passwordCost()]() mutable {
         Keys keys;
         if (hadOne)
             keys.current = wallet::seal::makeKey(currentBytes, costNow);

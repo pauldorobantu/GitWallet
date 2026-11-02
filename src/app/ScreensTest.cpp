@@ -17,7 +17,13 @@
 #include "ui/pages/HoldingsPage.h"
 #include "ui/pages/PortfolioPage.h"
 #include "ui/pages/ReceivePage.h"
+#include "ui/pages/SettingsPage.h"
 #include "ui/pages/WalletsPage.h"
+#include "ui/dialogs/PaymentsDialog.h"
+#include "wallet/History.h"
+#include "wallet/Payments.h"
+#include "wallet/Seal.h"
+#include "wallet/UtxoHistory.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
@@ -40,6 +46,8 @@
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QRandomGenerator>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSet>
 #include <QStackedWidget>
 #include <QTabBar>
@@ -2530,6 +2538,85 @@ bool writeScreenPictures(const QString& folder)
     window.showPage(QStringLiteral("receive"));
     window.findChild<ui::ReceivePage*>()->showFor(shop, wallet::networkInfo(bitcoin).coin);
     all = picture(QStringLiteral("receive")) && all;
+
+    // What came in: payments on three wallets, as they would come.
+    wallet::PaymentBook::setPauseForTest(10);
+    wallet::HistoryBook* book = controller->historyOf(bitcoin)->book();
+    const auto payBitcoin = [&](quint32 wallet, quint32 index, qint64 satoshi, int height, uint32_t nonce) {
+        const wallet::AccountKey* key = nullptr;
+        for (const wallet::AccountKey& each : controller->store().find(wallet)->accounts) {
+            if (each.type == segwit)
+                key = &each;
+        }
+        wallet::AddressRow row = model->at(model->find(wallet, bitcoin, segwit, 0, 0, index));
+        row.status = QStringLiteral("paid %1").arg(nonce);
+        row.used = true;
+        row.checked = true;
+        if (height > 0)
+            row.confirmed += satoshi;
+        else
+            row.unconfirmed += satoshi;
+        model->upsert(row);
+        chain::Bytes raw;
+        const auto put = [&raw](uint64_t value, int bytes) {
+            for (int shift = 0; shift < bytes * 8; shift += 8)
+                raw.push_back(uint8_t(value >> shift));
+        };
+        put(2, 4);
+        raw.push_back(1);
+        raw.resize(raw.size() + 32, uint8_t(nonce));
+        put(0, 4);
+        raw.push_back(0);
+        put(0xffffffff, 4);
+        raw.push_back(1);
+        put(uint64_t(satoshi), 8);
+        const chain::Bytes script = chain::addressFromChainNode(key->node().deriveChild(0), key->type, key->account, 0, index, wallet::networkInfo(bitcoin).format).scriptPubKey;
+        raw.push_back(uint8_t(script.size()));
+        raw.insert(raw.end(), script.begin(), script.end());
+        put(nonce, 4);
+        chain::Transaction tx;
+        chain::parseTransaction(raw, &tx);
+        book->setHeight(book->add(tx, height, QDateTime::currentSecsSinceEpoch(), [&](const QString& scripthash) {
+            const int at = model->findByScripthash(bitcoin, scripthash);
+            if (at < 0)
+                return false;
+            book->describeAddress(scripthash, model->at(at).wallet, model->at(at).address);
+            return true;
+        }), height);
+    };
+    payBitcoin(partner, 5, 2750000, 900000, 1);
+    holdOnEthereum(warehouse, 2, "ethereum/usdt", 1250000000ULL);
+    payBitcoin(shop, 8, 640000, 900001, 2);
+    holdOnEthereum(shop, 5, "ethereum/usdc", 420500000ULL);
+    payBitcoin(shop, 9, 185000, 0, 3);
+    pause(100);
+    window.openPayments();
+    pause(300);
+    if (auto* payments = window.findChild<ui::PaymentsDialog*>()) {
+        pause(200);
+        all = payments->grab().save(folder + QStringLiteral("/payments.png")) && all;
+        payments->done(0);
+    } else {
+        all = false;
+    }
+    pause(100);
+    wallet::PaymentBook::setPauseForTest(1000);
+
+    // Settings, down where the password and the backup are, and the lock itself.
+    window.showPage(QStringLiteral("settings"));
+    pause(200);
+    if (auto* settings = window.findChild<ui::SettingsPage*>()) {
+        if (auto* scroll = settings->findChild<QScrollArea*>())
+            scroll->verticalScrollBar()->setValue(scroll->verticalScrollBar()->maximum());
+    }
+    all = picture(QStringLiteral("settings-safety")) && all;
+    bool over = false;
+    wallet::seal::setCostForTest(256, 1);
+    controller->changePassword(QString(), QStringLiteral("a sentence for a picture"), false, &window, [&over](const QString&) { over = true; });
+    waitFor([&over] { return over; }, 20000);
+    wallet::seal::setCostForTest(0, 0);
+    window.lockNow();
+    all = picture(QStringLiteral("lock")) && window.isLocked() && all;
     controller->removeAllWallets(&error);
     QCoreApplication::processEvents();
     return all;

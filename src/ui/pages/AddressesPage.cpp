@@ -905,9 +905,9 @@ void AddressesPage::updateState()
     }
     QString countLine = hasWallet ? countText(shown, total, funded) : QString();
     if (hasWallet && dustHidden > 0)
-        countLine += QLatin1String(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(figures::formatCount(dustHidden));
+        countLine += QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(figures::formatCount(dustHidden));
     if (hasWallet && controller_->showingSaved())
-        countLine += QLatin1String(" · ") + trText(QStringLiteral("saved, being checked"));
+        countLine += QStringLiteral(" · ") + trText(QStringLiteral("saved, being checked"));
     ui_->count->setText(countLine);
     ui_->count->setVisible(hasWallet);
 
