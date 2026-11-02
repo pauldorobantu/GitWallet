@@ -72,7 +72,8 @@ real UI.
 | 7 | **Send** | Normal send and sweep for Bitcoin and Ethereum-style chains: fee presets, coin control, address book, first-time recipient warnings. Test networks first, then a small real payment the owner approves | 12-18 |
 | 8 | **More families** | XRP, Solana, then Cosmos, Cardano, TON and others, one at a time, each counted only when balances, history and prices pass, up to about 50 chains | 25-40 |
 
-Coins and send together are likely above 100 sessions. Every stage leaves something usable.
+Together that is about 60 to 100 sessions, and work of this size tends to overrun. Every
+stage leaves something usable.
 
 ## Decisions only the owner can make
 
