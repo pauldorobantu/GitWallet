@@ -52,6 +52,7 @@ HeaderChain::HeaderChain(const ChainProofs& proofs, net::ElectrumClient* client,
     connect(retry_, &QTimer::timeout, this, [this] {
         // A server that stays, because there is no other, gets another chance.
         refused_ = false;
+        refusalSaid_ = false;
         int moved = 0;
         for (auto it = refusedAsks_.begin(); it != refusedAsks_.end() && moved < kAsksPerRetry; ++moved) {
             wanted_.insert(*it);
@@ -65,6 +66,7 @@ HeaderChain::HeaderChain(const ChainProofs& proofs, net::ElectrumClient* client,
     // What was on its way goes to the next server with the rest of what the client holds.
     connect(client_, &net::ElectrumClient::ready, this, [this] {
         refused_ = false;
+        refusalSaid_ = false;
         wanted_.unite(refusedAsks_);
         refusedAsks_.clear();
         sendAsks();
@@ -92,18 +94,19 @@ void HeaderChain::start()
     askedAgain_.clear();
     syncing_ = false;
     refused_ = false;
+    refusalSaid_ = false;
     retry_->setInterval(gRetryMs);
     // The file has its own code per page; a header that no longer follows ends what is believed.
+    // Those under the checkpoint wait until they are wanted: at the size this is for, that is most of
+    // what a start would otherwise hold the window for.
     const QMap<int, QByteArray>& kept = book_->headers();
     int next = proofs_.checkpointHeight + 1;
     bool holds = true;
-    for (auto it = kept.cbegin(); it != kept.cend(); ++it) {
+    for (auto it = kept.lowerBound(next); it != kept.cend(); ++it) {
         chain::BlockHeader header;
         if (!chain::parseHeader(bytesOf(it.value()), &header))
             continue;
-        if (it.key() <= proofs_.checkpointHeight) {
-            below_.insert(it.key(), header);
-        } else if (holds && it.key() == next && follows(header, next, [this](int height) { return aboveAt(height); })) {
+        if (holds && it.key() == next && follows(header, next, [this](int height) { return aboveAt(height); })) {
             above_.append(header);
             ++next;
         } else {
@@ -135,7 +138,15 @@ const chain::BlockHeader* HeaderChain::at(int height) const
     if (height > proofs_.checkpointHeight)
         return aboveAt(height);
     const auto found = below_.constFind(height);
-    return found == below_.cend() ? nullptr : &found.value();
+    if (found != below_.cend())
+        return &found.value();
+    if (askedAgain_.contains(height))
+        return nullptr;
+    const auto kept = book_->headers().constFind(height);
+    chain::BlockHeader header;
+    if (kept == book_->headers().cend() || !chain::parseHeader(bytesOf(*kept), &header))
+        return nullptr;
+    return &*below_.insert(height, header);
 }
 
 template <typename Prior>
@@ -174,7 +185,7 @@ void HeaderChain::ask(int height)
         sync();
         return;
     }
-    if (below_.contains(height) || asked_.contains(height) || wanted_.contains(height) || refusedAsks_.contains(height))
+    if (at(height) || asked_.contains(height) || wanted_.contains(height) || refusedAsks_.contains(height))
         return;
     wanted_.insert(height);
     sendAsks();
@@ -182,11 +193,11 @@ void HeaderChain::ask(int height)
 
 void HeaderChain::askAgain(int height)
 {
-    const auto kept = below_.constFind(height);
-    if (kept == below_.cend())
+    const chain::BlockHeader* kept = at(height);
+    if (!kept)
         return;
     askedAgain_.insert(height, kept->hash);
-    below_.erase(kept);
+    below_.remove(height);
     ask(height);
 }
 
@@ -421,9 +432,12 @@ void HeaderChain::retryLater()
 
 void HeaderChain::noteRefused()
 {
-    if (!running_ || retry_->isActive())
+    if (!running_)
+        return;
+    retryLater();
+    if (refusalSaid_)
         return; // the rest of the same try
-    retry_->start();
+    refusalSaid_ = true;
     emit headersRefused();
 }
 

@@ -161,9 +161,10 @@ private:
     void onBadProof(const chain::Hash256& txid, int height);
     void askServerOf(int height, const QString& lie);
     void noteDishonest(const QString& why);
-    bool moveOn(const QString& why);
+    bool moveOn(const QString& why, bool lie = false);
     enum Asked { AskedHistory, AskedTransaction, AskedProof, AskedKinds };
     void noteRefusal(Asked kind);
+    void noteAddressRefused(const QString& scripthash);
     void noteAnswered(Asked kind);
     void noteAllWell();
     void pauseFor(int ms);
@@ -210,9 +211,11 @@ private:
     QSet<chain::Hash256> failedProof_;     // did not hold, or refused twice: asked again when the chain or server moves
     QSet<int> doubtedHeights_;             // being looked into: is the server wrong, or the chain behind
     QSet<QString> refusedAddresses_;       // no answer whole on this connection: asked again on the next
+    QSet<QString> retrying_;               // of those, on their way again: all is not well yet
+    QSet<chain::Hash256> namedHere_;       // what this connection's server has listed: its to answer for
     struct Contradiction {
-        QString status;     // what the status said then
-        bool again = false; // and asked once more, in case its news was late
+        QString status;  // what the status said then
+        qint64 since = 0; // ms since the epoch: its news may be late, for a while
     };
     QHash<QString, Contradiction> contradicted_; // a list that was not what the status said
     QSet<QString> differing_;
@@ -226,6 +229,9 @@ private:
     int pausedMs_ = 0;
     int priceBackoffMs_ = 0;
     int moves_ = 0;           // servers left for what a history needs, since all was well
+    int lieMoves_ = 0;        // and for a lie: what no server gives says nothing of one that lies
+    qint64 lastLieMs_ = 0;
+    quint64 priceRun_ = 0;    // a start or a stop: a price has nothing to do with a connection
     int headerRefusals_ = 0;  // tries the chain's asks were refused on, on this connection
     int tipAtWait_ = -1;
     bool running_ = false;

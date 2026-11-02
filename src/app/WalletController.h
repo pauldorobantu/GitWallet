@@ -11,6 +11,8 @@
 #include <QString>
 
 #include <memory>
+#include <QPointer>
+#include <QThread>
 #include <string>
 #include <vector>
 
@@ -168,8 +170,9 @@ public:
     void writeLabelsFile(const QString& path, QObject* guard, const std::function<void(bool ok, const QString& error)>& done);
     // What such a file says goes in, a part per event-loop turn, over what is there: only what a
     // line says, so that a file from a wallet that has only labels leaves a note alone. `done`: how
-    // many went in and how many lines were left out, or -1 with `error` when none can be kept.
-    void importLabelsFile(const QString& path, QObject* guard, const std::function<void(int added, int skipped, const QString& error)>& done);
+    // many went in, how many lines were left out, how many name a transaction not read yet, so
+    // that the same file will take them later, or -1 with `error` when none can be kept.
+    void importLabelsFile(const QString& path, QObject* guard, const std::function<void(int added, int skipped, int later, const QString& error)>& done);
 
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
@@ -216,8 +219,9 @@ private:
     void openLedger();
     void onLedgerLoaded(const QList<store::SavedPrice>& prices, const QList<store::SavedTime>& times);
     void importNextPart(const std::shared_ptr<LabelImport>& import);
-    // A key among what looks like one: the id of a transaction these wallets know is no secret.
-    bool holdsSecret(const QString& text) const;
+    // A key among what looks like one: the id of a transaction these wallets know, or that a file of
+    // labels names, is no secret.
+    bool holdsSecret(const QString& text, const QSet<chain::Hash256>& alsoKnown = {}) const;
     int differingAddresses() const;
     void saveTimes();  // when each network last had a whole answer
     void savePrices();
@@ -259,6 +263,7 @@ private:
     QHash<QString, QString> addressLabels_;
     QString ledgerClosedWhy_;       // why nothing can be kept, when the database is not open
     bool importingLabels_ = false;
+    QList<QPointer<QThread>> copiesBeingWritten_; // a window closing waits for those
     bool running_ = false;          // between startServices() and stopServices()
     bool waitingForLedger_ = false; // the scans start when the database has handed over
     bool showingSaved_ = false;

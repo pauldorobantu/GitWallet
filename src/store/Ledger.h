@@ -69,6 +69,8 @@ signals:
     // Everything has been read. `savedAt`: when each network last had a full answer.
     void loaded(const QList<SavedPrice>& prices, const QList<SavedTime>& times);
     void problem(const QString& message);
+    // Labels and notes are not going in. Its own: what is said of balances says nothing of those.
+    void labelsProblem(const QString& message);
     // A new database took the place of this one. `recovered`: labels and notes that came along from
     // it, -1 if it could not be read at all. `whole`: and it had no others.
     void setAside(const QString& file, int recovered, bool whole);

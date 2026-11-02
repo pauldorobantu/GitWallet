@@ -556,6 +556,17 @@ int main(int argc, char** argv)
             }
             return true;
         };
+        // What a server refused for a moment is asked again in a moment: a minute at most, and what
+        // is left then is what the report is to say.
+        const auto nothingRefused = [controller] {
+            const QList<wallet::UtxoHistory*> histories = controller->histories();
+            for (const wallet::UtxoHistory* history : histories) {
+                const wallet::HistoryProgress progress = history->progress();
+                if (progress.refused > 0 || progress.unproven > 0)
+                    return false;
+            }
+            return true;
+        };
         const auto pricesDone = [controller] {
             const QList<wallet::UtxoHistory*> histories = controller->histories();
             for (const wallet::UtxoHistory* history : histories) {
@@ -567,20 +578,23 @@ int main(int argc, char** argv)
             }
             return true;
         };
-        QObject::connect(controller, &app::WalletController::scanFinished, controller, [finish, historyDone, pricesDone, controller] {
+        QObject::connect(controller, &app::WalletController::scanFinished, controller, [finish, historyDone, nothingRefused, pricesDone, controller] {
             auto* wait = new QTimer(controller);
             wait->setInterval(500);
             auto clock = std::make_shared<QElapsedTimer>();
             auto settled = std::make_shared<int>(0);
             clock->start();
-            QObject::connect(wait, &QTimer::timeout, controller, [finish, historyDone, pricesDone, wait, clock, settled] {
+            QObject::connect(wait, &QTimer::timeout, controller, [finish, historyDone, nothingRefused, pricesDone, wait, clock, settled] {
                 if (!historyDone()) {
                     *settled = 0;
                     clock->restart();
                     return;
                 }
-                // A moment of quiet, then prices have up to 30 s: what predates them never gets one.
-                if (++*settled < 4 || (!pricesDone() && clock->elapsed() < 30000))
+                if (!nothingRefused() && clock->elapsed() < 60000)
+                    return;
+                // Long enough for what adds up to be looked at twice. Then prices have up to 30 s:
+                // what predates them never gets one.
+                if (++*settled < 22 || (!pricesDone() && clock->elapsed() < 30000))
                     return;
                 wait->stop();
                 finish(false);

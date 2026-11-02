@@ -377,6 +377,15 @@ void HistoryBook::settleConflicts(int position)
             if (other == position)
                 continue;
             TxRecord& rival = txs_[other];
+            // What is proven to have spent those coins says what this is, whatever a list says.
+            if (tx.height <= 0 && rival.seen == TxSeen::Alive && rival.proven && rival.height > 0) {
+                TxRecord& self = txs_[position];
+                --pending_;
+                self.seen = TxSeen::Replaced;
+                self.replacedBy = rival.txid;
+                touch(position);
+                return;
+            }
             // A pending one loses to what a block holds. Two pending ones wait: a server lists one
             // of them at most, and the one it stops listing goes through markGone().
             if (rival.seen == TxSeen::Dropped || (rival.seen == TxSeen::Alive && inBlock && rival.height <= 0)) {
@@ -525,8 +534,9 @@ void HistoryBook::forget(const QSet<QString>& scripthashes)
         return;
     std::vector<char> leaving(size_t(txs_.size()), 0);
     for (int position = 0; position < txs_.size(); ++position) {
+        // What has nothing on any address yet may be another wallet's, still on its way, with its note.
         const QVector<TxEffect>& theirs = effects_.at(position);
-        leaving[size_t(position)] = !std::any_of(theirs.cbegin(), theirs.cend(), [&going](const TxEffect& e) { return !going.contains(e.address); });
+        leaving[size_t(position)] = !theirs.isEmpty() && !std::any_of(theirs.cbegin(), theirs.cend(), [&going](const TxEffect& e) { return !going.contains(e.address); });
     }
     removeRecords(leaving, going, scripthashes);
 }
@@ -573,9 +583,10 @@ void HistoryBook::removeRecords(const std::vector<char>& leaving, const QSet<int
         }
         const int to = next++;
         movedTo[size_t(position)] = to;
-        bool outputsGone = false;
+        bool changed = false;
         if (!goingScripthashes.isEmpty()) {
             // Outputs of the addresses that go are no more to be counted as the wallets'.
+            bool outputsGone = false;
             for (const OurOutput& output : std::as_const(record.outputs)) {
                 if (goingScripthashes.contains(output.scripthash)) {
                     owned_.remove(chain::OutPoint{record.txid, output.n});
@@ -584,10 +595,17 @@ void HistoryBook::removeRecords(const std::vector<char>& leaving, const QSet<int
             }
             if (outputsGone)
                 record.outputs.removeIf([&goingScripthashes](const OurOutput& output) { return goingScripthashes.contains(output.scripthash); });
-            // What stays spends and pays as it did; an address that went no longer counts.
-            effects_[position].removeIf([&goingAddresses](const TxEffect& effect) { return goingAddresses.contains(effect.address); });
+            changed = outputsGone;
+            // What stays spends and pays as it did; an address that went no longer counts. Of what it
+            // spent from one, its fee is no more known than a scan without that wallet would know it.
+            QVector<TxEffect>& effects = effects_[position];
+            if (std::any_of(effects.cbegin(), effects.cend(), [&goingAddresses](const TxEffect& effect) { return effect.spent > 0 && goingAddresses.contains(effect.address); })) {
+                record.fee = -1;
+                changed = true;
+            }
+            effects.removeIf([&goingAddresses](const TxEffect& effect) { return goingAddresses.contains(effect.address); });
         }
-        if (dirtyTxs_.contains(position) || outputsGone)
+        if (dirtyTxs_.contains(position) || changed)
             dirty.insert(to);
         if (!effects_.at(position).isEmpty())
             ++lines_;
@@ -605,15 +623,16 @@ void HistoryBook::removeRecords(const std::vector<char>& leaving, const QSet<int
 
     for (auto it = positions_.begin(); it != positions_.end(); ++it)
         it.value() = movedTo[size_t(it.value())];
+    // In two walks: an erase can bring back round what one walk has been past, and it would be
+    // numbered twice.
     for (auto it = spenders_.begin(); it != spenders_.end();) {
-        const int to = movedTo[size_t(it.value())];
-        if (to < 0) {
+        if (movedTo[size_t(it.value())] < 0)
             it = spenders_.erase(it);
-        } else {
-            it.value() = to;
+        else
             ++it;
-        }
     }
+    for (auto it = spenders_.begin(); it != spenders_.end(); ++it)
+        it.value() = movedTo[size_t(it.value())];
     for (int id = 0; id < addresses_.size(); ++id) {
         AddressEntry& entry = addresses_[id];
         if (goingAddresses.contains(id)) {
@@ -651,7 +670,14 @@ void HistoryBook::keepWallets(const QSet<quint32>& wallets)
         if (entry.wallet != 0 && !wallets.contains(entry.wallet))
             going.insert(entry.scripthash);
     }
+    // Nobody removed it: a wallet.dat from before it was added comes to the same. What only this PC
+    // has stays, for when it is back; a removal is what takes that.
+    const QHash<chain::Hash256, TxNote> notes = notes_;
     forget(going);
+    if (notes_.size() != notes.size()) {
+        notes_ = notes;
+        emit notesChanged();
+    }
 }
 
 void HistoryBook::addHeader(int height, const QByteArray& raw)

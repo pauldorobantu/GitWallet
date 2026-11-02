@@ -30,6 +30,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -77,10 +78,25 @@ public:
 
     void keyboardSearch(const QString& text) override
     {
-        if (!search)
+        // A space means choosing the row.
+        if (!search || text.trimmed().isEmpty())
             return;
         search->setFocus();
         search->insert(text);
+    }
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        // What the row means, whole, and past the clipboard's history as every copy here is. Not the
+        // cell as it is drawn: an id with its middle left out names nothing.
+        if (event->matches(QKeySequence::Copy) && currentIndex().isValid()) {
+            const QVariant whole = currentIndex().data(kCopyRole);
+            copyTextToClipboard(this, whole.isValid() ? whole.toString() : currentIndex().data().toString(), trText(QStringLiteral("Copied")));
+            event->accept();
+            return;
+        }
+        HoverRowTableView::keyPressEvent(event);
     }
 };
 
@@ -125,6 +141,7 @@ struct HistoryPage::Ui : QObject
     chain::Hash256 chosenTx{};
     bool hadPlace = false;
     bool placeHeld = false; // read before a book moved everything: the next rebuild goes by that
+    int yearOfFilter = 0;   // what "this year" and "last year" were worked out from
 
     // An export on its way, a chunk per event-loop turn.
     QVector<HistoryTableModel::Line> exporting;
@@ -261,7 +278,7 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->periodAgain = new QTimer(this);
     ui_->periodAgain->setInterval(kPeriodAgainMs);
     connect(ui_->periodAgain, &QTimer::timeout, this, [this] {
-        if (ui_->period->currentIndex() != PeriodAll)
+        if (periodMoved())
             applyFilter();
     });
 
@@ -325,6 +342,12 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     if (controller_) {
         connect(controller_, &WalletController::walletChanged, this, [this] {
             rebuildWalletFilter();
+            // One address the page was narrowed to, and its wallet is gone.
+            if (!ui_->scripthash.isEmpty() && controller_->model()->findByScripthash(ui_->addressNetwork, ui_->scripthash) < 0) {
+                ui_->scripthash.clear();
+                ui_->address.clear();
+                applyFilter();
+            }
             updateState();
         });
         connect(controller_, &WalletController::historyProgress, this, [this] {
@@ -353,9 +376,24 @@ void HistoryPage::showEvent(QShowEvent* event)
     QWidget::showEvent(event);
     ui_->model->setWatched(true);
     ui_->periodAgain->start();
-    if (ui_->period->currentIndex() != PeriodAll)
+    if (periodMoved())
         applyFilter();
     updateState();
+}
+
+bool HistoryPage::periodMoved() const
+{
+    switch (ui_->period->currentIndex()) {
+    case PeriodDay:
+    case PeriodWeek:
+    case PeriodMonth:
+        return true;
+    case PeriodYear:
+    case PeriodLastYear:
+        return ui_->yearOfFilter != QDate::currentDate().year();
+    default:
+        return false;
+    }
 }
 
 void HistoryPage::hideEvent(QHideEvent* event)
@@ -441,6 +479,7 @@ void HistoryPage::applyFilter()
     filter.state = ui_->state->currentData().toInt();
     filter.query = ui_->search->text().trimmed();
     const QDateTime now = QDateTime::currentDateTime();
+    ui_->yearOfFilter = now.date().year();
     switch (ui_->period->currentIndex()) {
     case PeriodDay:
         filter.from = now.addDays(-1).toSecsSinceEpoch();
@@ -524,8 +563,10 @@ void HistoryPage::updateState()
     // What the lines shown came to, in the only coin there is so far.
     QString line;
     if (hasWallet) {
-        line = shown == total ? trText(total == 1 ? QStringLiteral("%1 transaction") : QStringLiteral("%1 transactions")).arg(grouped(total))
-                              : trText(QStringLiteral("%1 of %2 transactions")).arg(grouped(shown), grouped(total));
+        // Of the same moment: what comes in between two rebuilds is no filter.
+        const int all = ui_->model->totalAtRebuild();
+        line = shown == all ? trText(all == 1 ? QStringLiteral("%1 transaction") : QStringLiteral("%1 transactions")).arg(grouped(all))
+                            : trText(QStringLiteral("%1 of %2 transactions")).arg(grouped(shown), grouped(all));
         const wallet::NetworkInfo* utxo = wallet::firstOf(wallet::Family::Utxo);
         if (utxo && shown > 0) {
             const wallet::AssetInfo& coin = wallet::assetInfo(utxo->coin);
@@ -630,8 +671,10 @@ void HistoryPage::restorePlace()
     if (ui_->hadPlace) {
         const int row = ui_->model->rowOf(ui_->topBook, ui_->topTx);
         if (row >= 0) {
-            // Down to that line, and no further along: it also scrolls sideways to its column.
+            // Down to that line, and no further along: it also scrolls sideways to its column. With
+            // the list as long as it is now: its scroll bar is otherwise as long as it was.
             const int sideways = view->horizontalScrollBar()->value();
+            view->doItemsLayout();
             view->scrollTo(ui_->model->index(row, 0), QAbstractItemView::PositionAtTop);
             view->horizontalScrollBar()->setValue(sideways);
         }

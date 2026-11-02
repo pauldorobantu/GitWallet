@@ -73,6 +73,7 @@ public:
     void setFilter(const Filter& filter);
     const Filter& filter() const { return filter_; }
     int totalCount() const; // every line there is, whatever is narrowed
+    int totalAtRebuild() const { return totalAtRebuild_; } // the same, as it was when the lines shown were put together
     // What the lines shown came to, of those proven in a block: what is pending, or on a server's
     // word, is not to be counted as paid.
     qint64 receivedShown() const { return receivedShown_; }
@@ -116,7 +117,7 @@ private:
     double coinValue(const Line& line) const;
     double priceNow(const wallet::HistoryBook& book) const;
     QString walletText(const Line& line) const;
-    QStringList walletNames(const Line& line, quint32 only, int atMost) const;
+    QStringList walletNames(const Line& line, const Filter& filter, int atMost) const;
     QStringList addressesOf(const Line& line, const Filter& filter) const;
     void refreshLabels();
     void noteProgress();
@@ -133,6 +134,7 @@ private:
     int lastRebuildMs_ = 0;
     int tipsSeen_ = 0;
     int failedSeen_ = 0;
+    int totalAtRebuild_ = 0;
     bool watched_ = false;
     bool stale_ = false;
 };

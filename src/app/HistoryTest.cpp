@@ -317,6 +317,7 @@ public:
     bool emptyChunks = false;  // none, while it says it has more
     bool listLeavesOut = false; // a list that is not what its status says
     bool hideAll = false;      // nothing of any address: no status, no list, no balance
+    QSet<chain::Hash256> refuseRawOf; // these raw transactions only
     int heightLie = 0;         // added to each height in a list, and in the status that goes with it
     QSet<QString> unread;      // addresses it will not read, whose balance it still gives
     qint64 balanceLie = 0;
@@ -518,7 +519,7 @@ private:
             chain::Hash256 txid{};
             chain::hashFromHex(params.at(0).toString().toStdString(), &txid);
             const auto found = txs_.constFind(txid);
-            if (refuseRaw || found == txs_.cend()) {
+            if (refuseRaw || refuseRawOf.contains(txid) || found == txs_.cend()) {
                 refuse(peer, id);
             } else if (lieInRaw) {
                 answer(peer, id, hexOf(rawTransaction({{hashOf("0000000000000000000000000000000000000000000000000000000000000002"), 0}}, {{{0x51}, 1}}, 12345)));
@@ -871,6 +872,11 @@ void testBook(const Check& check, const wallet::AccountKey& key)
     check(rbf.at(firstAt).seen == wallet::TxSeen::Alive, QStringLiteral("a server's word that a block holds something else takes nothing from it"));
     rbf.setProven(secondAt, true, 0);
     check(rbf.at(firstAt).seen == wallet::TxSeen::Replaced && rbf.at(firstAt).replacedBy == second.txid, QStringLiteral("and what a block is proven to hold beats what is pending"));
+    rbf.setHeight(firstAt, 0);
+    check(rbf.at(firstAt).seen == wallet::TxSeen::Replaced, QStringLiteral("even if a list then names it again"));
+    const chain::Transaction third = spend(52, 70000);
+    const int thirdAt = rbf.add(third, 0, 4000, isOurs);
+    check(rbf.at(thirdAt).seen == wallet::TxSeen::Replaced && rbf.netOf(ours[0].scripthash) == 0, QStringLiteral("and a new one that spends the same coins is taken for what it is"));
 
     // Counted as it goes, whatever it goes through.
     {
@@ -1053,8 +1059,50 @@ void testBook(const Check& check, const wallet::AccountKey& key)
     }();
     const int spendsAt = two.add(spendsKept, 100, 1000, isOurs);
     check(two.netOf(ours[2].scripthash) == 0 && two.hasEffectOn(spendsAt, ours[2].scripthash) && two.at(spendsAt).fee == 1000, QStringLiteral("and what spends it afterwards still finds what it spends"));
+    const chain::Hash256 notedBefore = stillThere.txid;
+    two.setNote(notedBefore, {QStringLiteral("on a wallet that is about to go missing"), QString()});
+    two.takeDelta();
     two.keepWallets({9});
     check(two.size() == 0, QStringLiteral("those no longer in the file do not"));
+    // Nobody removed that one: a wallet.dat from before it was added comes to the same.
+    check(two.noteOf(notedBefore).label.startsWith(QLatin1String("on a wallet")), QStringLiteral("though what only this PC has stays, for when it is back"));
+    const wallet::HistoryDelta afterMissing = two.takeDelta();
+    check(afterMissing.removedTxs.contains(notedBefore) && !afterMissing.removedNotes.contains(notedBefore), QStringLiteral("in the file too"));
+
+    // What has no effect yet may be another wallet's, on its way.
+    {
+        wallet::HistoryBook book(key.network);
+        book.add(txs[0], 100, 1000, isOurs);
+        const chain::Transaction waiting = [&] {
+            chain::Transaction tx;
+            chain::parseTransaction(rawTransaction({{hashOf("00000000000000000000000000000000000000000000000000000000000000ad"), 0}}, {{foreignScript, 5}}, 78), &tx);
+            return tx;
+        }();
+        const int waitingAt = book.add(waiting, 100, 1000, isOurs);
+        check(book.effectsOf(waitingAt).isEmpty(), QStringLiteral("a transaction read before what made its coins touches nothing yet"));
+        book.setNote(waiting.txid, {QStringLiteral("rent"), QString()});
+        book.describeAddress(ours[0].scripthash, 1, ours[0].address);
+        book.forgetWallet(1);
+        check(book.find(waiting.txid) >= 0 && book.noteOf(waiting.txid).label == QLatin1String("rent"), QStringLiteral("and stays, with its note, when another wallet goes"));
+    }
+    // The fee of what also spent from a wallet that goes is no more known than without that wallet.
+    {
+        wallet::HistoryBook book(key.network);
+        chain::Transaction fromOne;
+        chain::Transaction fromTwo;
+        chain::Transaction spendsBoth;
+        chain::parseTransaction(rawTransaction({{hashOf("00000000000000000000000000000000000000000000000000000000000000ae"), 0}}, {{ours[0].script, 1000}}, 80), &fromOne);
+        chain::parseTransaction(rawTransaction({{hashOf("00000000000000000000000000000000000000000000000000000000000000af"), 0}}, {{ours[1].script, 1000}}, 81), &fromTwo);
+        chain::parseTransaction(rawTransaction({{fromOne.txid, 0}, {fromTwo.txid, 0}}, {{foreignScript, 1900}}, 82), &spendsBoth);
+        book.add(fromOne, 100, 1000, isOurs);
+        book.add(fromTwo, 100, 1000, isOurs);
+        const int at = book.add(spendsBoth, 100, 1000, isOurs);
+        check(book.at(at).fee == 100, QStringLiteral("what spends from two wallets knows its fee"));
+        book.describeAddress(ours[0].scripthash, 1, ours[0].address);
+        book.describeAddress(ours[1].scripthash, 2, ours[1].address);
+        book.forgetWallet(1);
+        check(book.at(book.find(spendsBoth.txid)).fee == -1, QStringLiteral("and with one of them gone, knows it no more"));
+    }
 }
 
 void testFlow(const Check& check, const wallet::AccountKey& key)
@@ -1207,11 +1255,11 @@ void testLiars(const Check& check, const wallet::AccountKey& key)
     check(said > 0, QStringLiteral("and the window says so"));
     said = twoServers([](FakeChain* s) { s->wrongBitsAt = 15; }, QStringLiteral("nor where the difficulty changes, if it is not what the rule gives"), provenThere, 10, 5);
     check(said > 0, QStringLiteral("and the window says so"));
-    said = twoServers([](FakeChain* s) { s->listLeavesOut = true; }, QStringLiteral("a list that is not what its status says is not believed, and the next server reads it"), provenThere);
-    check(said > 0, QStringLiteral("and the window says so"));
     said = twoServers([](FakeChain* s) { s->heightLie = 100000; }, QStringLiteral("a transaction in a block a server does not have goes no further"), provenThere);
     check(said > 0, QStringLiteral("and the window says so"));
     wallet::UtxoHistory::setFirstPauseForTest(300);
+    said = twoServers([](FakeChain* s) { s->listLeavesOut = true; }, QStringLiteral("a list that is not what its status says is not believed, and the next server reads it"), provenThere);
+    check(said > 0, QStringLiteral("and the window says so"));
     said = twoServers([](FakeChain* s) { s->refuseBranch = true; }, QStringLiteral("a server that will not give a header below the checkpoint is left for one that does"), provenThere, 25);
     said = twoServers([](FakeChain* s) { s->refuseChunks = true; }, QStringLiteral("so is one that will not give headers past it"), provenThere);
     said = twoServers([](FakeChain* s) { s->emptyChunks = true; }, QStringLiteral("or says it has more, and gives none"), provenThere);
@@ -1267,7 +1315,166 @@ void testLiars(const Check& check, const wallet::AccountKey& key)
         check(waitFor([&book, &txid] { return book.find(txid) >= 0 && book.at(book.find(txid)).proven; }, 15000), QStringLiteral("a proof holds"));
         run.history.stop();
         run.history.start();
-        check(run.history.progress().unproven == 0, QStringLiteral("and is not asked for again at the next start"));
+        check(book.at(book.find(txid)).proven && run.history.progress().proofsLeft == 0, QStringLiteral("and is not asked for again at the next start"));
+    }
+    {
+        // A height another server made up is not the next one's to answer for.
+        FakeChain liar;
+        chain::Hash256 txid{};
+        chainWithPayment(&liar, &txid);
+        liar.heightLie = 100000;
+        FakeChain second;
+        chain::Hash256 same{};
+        chainWithPayment(&second, &same);
+        FakeChain third;
+        chain::Hash256 also{};
+        chainWithPayment(&third, &also);
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        HistoryRun run(&model, &book, second.proofs(10), {liar.line(), second.line(), third.line()}, key);
+        check(waitFor([&book, &same] { return book.find(same) >= 0 && book.at(book.find(same)).proven; }, 20000), QStringLiteral("a server lies about a block: the next proves it where it is"));
+        pause(1500);
+        check(third.connections == 0 && run.problems.size() == 1, QStringLiteral("without the honest one being blamed for that (%1 said)").arg(run.problems.size()));
+    }
+    {
+        // What every server refuses does not use up what it takes to leave one that lies.
+        const AddressOf other = addressOf(key, 0, 1);
+        FakeChain one;
+        FakeChain two;
+        const chain::Hash256 refused = one.fund(first.script, 1000);
+        two.fund(first.script, 1000);
+        one.mine();
+        two.mine();
+        one.refuseRawOf.insert(refused);
+        two.refuseRawOf.insert(refused);
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        wallet::UtxoHistory::setFirstPauseForTest(200);
+        HistoryRun run(&model, &book, one.proofs(10), {one.line(), two.line()}, key);
+        check(waitFor([&two, &run] { return two.connections > 0 && run.history.progress().refused > 0 && !run.history.progress().working(); }, 15000), QStringLiteral("no server gives a transaction, and the next has been tried"));
+        const chain::Hash256 paid = two.fund(other.script, 500);
+        one.fund(other.script, 500);
+        two.mine();
+        one.mine();
+        two.lieInMerkle = true;
+        const int before = one.connections;
+        two.notifyTip();
+        two.notifyHere(other.scripthash);
+        check(waitFor([&one, before] { return one.connections > before; }, 15000), QStringLiteral("and when the one it is on then lies, it can still be left"));
+        check(waitFor([&book, &paid] { return book.find(paid) >= 0 && book.at(book.find(paid)).proven; }, 15000), QStringLiteral("for what the other can prove"));
+        wallet::UtxoHistory::setFirstPauseForTest(0);
+    }
+    {
+        // Back from refusing: a proof that came late clears what did not add up, and what was refused
+        // is asked for again when a block comes, with no other server to go to.
+        const AddressOf other = addressOf(key, 0, 1);
+        FakeChain only;
+        chain::Hash256 txid{};
+        chainWithPayment(&only, &txid);
+        const chain::Hash256 refused = only.fund(other.script, 500);
+        only.mine();
+        only.refuseProofs = true;
+        only.refuseRawOf.insert(refused);
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        wallet::UtxoHistory::setFirstPauseForTest(200);
+        HistoryRun run(&model, &book, only.proofs(10), {only.line()}, key);
+        check(waitFor([&run] { const wallet::HistoryProgress p = run.history.progress(); return p.unproven > 0 && p.differing > 0 && p.refused > 0; }, 25000), QStringLiteral("a server gives no proof and a raw transaction: nothing counts on them, and it says so"));
+        only.refuseProofs = false;
+        only.refuseRawOf.clear();
+        only.mine();
+        only.notifyTip();
+        check(waitFor([&run, &book, &refused] { const wallet::HistoryProgress p = run.history.progress(); return p.unproven == 0 && p.differing == 0 && p.refused == 0 && book.find(refused) >= 0; }, 25000),
+              QStringLiteral("and when it gives them, with the next block, all of that clears"));
+        wallet::UtxoHistory::setFirstPauseForTest(0);
+    }
+    {
+        // Asked for by one that says it is no longer in that block.
+        FakeChain only;
+        chain::Hash256 txid{};
+        chainWithPayment(&only, &txid);
+        only.lieInMerkle = true;
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        wallet::UtxoHistory::setFirstPauseForTest(200);
+        HistoryRun run(&model, &book, only.proofs(10), {only.line()}, key);
+        check(waitFor([&run] { return run.history.progress().unproven > 0; }, 15000), QStringLiteral("a proof fails"));
+        only.lieInMerkle = false;
+        only.reorganise(1, {});
+        only.notifyTip();
+        only.notifyHere(first.scripthash);
+        check(waitFor([&run, &book, &txid] { const int at = book.find(txid); return at >= 0 && book.at(at).height <= 0 && run.history.progress().unproven == 0; }, 15000),
+              QStringLiteral("then a list says it is pending: there is no proof to fail any more"));
+        wallet::UtxoHistory::setFirstPauseForTest(0);
+    }
+    {
+        // A server that refuses headers for many blocks at once: more than a try asks again.
+        FakeChain refuser(4);
+        FakeChain honest(4);
+        QVector<chain::Hash256> paid;
+        for (int i = 0; i < 230; ++i) {
+            refuser.fund(first.script, 1000 + i);
+            refuser.mine();
+            paid.append(honest.fund(first.script, 1000 + i));
+            honest.mine();
+        }
+        refuser.refuseBranch = true;
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        wallet::UtxoHistory::setFirstPauseForTest(300);
+        HistoryRun run(&model, &book, honest.proofs(honest.tip()), {refuser.line(), honest.line()}, key);
+        check(waitFor([&honest] { return honest.connections > 0; }, 25000), QStringLiteral("a server refusing a great many headers is still left"));
+        check(waitFor([&run, &book] { return run.settled() && book.size() == 230; }, 40000), QStringLiteral("for one that gives them"));
+        wallet::UtxoHistory::setFirstPauseForTest(0);
+    }
+    {
+        // A first read: what lists name is read as it goes, not after every list.
+        FakeChain server;
+        QVector<AddressOf> addresses;
+        for (quint32 i = 0; i < 60; ++i) {
+            addresses.append(addressOf(key, 0, i));
+            server.fund(addresses.last().script, 1000 + int(i));
+        }
+        server.mine();
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        HistoryRun run(&model, &book, server.proofs(10), {server.line()}, key, 80);
+        const auto lists = [&server] { return server.calls.value(QStringLiteral("blockchain.scripthash.get_history")); };
+        const auto raws = [&server] { return server.calls.value(QStringLiteral("blockchain.transaction.get")); };
+        const bool listsCame = waitFor([&lists] { return lists() >= 20; }, 15000);
+        check(listsCame && raws() > 0, QStringLiteral("lines come as the lists do (%1 lists, %2 raw transactions)").arg(lists()).arg(raws()));
+        check(waitFor([&run, &book] { return run.settled() && book.size() == 60; }, 20000), QStringLiteral("and all of them in the end"));
+    }
+    {
+        // An address read in rounds, and a block that gives way: nobody is left for that.
+        const int places = 1;
+        wallet::UtxoScanner::setLivePlacesForTest(places);
+        wallet::UtxoScanner::setPacesForTest(1000, 0, 0);
+        FakeChain server;
+        FakeChain second;
+        const AddressOf far = addressOf(key, 0, 2);
+        const chain::Hash256 txid = server.fund(far.script, 7000);
+        second.fund(far.script, 7000);
+        server.mine();
+        second.mine();
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        wallet::UtxoHistory::setFirstPauseForTest(200);
+        {
+            HistoryRun run(&model, &book, server.proofs(10), {server.line(), second.line()}, key);
+            check(waitFor([&book, &txid] { return book.find(txid) >= 0 && book.at(book.find(txid)).proven; }, 20000), QStringLiteral("a payment on an address read in rounds is proven"));
+            const int before = book.at(book.find(txid)).height;
+            server.reorganise(1, {});
+            for (int i = 0; i < 3; ++i)
+                server.mine();
+            server.notifyTip();
+            check(waitFor([&book, &txid, before] { const int at = book.find(txid); return at >= 0 && book.at(at).proven && book.at(at).height != before; }, 20000),
+                  QStringLiteral("its block gives way: it is read where it now is, at once"));
+            check(second.connections == 0, QStringLiteral("and no server is left for telling the truth about it"));
+        }
+        wallet::UtxoHistory::setFirstPauseForTest(0);
+        wallet::UtxoScanner::setLivePlacesForTest(0);
+        wallet::UtxoScanner::setPacesForTest(0, 0, 0);
     }
     {
         // What a list names has to touch the address. Not even a server that was left can leave it behind.
@@ -1708,6 +1915,7 @@ void testLedger(const Check& check, const wallet::AccountKey& key)
         QStringList said;
         QObject::connect(&ledger, &store::Ledger::loaded, &ledger, [&loaded] { loaded = true; });
         QObject::connect(&ledger, &store::Ledger::problem, &ledger, [&said](const QString& message) { said.append(message); });
+        QObject::connect(&ledger, &store::Ledger::labelsProblem, &ledger, [&said](const QString& message) { said.append(message); });
         ledger.open(path, keyBytes, wallets);
         check(waitFor([&loaded] { return loaded; }, 10000), QStringLiteral("the database opens again"));
         sqlite3* holder = holdFile();
@@ -1806,6 +2014,72 @@ void testLedger(const Check& check, const wallet::AccountKey& key)
         const store::SavedLabels another = store::LedgerDb::salvageLabels(path, QByteArray(32, 'x'));
         check(!another.read && another.count() == 0, QStringLiteral("under another key a file gives nothing, and says it could not read it"));
     }
+    // A bad page among notes: what lies beyond it is read from the other end.
+    {
+        const QString many = folder.filePath(QStringLiteral("many-notes.db"));
+        constexpr int kNotes = 6000;
+        {
+            store::LedgerDb db;
+            QString why;
+            db.open(many, keyBytes, &why);
+            QHash<chain::Hash256, wallet::TxNote> notes;
+            for (int n = 0; n < kNotes; ++n) {
+                chain::Hash256 txid{};
+                txid[0] = uint8_t(n);
+                txid[1] = uint8_t(n >> 8);
+                notes.insert(txid, {QStringLiteral("note %1").arg(n), QStringLiteral("so that a page holds few of these")});
+            }
+            db.saveNotes(key.network, notes, &why);
+            db.close();
+        }
+        {
+            QFile file(many);
+            file.open(QIODevice::ReadWrite);
+            file.seek(file.size() / 2);
+            const char flipped = 0x5a;
+            file.write(&flipped, 1);
+        }
+        const store::SavedLabels saved = store::LedgerDb::salvageLabels(many, keyBytes);
+        check(saved.read && !saved.whole && saved.count() > kNotes * 9 / 10 && saved.count() < kNotes, QStringLiteral("one bad page costs what it holds, not what comes after it (%1 of %2)").arg(saved.count()).arg(kNotes));
+        // A file from before there were any has none to lose.
+        sqlite3* raw = nullptr;
+        const QString oldFile = folder.filePath(QStringLiteral("no-notes.db"));
+        sqlite3_open_v2(oldFile.toUtf8().constData(), &raw, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+        const QByteArray pragma = "PRAGMA key = \"x'" + keyBytes.toHex() + "'\"";
+        sqlite3_exec(raw, pragma.constData(), nullptr, nullptr, nullptr);
+        sqlite3_exec(raw, "CREATE TABLE address(id INTEGER PRIMARY KEY); PRAGMA user_version = 1;", nullptr, nullptr, nullptr);
+        sqlite3_close_v2(raw);
+        const store::SavedLabels none = store::LedgerDb::salvageLabels(oldFile, keyBytes);
+        check(none.read && none.whole && none.count() == 0, QStringLiteral("and a file from before there were any has none to lose"));
+    }
+    // A file set aside on a full disk: its labels and notes come over at the next start that can.
+    {
+        const QString pending = folder.filePath(QStringLiteral("pending.db"));
+        const QString aside = pending + QStringLiteral(".unread-20260101-000000");
+        const chain::Hash256 noted = hashOf("00000000000000000000000000000000000000000000000000000000000000c4");
+        {
+            store::LedgerDb db;
+            QString why;
+            db.open(aside, keyBytes, &why);
+            db.saveNote(key.network, noted, {QStringLiteral("older"), QString()}, &why);
+            db.saveAddressLabel(QStringLiteral("bc1qpending"), QStringLiteral("Till 4"), &why);
+            db.close();
+        }
+        QFile(aside + QStringLiteral(".labels-pending")).open(QIODevice::WriteOnly);
+        wallet::WalletModel model;
+        wallet::HistoryBook book(key.network);
+        store::Ledger ledger(&model);
+        ledger.addBook(&book);
+        bool loaded = false;
+        QHash<QString, QString> labels;
+        QObject::connect(&ledger, &store::Ledger::loaded, &ledger, [&loaded] { loaded = true; });
+        QObject::connect(&ledger, &store::Ledger::labelsRead, &ledger, [&labels](const QHash<QString, QString>& read) { labels = read; });
+        ledger.open(pending, keyBytes, wallets);
+        check(waitFor([&loaded] { return loaded; }, 15000), QStringLiteral("a start finds a file whose labels and notes have yet to come over"));
+        check(book.noteOf(noted).label == QLatin1String("older") && labels.value(QStringLiteral("bc1qpending")) == QLatin1String("Till 4"), QStringLiteral("and they do"));
+        check(!QFile::exists(aside + QStringLiteral(".labels-pending")), QStringLiteral("once"));
+        ledger.close();
+    }
 
     // What a wallet leaves behind goes with it, whatever rows the window has.
     {
@@ -1827,6 +2101,11 @@ void testLedger(const Check& check, const wallet::AccountKey& key)
         db.saveRows({row, shared, other}, &why);
         db.saveAddressLabel(QStringLiteral("bc1qfour"), QStringLiteral("goes"), &why);
         db.saveAddressLabel(QStringLiteral("bc1qshared"), QStringLiteral("stays"), &why);
+        // A wallet that is only not in this wallet.dat, at a start: its rows go, not what only this PC has.
+        QVector<wallet::AddressRow> read;
+        check(db.loadRows({5}, 100, [&read](QVector<wallet::AddressRow>&& chunk) { read += chunk; }, &why) && read.size() == 1, QStringLiteral("a start lets go of the rows of a wallet it does not know"));
+        check(db.loadAddressLabels(&why).value(QStringLiteral("bc1qfour")) == QLatin1String("goes"), QStringLiteral("but keeps its labels"));
+        db.saveRows({row, shared, other}, &why);
         QStringList gone;
         check(db.removeWallet(4, &why, &gone) && gone == QStringList{QStringLiteral("bc1qfour")}, QStringLiteral("a wallet removed takes its addresses' labels along, and says which"));
         check(db.loadAddressLabels(&why).value(QStringLiteral("bc1qshared")) == QLatin1String("stays"), QStringLiteral("but not those of an address another wallet has too"));
@@ -1927,6 +2206,26 @@ void testWindow(const Check& check, const wallet::AccountKey& key)
         check(lines->rowCount() == 4 && lines->rowOf(book, waiting.txid) == 0, QStringLiteral("and sorted by anything it holds the same lines"));
     }
 
+    // A search goes through addresses' labels, and follows them.
+    {
+        auto* search = page.findChild<QLineEdit*>(QStringLiteral("mimSearch"));
+        search->setText(QStringLiteral("Till 9"));
+        check(waitFor([&lines] { return lines->rowCount() == 0; }, 2000), QStringLiteral("a search for a label nobody has finds nothing"));
+        check(controller.setAddressLabel(second.address, QStringLiteral("Till 9"), &error), QStringLiteral("an address gets that label"));
+        check(waitFor([&lines] { return lines->rowCount() > 0; }, 3000), QStringLiteral("and the search finds it, without being typed again"));
+        check(controller.setAddressLabel(second.address, QString(), &error) && waitFor([&lines] { return lines->rowCount() == 0; }, 3000), QStringLiteral("and no longer when it is gone"));
+        search->clear();
+        check(waitFor([&lines] { return lines->rowCount() == 4; }, 3000), QStringLiteral("cleared, all the lines are back"));
+    }
+
+    // Narrowed to one address, a line says that one's wallet, not every wallet it touched.
+    {
+        ui::HistoryTableModel::Filter one;
+        one.scripthash = second.scripthash;
+        const ui::HistoryTableModel::ExportLine there = lines->exportLine(*lineOf(out), one);
+        check(there.wallet == QLatin1String("Shop") && there.addresses == second.address, QStringLiteral("an export narrowed to an address is of that address's wallet"));
+    }
+
     // "All of it" is all of it, whatever was left in the filters.
     {
         auto* period = page.findChild<QComboBox*>(QStringLiteral("historyPeriod"));
@@ -1974,13 +2273,15 @@ void testWindow(const Check& check, const wallet::AccountKey& key)
     }
     int added = -9;
     int skipped = -9;
+    int later = -9;
     QString importError;
-    controller.importLabelsFile(labelsPath, &controller, [&](int count, int left, const QString& why) {
+    controller.importLabelsFile(labelsPath, &controller, [&](int count, int left, int notYet, const QString& why) {
         added = count;
         skipped = left;
+        later = notYet;
         importError = why;
     });
-    check(waitFor([&added] { return added != -9; }, 15000) && added == 1 && skipped == 3, QStringLiteral("a file of labels goes in, and says what it left out (%1 and %2)").arg(added).arg(skipped));
+    check(waitFor([&added] { return added != -9; }, 15000) && added == 1 && skipped == 2 && later == 1, QStringLiteral("a file of labels goes in, and says what it left out (%1, %2 and %3)").arg(added).arg(skipped).arg(later));
     check(book->noteOf(out.txid).label == QLatin1String("From another wallet") && book->noteOf(out.txid).note.contains(knownHex), QStringLiteral("and a line with a label alone leaves the note"));
     check(controller.addressLabel(first.address) == QLatin1String("Till 1"), QStringLiteral("nor does one with nothing for an address take its label"));
     check(!book->noteOf(in.txid).label.contains(QStringLiteral("abab")), QStringLiteral("and what could be a key stays out"));
@@ -2000,8 +2301,11 @@ void testWindow(const Check& check, const wallet::AccountKey& key)
     check(read.size() == 2 && leftOut == 0 && controller.labelCount() == 2, QStringLiteral("and they are all there (%1)").arg(read.size()));
     check(controller.labelCount(wallet) >= 1, QStringLiteral("what would go with this wallet is known before it goes"));
 
+    // Narrowed to an address, and its wallet goes: the page goes back to what there is.
+    page.showAddress(key.network, first.scripthash, first.address);
     check(controller.removeAllWallets(&error), QStringLiteral("and it can all be removed"));
     check(controller.labelCount() == 0, QStringLiteral("with its labels and notes"));
+    check(lines->filter().scripthash.isEmpty(), QStringLiteral("and a page narrowed to one of its addresses no longer is"));
     wallet::UtxoHistory::setFirstPauseForTest(0);
 }
 

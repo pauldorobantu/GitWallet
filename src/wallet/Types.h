@@ -75,6 +75,7 @@ enum class Problem {
     SavedDataAside, // a database that could not be read was kept under another name, and a new one is in use
     FilesLeft,      // files that hold keys or addresses could not be deleted
     FolderHeld,     // another window holds the data folder, so nothing is saved here for now
+    LabelsNotKept,  // labels and notes, which exist nowhere else, are not going into the database
 };
 
 // One address on one network. An Evm address exists on every Evm network, with one row

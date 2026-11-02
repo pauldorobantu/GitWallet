@@ -1269,8 +1269,14 @@ void UtxoScanner::finishRoundIfDone()
 void UtxoScanner::armRoundTimer()
 {
     const qint64 wait = minRoundMs() - (nowMs() - roundStartMs_);
-    QTimer::singleShot(std::chrono::milliseconds(std::max<qint64>(wait, 0) + 1), this, [this, gen = generation_] {
-        if (gen == generation_) schedulePump();
+    // Precise: a long wait is otherwise rounded to the second, and one that ends early finds the
+    // round not due, with nothing left to come back for it.
+    QTimer::singleShot(std::chrono::milliseconds(std::max<qint64>(wait, 0) + 1), Qt::PreciseTimer, this, [this, gen = generation_] {
+        if (gen != generation_) return;
+        if (roundEndMs_ != 0 && nowMs() - roundStartMs_ < minRoundMs())
+            armRoundTimer();
+        else
+            schedulePump();
     });
 }
 

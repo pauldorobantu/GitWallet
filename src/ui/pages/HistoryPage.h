@@ -45,6 +45,7 @@ private:
     void applyColumnWidths();
     void rebuildWalletFilter();
     void resetFilters();
+    bool periodMoved() const; // what the period chosen covers is no longer what the list goes by
     void applyFilter();
     void openSelected();
     void chooseExportFile();

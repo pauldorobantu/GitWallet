@@ -75,6 +75,8 @@ $historyDifferent = @(Compare-Object (HistoryIds $live) (HistoryIds $rounds))
 # As with the rows: a block between two scans is the chain's.
 if ($historyDifferent.Count -gt 0) {
     "      $($historyDifferent.Count) lines of the history differ; reading both once more"
+    "      in rounds it stood at: $($rounds.historyState | ConvertTo-Json -Compress)"
+    $historyDifferent | Select-Object -First 5 | ForEach-Object { "      $($_.SideIndicator) $($_.InputObject)" }
     $live = Scan 'live-history-again' @()
     $rounds = Scan 'rounds-history-again' @('--live-places', '10')
     $historyDifferent = @(Compare-Object (HistoryIds $live) (HistoryIds $rounds))

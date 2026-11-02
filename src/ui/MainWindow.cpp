@@ -482,6 +482,11 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
         n.headline = trText(QStringLiteral("Saved balances are not being kept"));
         n.depends = 0;
         break;
+    case wallet::Problem::LabelsNotKept:
+        n.key = QStringLiteral("labels-not-kept");
+        n.headline = trText(QStringLiteral("Labels and notes are not being saved"));
+        n.depends = 0;
+        break;
     case wallet::Problem::FilesLeft:
         n.key = QStringLiteral("files-left");
         n.headline = trText(QStringLiteral("Some files could not be deleted"));

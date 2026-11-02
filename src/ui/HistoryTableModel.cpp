@@ -107,6 +107,11 @@ HistoryTableModel::HistoryTableModel(WalletController* controller, QObject* pare
             scheduleRebuild();
         });
         connect(controller_, &WalletController::historyProgress, this, &HistoryTableModel::noteProgress);
+        // A search goes through addresses' labels too.
+        connect(controller_, &WalletController::labelsChanged, this, [this] {
+            if (!filter_.query.isEmpty())
+                scheduleRebuild();
+        });
         connect(controller_->prices(), &net::PriceFeed::updated, this, [this] {
             if (!lines_.isEmpty())
                 emit dataChanged(index(0, ColUsdNow), index(int(lines_.size()) - 1, ColUsdNow));
@@ -347,6 +352,7 @@ void HistoryTableModel::rebuildNow()
         }
     }
     stale_ = false;
+    totalAtRebuild_ = totalCount();
     emit aboutToRebuild();
     beginResetModel();
     lines_ = std::move(lines);
@@ -415,8 +421,12 @@ void HistoryTableModel::sortLines()
         QHash<QString, int> numbers;
         for (const Line& line : std::as_const(lines_))
             numbers.insert(textOf(line), 0);
+        // As the other pages do it, whatever case a name is in.
         QStringList distinct = numbers.keys();
-        std::sort(distinct.begin(), distinct.end());
+        std::sort(distinct.begin(), distinct.end(), [](const QString& a, const QString& b) {
+            const int order = QString::compare(a, b, Qt::CaseInsensitive);
+            return order != 0 ? order < 0 : a < b;
+        });
         for (int i = 0; i < distinct.size(); ++i)
             numbers.insert(distinct.at(i), i);
         order([&](const Line& line) { return numbers.value(textOf(line)); });
@@ -482,14 +492,16 @@ int HistoryTableModel::columnCount(const QModelIndex& parent) const
     return parent.isValid() ? 0 : ColumnCount;
 }
 
-QStringList HistoryTableModel::walletNames(const Line& line, quint32 only, int atMost) const
+QStringList HistoryTableModel::walletNames(const Line& line, const Filter& filter, int atMost) const
 {
     const QVector<wallet::TxEffect>& effects = line.book->effectsOf(line.position);
     QStringList names;
     for (const wallet::TxEffect& effect : effects) {
-        const quint32 id = line.book->addressAt(effect.address).wallet;
-        const QString name = labels_.value(id);
-        if ((only == 0 || only == id) && !name.isEmpty() && !names.contains(name))
+        const wallet::HistoryBook::AddressEntry& entry = line.book->addressAt(effect.address);
+        if (!filter.scripthash.isEmpty() && entry.scripthash != filter.scripthash)
+            continue;
+        const QString name = labels_.value(entry.wallet);
+        if ((filter.wallet == 0 || filter.wallet == entry.wallet) && !name.isEmpty() && !names.contains(name))
             names.append(name);
         if (atMost > 0 && names.size() >= atMost)
             break;
@@ -505,7 +517,7 @@ QString HistoryTableModel::walletText(const Line& line) const
         const quint32 id = line.book->addressAt(effects.first().address).wallet;
         return filter_.wallet == 0 || filter_.wallet == id ? labels_.value(id) : QString();
     }
-    return walletNames(line, filter_.wallet, 3).join(QStringLiteral(" · "));
+    return walletNames(line, filter_, 3).join(QStringLiteral(" · "));
 }
 
 QList<QString> HistoryTableModel::walletsOf(const Line& line) const
@@ -729,7 +741,7 @@ HistoryTableModel::ExportLine HistoryTableModel::exportLine(const Line& line, co
     ExportLine e;
     e.date = tx.time > 0 ? QDateTime::fromSecsSinceEpoch(tx.time).toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")) : QString();
     e.kind = kindText(line.kind);
-    e.wallet = walletNames(line, filter.wallet, 0).join(QStringLiteral(" · "));
+    e.wallet = walletNames(line, filter, 0).join(QStringLiteral(" · "));
     e.amount = exactCoin(netOf(line), coin);
     e.coin = coin.symbol;
     // Signed as the amount is, so that a column for the books can be added up.

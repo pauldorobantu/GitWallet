@@ -88,7 +88,7 @@ private:
     net::ElectrumClient* client_ = nullptr;
     HistoryBook* book_ = nullptr;
     QTimer* retry_ = nullptr;
-    QHash<int, chain::BlockHeader> below_; // at or under the checkpoint, as they were asked for
+    mutable QHash<int, chain::BlockHeader> below_; // at or under the checkpoint, read when first wanted
     Candidate above_;                      // the headers right after the checkpoint, none left out
     QSet<int> wanted_;                     // below the checkpoint, to ask
     QSet<int> asked_;                      // on their way
@@ -100,6 +100,7 @@ private:
     bool syncing_ = false;
     bool resync_ = false;    // the tip moved while one was on its way
     bool refused_ = false;   // this connection's chain does not hold: nothing more is asked of it for a while
+    bool refusalSaid_ = false; // of this try
 };
 
 } // namespace wallet

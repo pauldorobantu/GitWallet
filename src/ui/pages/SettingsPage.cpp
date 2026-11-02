@@ -366,7 +366,7 @@ void SettingsPage::importLabels()
     if (path.isEmpty())
         return;
     ui_->labelsBusy(true);
-    controller_->importLabelsFile(path, this, [this](int added, int skipped, const QString& error) {
+    controller_->importLabelsFile(path, this, [this](int added, int skipped, int later, const QString& error) {
         ui_->labelsBusy(false);
         if (added < 0) {
             Feedback::show(this, Feedback::Type::Error, trText(error));
@@ -375,6 +375,16 @@ void SettingsPage::importLabels()
         Feedback::show(this, skipped > 0 ? Feedback::Type::Warning : Feedback::Type::Success,
                        skipped > 0 ? trText(QStringLiteral("%1 labels imported, %2 lines left out")).arg(added).arg(skipped)
                                    : trText(QStringLiteral("%1 labels imported")).arg(added));
+        if (later > 0) {
+            // More than a toast has room for, and the one chance to say not to throw the file away.
+            auto* box = new QMessageBox(QMessageBox::Information, trText(QStringLiteral("Import labels")),
+                                        trText(QStringLiteral("%1 lines name a transaction these wallets have not read yet, and look like a private key until they have. Keep the file, and import it again once the history is read."))
+                                            .arg(later),
+                                        QMessageBox::Ok, this);
+            box->setAttribute(Qt::WA_DeleteOnClose);
+            applyDialogChrome(box);
+            box->open();
+        }
     });
 }
 
@@ -562,6 +572,10 @@ void SettingsPage::confirmRemove()
                   + QStringLiteral("Its %1 labels and notes go too, for good: only this PC has them, and no seed brings them "
                                    "back. Keep a copy first, under Labels and notes here in Settings.")
                         .arg(labels);
+    } else if (!controller_->keepingSaved() || controller_->loadingSaved()) {
+        // Nothing to count, which is no reason to say nothing: the file goes all the same.
+        detail += QLatin1Char(' ')
+                  + QStringLiteral("Its database could not be read just now: whatever labels and notes it holds go too, for good.");
     }
     const int databases = controller_->databasesKeptAside();
     if (databases > 0) {

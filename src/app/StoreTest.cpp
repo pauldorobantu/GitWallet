@@ -9,8 +9,10 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -32,6 +34,16 @@ void runFoundationTest(const std::function<void(bool, const QString&)>& check, Q
 void runHistoryTest(const std::function<void(bool, const QString&)>& check, QString* report, const QList<wallet::AccountKey>& someKeys);
 
 namespace {
+
+// Refused while the database hands over, and these do it the moment after adding a wallet.
+bool removedAll(WalletController& controller, QString* error)
+{
+    QElapsedTimer clock;
+    clock.start();
+    while (controller.loadingSaved() && clock.elapsed() < 15000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    return controller.removeAllWallets(error);
+}
 
 // Published BIP39 test vectors; none of them is anyone's wallet.
 const char* kFirstMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -770,7 +782,7 @@ StoreTestResult runStoreTest()
             controller.model()->clear();
 
             // Remove all takes the files kept aside too.
-            done(controller.removeAllWallets(&error), QStringLiteral("every wallet can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("every wallet can be removed"));
             check(!QFile::exists(filePath) && asideFiles().isEmpty(),
                   QStringLiteral("which leaves neither wallet.dat nor the file kept aside"));
         }
@@ -797,7 +809,7 @@ StoreTestResult runStoreTest()
             QList<wallet::WalletRequest> twice{named};
             check(controller.addWallets(&twice, &error) == 0 && error.isEmpty() && !twice.at(0).refused.isEmpty(),
                   QStringLiteral("a batch of what is here already adds nothing, and says why per line"));
-            done(controller.removeAllWallets(&error), QStringLiteral("the batch can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("the batch can be removed"));
 
             // One seed, 12,000 used addresses in a row: no hole for a smaller gap to
             // leave out, but the row limit falls with the gaps (15,000 at 200/50, 10,000 at 100/50).
@@ -831,7 +843,7 @@ StoreTestResult runStoreTest()
             const WalletController::GapImpact pastLimit = controller.gapImpact(wideGaps);
             check(pastLimit.atMost && pastLimit.used == 3003, QStringLiteral("past the limit, a smaller gap still says what it loses"));
             controller.model()->clear();
-            done(controller.removeAllWallets(&error), QStringLiteral("and it can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("and it can be removed"));
 
             // Numbers go to what really goes in, and past every name in use.
             const auto numberedRequest = [](const QList<wallet::AccountKey>& accounts, const QString& base) {
@@ -877,7 +889,7 @@ StoreTestResult runStoreTest()
             check(!controller.renameWallet(renamedId, QStringLiteral("SHOP 2"), &error) && error.contains(QStringLiteral("already named")),
                   QStringLiteral("and a rename cannot take a name in use"));
             done(controller.renameWallet(renamedId, QStringLiteral("shop 1"), &error), QStringLiteral("though it can change its own"));
-            done(controller.removeAllWallets(&error), QStringLiteral("and they can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("and they can be removed"));
 
             // Raised gaps can go past the limit too, with nothing used to lose yet.
             QList<wallet::WalletRequest> twoSeeds{numberedRequest(accountsOf(kFirstMnemonic), QStringLiteral("Big")),
@@ -888,7 +900,7 @@ StoreTestResult runStoreTest()
             raised.utxoChangeGap = 5000;
             check(controller.gapImpact(raised).overLimit == 0,
                   QStringLiteral("raised to 5,000 they want 60,000 addresses: past what is followed live, not past what is read"));
-            done(controller.removeAllWallets(&error), QStringLiteral("and they can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("and they can be removed"));
 
             // Enough of them, and the limit on what is watched at all comes into it.
             QList<wallet::WalletRequest> manySeeds;
@@ -903,7 +915,7 @@ StoreTestResult runStoreTest()
             const WalletController::GapImpact raisedImpact = controller.gapImpact(raised);
             check(raisedImpact.overLimit == 200000 && raisedImpact.used == 0,
                   QStringLiteral("raised to 5,000 they want 200,000 addresses past what GitWallet watches"));
-            done(controller.removeAllWallets(&error), QStringLiteral("and they can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("and they can be removed"));
 
             // The same text can be two sets of addresses, in one wallet or two.
             QString why;
@@ -914,7 +926,7 @@ StoreTestResult runStoreTest()
                   QStringLiteral("one xpub reads as a legacy and an Ethereum account"));
             done(controller.addKeysWallet(twoKinds, QStringLiteral("Two kinds"), &error),
                  QStringLiteral("and such a wallet saves"));
-            done(controller.removeAllWallets(&error), QStringLiteral("and it can be removed"));
+            done(removedAll(controller, &error), QStringLiteral("and it can be removed"));
         }
         {
             // A file changed outside this window is not this window's to delete.
@@ -924,7 +936,7 @@ StoreTestResult runStoreTest()
             wallet::WalletStore other;
             other.wallets.append(entryOf(other.takeWalletId(), QStringLiteral("Another window's"), first));
             done(other.save(&error), QStringLiteral("another window writes the file"));
-            check(!controller.removeAllWallets(&error) && error.contains(QStringLiteral("changed outside")),
+            check(!removedAll(controller, &error) && error.contains(QStringLiteral("changed outside")),
                   QStringLiteral("remove all is refused"));
             check(QFile::exists(filePath), QStringLiteral("and the file stays"));
         }
@@ -957,7 +969,7 @@ StoreTestResult runStoreTest()
                 check(copy.open(QIODevice::ReadOnly) && copy.readAll() == before, QStringLiteral("byte for byte"));
                 copy.close();
                 check(controller.walletFilesKeptAside() == 1, QStringLiteral("remove all counts it"));
-                done(controller.removeAllWallets(&error), QStringLiteral("and removes it"));
+                done(removedAll(controller, &error), QStringLiteral("and removes it"));
                 check(copies().isEmpty(), QStringLiteral("it is gone with the wallets"));
             }
         }

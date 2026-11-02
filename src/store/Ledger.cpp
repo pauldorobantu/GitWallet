@@ -37,6 +37,12 @@ QStringList companions(const QString& path)
     return {path + QStringLiteral("-wal"), path + QStringLiteral("-shm")};
 }
 
+// Beside a file set aside whose labels and notes have yet to come over: the disk was full, say.
+QString pendingMark()
+{
+    return QStringLiteral(".labels-pending");
+}
+
 } // namespace
 
 Ledger::Ledger(wallet::WalletModel* model, QObject* parent) : QObject(parent), model_(model)
@@ -132,12 +138,15 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
             opened = db_->open(path, key, &why);
             int recovered = saved.read ? saved.count() : -1;
             bool whole = saved.whole;
-            if (opened == LedgerDb::Open::Ready && saved.count() > 0) {
-                QString lost;
-                if (!db_->restoreLabels(saved, &lost)) {
+            if (saved.count() > 0) {
+                QString lost = why;
+                if (opened != LedgerDb::Open::Ready || !db_->restoreLabels(saved, &lost)) {
+                    // Not said to have come along, and asked for again at the next start.
                     qCWarning(lcLedger).noquote() << "labels and notes could not be brought over:" << lost;
                     recovered = -1;
                     whole = false;
+                    QFile mark(aside + pendingMark());
+                    mark.open(QIODevice::WriteOnly);
                 }
             }
             QMetaObject::invokeMethod(this, [this, self, run, hadRows, aside, recovered, whole] {
@@ -151,6 +160,19 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                 rewrite_ = false;
                 emit setAside(aside, recovered, whole);
             }, Qt::QueuedConnection);
+        };
+        const auto bringOverPending = [&]() {
+            const QFileInfo info(path);
+            const QStringList marks = info.dir().entryList({info.fileName() + QStringLiteral(".unread-*") + pendingMark()}, QDir::Files);
+            for (const QString& name : marks) {
+                const QString mark = info.dir().filePath(name);
+                const QString aside = mark.chopped(pendingMark().size());
+                QString lost;
+                const SavedLabels saved = LedgerDb::salvageLabels(aside, key);
+                QFile::remove(aside + QStringLiteral("-shm"));
+                if (saved.count() == 0 || db_->restoreLabels(saved, &lost))
+                    QFile::remove(mark);
+            }
         };
         // What can be edited on a line has to be there before the line is.
         const auto handOverLabels = [&]() {
@@ -214,6 +236,7 @@ void Ledger::open(const QString& path, const QByteArray& key, const QSet<quint32
                 }
                 return true;
             };
+            bringOverPending();
             if (handOverLabels() && db_->loadRows(wallets, kChunk, chunk, &why) && history()) {
                 prices = db_->loadPrices(nullptr);
                 times = db_->loadTimes(nullptr);
@@ -568,8 +591,8 @@ void Ledger::noteLabelsWrite(bool ok, const QString& why)
     qCWarning(lcLedger).noquote() << "a label or note could not be saved:" << why;
     if (!labelsFailing_) {
         labelsFailing_ = true;
-        emit problem(QStringLiteral("Labels and notes could not be written: %1. They are on screen and are being tried again, "
-                                    "but until that works only this window has them.").arg(why));
+        emit labelsProblem(QStringLiteral("Labels and notes could not be written: %1. They are on screen and are being tried again, "
+                                          "but until that works only this window has them.").arg(why));
     }
     schedule();
 }

@@ -77,7 +77,9 @@ public:
                   const std::function<void(QVector<wallet::AddressRow>&&)>& sink, QString* why);
     bool saveRows(const QVector<wallet::AddressRow>& rows, QString* why);
     bool replaceRows(const QVector<wallet::AddressRow>& rows, QString* why); // of the networks on the list, these and no others
-    // Its rows go, with the labels of those addresses, unless another wallet has them too: `labelsGone` names them.
+    // Its rows go, with the labels of those addresses unless another wallet has them too:
+    // `labelsGone` names them. Only a removal does that (`labelsGone` given): one a start finds
+    // left over may be a wallet.dat from before it was added.
     bool removeWallet(quint32 wallet, QString* why, QStringList* labelsGone = nullptr);
     int rowCount(); // -1 when it cannot be read
     bool readDamaged() const { return readDamaged_; }
@@ -108,6 +110,7 @@ public:
 
     // Whatever can still be read of labels and notes in a file set aside, which stays as it is.
     static SavedLabels salvageLabels(const QString& path, const QByteArray& key);
+    // Into this one, leaving what it holds already: that is newer.
     bool restoreLabels(const SavedLabels& labels, QString* why);
 
 private:
@@ -122,6 +125,7 @@ private:
     bool writeLabels(const QHash<QString, QString>& labels, QString* why);
     bool readEnded(int step, QString* why); // of a read that keeps what it got
     bool writeInTransaction(const std::function<bool(QString*)>& work, QString* why);
+    bool writeLabelsDurably(const std::function<bool(QString*)>& work, QString* why);
     bool damaged() const; // what SQLite just failed on says the file is
     QString lastError() const;
 

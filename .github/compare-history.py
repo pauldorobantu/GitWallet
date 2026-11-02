@@ -58,7 +58,9 @@ def main():
             time.sleep(0.2)
             # Anyone can pay this seed: what is newer than the scan says nothing.
             newer = {t['txid'] for t in theirs if not t['status'].get('confirmed') or t['status'].get('block_height', 0) > report['historyState'][0]['tip']}
-            if {t['txid'] for t in theirs} - newer != set(effects[address]) - newer:
+            # And what the report had pending may have gone since.
+            pending = {x for x in effects[address] if here[x]['height'] <= 0}
+            if {t['txid'] for t in theirs} - newer - pending != set(effects[address]) - newer - pending:
                 differences += 1
                 print('differs: the list of', address)
             for t in theirs:

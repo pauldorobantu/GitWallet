@@ -673,21 +673,21 @@ bool LedgerDb::removeWallet(quint32 wallet, QString* why, QStringList* labelsGon
 {
     return writeInTransaction([this, wallet, labelsGone](QString* failure) {
         // What only this PC knew of those addresses goes with them, whatever rows the window has now.
-        Statement labels;
-        if (!prepare("DELETE FROM address_label WHERE address IN (SELECT address FROM address WHERE wallet = ?1) "
-                     "AND address NOT IN (SELECT address FROM address WHERE wallet != ?1) RETURNING address",
-                     labels.slot(), failure))
-            return false;
-        sqlite3_bind_int64(labels.get(), 1, wallet);
-        int step = SQLITE_DONE;
-        while ((step = sqlite3_step(labels.get())) == SQLITE_ROW) {
-            if (labelsGone)
+        if (labelsGone) {
+            Statement labels;
+            if (!prepare("DELETE FROM address_label WHERE address IN (SELECT address FROM address WHERE wallet = ?1) "
+                         "AND address NOT IN (SELECT address FROM address WHERE wallet != ?1) RETURNING address",
+                         labels.slot(), failure))
+                return false;
+            sqlite3_bind_int64(labels.get(), 1, wallet);
+            int step = SQLITE_DONE;
+            while ((step = sqlite3_step(labels.get())) == SQLITE_ROW)
                 labelsGone->append(columnText(labels.get(), 0));
-        }
-        if (step != SQLITE_DONE) {
-            if (failure)
-                *failure = lastError();
-            return false;
+            if (step != SQLITE_DONE) {
+                if (failure)
+                    *failure = lastError();
+                return false;
+            }
         }
         Statement remove;
         if (!prepare("DELETE FROM address WHERE wallet = ?", remove.slot(), failure))
@@ -1160,9 +1160,20 @@ bool LedgerDb::writeNotes(int network, const QHash<chain::Hash256, wallet::TxNot
     return true;
 }
 
+// These exist nowhere else, and a window has said they are kept: a power cut must not take that back.
+bool LedgerDb::writeLabelsDurably(const std::function<bool(QString*)>& work, QString* why)
+{
+    if (db_)
+        sqlite3_exec(db_, "PRAGMA synchronous = FULL", nullptr, nullptr, nullptr);
+    const bool ok = writeInTransaction(work, why);
+    if (db_)
+        sqlite3_exec(db_, "PRAGMA synchronous = NORMAL", nullptr, nullptr, nullptr);
+    return ok;
+}
+
 bool LedgerDb::saveNotes(wallet::Network network, const QHash<chain::Hash256, wallet::TxNote>& notes, QString* why)
 {
-    return writeInTransaction([this, network, &notes](QString* failure) {
+    return writeLabelsDurably([this, network, &notes](QString* failure) {
         const int id = nameId(wallet::networkInfo(network).id, failure);
         return id >= 0 && writeNotes(id, notes, failure);
     }, why);
@@ -1200,7 +1211,7 @@ bool LedgerDb::writeLabels(const QHash<QString, QString>& labels, QString* why)
 
 bool LedgerDb::saveAddressLabels(const QHash<QString, QString>& labels, QString* why)
 {
-    return writeInTransaction([this, &labels](QString* failure) { return writeLabels(labels, failure); }, why);
+    return writeLabelsDurably([this, &labels](QString* failure) { return writeLabels(labels, failure); }, why);
 }
 
 bool LedgerDb::saveAddressLabel(const QString& address, const QString& label, QString* why)
@@ -1248,28 +1259,50 @@ SavedLabels LedgerDb::salvageLabels(const QString& path, const QByteArray& key)
     QByteArray pragma = "PRAGMA key = \"x'" + key.toHex() + "'\"";
     const int keyed = sqlite3_exec(raw, pragma.constData(), nullptr, nullptr, nullptr);
     pragma.fill('\0');
-    // A page that fails ends the reading there, and what came before it stands.
+    // A file from before there were any has no such tables, and nothing to give up.
+    int version = -1;
     if (keyed == SQLITE_OK) {
-        sqlite3_stmt* names = nullptr;
-        if (sqlite3_prepare_v2(raw, "SELECT n.text, t.txid, t.label, t.note FROM tx_note t JOIN name n ON n.id = t.network", -1, &names, nullptr) == SQLITE_OK) {
-            out.read = true;
+        sqlite3_stmt* asked = nullptr;
+        if (sqlite3_prepare_v2(raw, "PRAGMA user_version", -1, &asked, nullptr) == SQLITE_OK && sqlite3_step(asked) == SQLITE_ROW)
+            version = sqlite3_column_int(asked, 0);
+        sqlite3_finalize(asked);
+    }
+    if (version >= 0 && version < 2) {
+        out.read = true;
+        out.whole = true;
+    } else if (version >= 0) {
+        // A page that fails ends a walk there. The rest of the pages are as good as they were, so
+        // what the walk did not reach is walked to from the other end, up to the same page.
+        const auto walk = [raw](const char* sql, const std::function<void(sqlite3_stmt*)>& row) {
+            sqlite3_stmt* rows = nullptr;
+            if (sqlite3_prepare_v2(raw, sql, -1, &rows, nullptr) != SQLITE_OK) {
+                sqlite3_finalize(rows);
+                return false;
+            }
             int step = SQLITE_DONE;
-            while ((step = sqlite3_step(names)) == SQLITE_ROW)
-                out.notes[columnText(names, 0)].insert(columnHash(names, 1), {columnText(names, 2), columnText(names, 3)});
-            out.whole = step == SQLITE_DONE;
-        }
-        sqlite3_finalize(names);
-        sqlite3_stmt* labels = nullptr;
-        if (sqlite3_prepare_v2(raw, "SELECT address, label FROM address_label", -1, &labels, nullptr) == SQLITE_OK) {
-            out.read = true;
-            int step = SQLITE_DONE;
-            while ((step = sqlite3_step(labels)) == SQLITE_ROW)
-                out.addresses.insert(columnText(labels, 0), columnText(labels, 1));
-            out.whole = out.whole && step == SQLITE_DONE;
-        } else {
+            while ((step = sqlite3_step(rows)) == SQLITE_ROW)
+                row(rows);
+            sqlite3_finalize(rows);
+            return step == SQLITE_DONE;
+        };
+        const auto note = [&out](sqlite3_stmt* row) {
+            out.notes[columnText(row, 0)].insert(columnHash(row, 1), {columnText(row, 2), columnText(row, 3)});
+        };
+        const auto label = [&out](sqlite3_stmt* row) { out.addresses.insert(columnText(row, 0), columnText(row, 1)); };
+        const char* notesUp = "SELECT n.text, t.txid, t.label, t.note FROM tx_note t JOIN name n ON n.id = t.network ORDER BY t.network, t.txid";
+        const char* notesDown = "SELECT n.text, t.txid, t.label, t.note FROM tx_note t JOIN name n ON n.id = t.network ORDER BY t.network DESC, t.txid DESC";
+        const char* labelsUp = "SELECT address, label FROM address_label ORDER BY address";
+        const char* labelsDown = "SELECT address, label FROM address_label ORDER BY address DESC";
+        out.read = true;
+        out.whole = true;
+        if (!walk(notesUp, note)) {
             out.whole = false;
+            walk(notesDown, note);
         }
-        sqlite3_finalize(labels);
+        if (!walk(labelsUp, label)) {
+            out.whole = false;
+            walk(labelsDown, label);
+        }
     }
     sqlite3_close_v2(raw);
     return out;
@@ -1277,13 +1310,41 @@ SavedLabels LedgerDb::salvageLabels(const QString& path, const QByteArray& key)
 
 bool LedgerDb::restoreLabels(const SavedLabels& labels, QString* why)
 {
-    return writeInTransaction([this, &labels](QString* failure) {
-        for (auto it = labels.notes.cbegin(); it != labels.notes.cend(); ++it) {
-            const int id = nameId(it.key(), failure);
-            if (id < 0 || !writeNotes(id, *it, failure))
+    return writeLabelsDurably([this, &labels](QString* failure) {
+        const auto ran = [this, failure](sqlite3_stmt* write) {
+            const int done = sqlite3_step(write);
+            sqlite3_reset(write);
+            if (done == SQLITE_DONE)
+                return true;
+            if (failure)
+                *failure = lastError();
+            return false;
+        };
+        Statement putNote;
+        Statement putLabel;
+        if (!prepare("INSERT OR IGNORE INTO tx_note(network, txid, label, note) VALUES(?,?,?,?)", putNote.slot(), failure)
+            || !prepare("INSERT OR IGNORE INTO address_label(address, label) VALUES(?,?)", putLabel.slot(), failure))
+            return false;
+        for (auto network = labels.notes.cbegin(); network != labels.notes.cend(); ++network) {
+            const int id = nameId(network.key(), failure);
+            if (id < 0)
+                return false;
+            for (auto it = network->cbegin(); it != network->cend(); ++it) {
+                sqlite3_bind_int(putNote.get(), 1, id);
+                bindHash(putNote.get(), 2, it.key());
+                bindText(putNote.get(), 3, it->label);
+                bindText(putNote.get(), 4, it->note);
+                if (!ran(putNote.get()))
+                    return false;
+            }
+        }
+        for (auto it = labels.addresses.cbegin(); it != labels.addresses.cend(); ++it) {
+            bindText(putLabel.get(), 1, it.key());
+            bindText(putLabel.get(), 2, *it);
+            if (!ran(putLabel.get()))
                 return false;
         }
-        return writeLabels(labels.addresses, failure);
+        return true;
     }, why);
 }
 

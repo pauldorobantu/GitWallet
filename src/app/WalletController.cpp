@@ -298,6 +298,9 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     connect(ledger_, &store::Ledger::problem, this, [this](const QString& message) {
         emit errorOccurred(wallet::Problem::SavedData, message, QString());
     });
+    connect(ledger_, &store::Ledger::labelsProblem, this, [this](const QString& message) {
+        emit errorOccurred(wallet::Problem::LabelsNotKept, message, QString());
+    });
     connect(ledger_, &store::Ledger::labelsRead, this, [this](const QHash<QString, QString>& labels) {
         addressLabels_ = labels;
         emit labelsChanged();
@@ -311,7 +314,7 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
         const QString shown = QDir::toNativeSeparators(file);
         QString message = QStringLiteral("The saved balances could not be read, so they were kept as %1 and are being read again.").arg(shown);
         if (recovered < 0)
-            message += QStringLiteral(" Its labels and notes could not be read: only that file, or a copy you exported, holds them.");
+            message += QStringLiteral(" Its labels and notes could not be brought over: only that file, or a copy you exported, holds them.");
         else if (!whole)
             message += QStringLiteral(" %1 of its labels and notes came along; the rest could not be read, and stay in that file.").arg(recovered);
         else if (recovered > 0)
@@ -336,6 +339,12 @@ WalletController::~WalletController()
     // destroyed().
     blockSignals(true);
     stopServices();
+    // A copy of the labels someone is counting on: nothing would otherwise be there, with part of it
+    // in the clear beside it.
+    for (const QPointer<QThread>& thread : std::as_const(copiesBeingWritten_)) {
+        if (thread)
+            thread->wait();
+    }
     ledger_->close();
 }
 
@@ -678,6 +687,11 @@ bool WalletController::renameWallet(quint32 id, const QString& label, QString* e
 bool WalletController::removeAllWallets(QString* error)
 {
     setError(error, QString());
+    // Nothing could stop what is reading it, and the window would wait for that.
+    if (waitingForLedger_) {
+        setError(error, QStringLiteral("The wallets were not removed: what is saved is still being read. Try again in a moment."));
+        return false;
+    }
     // Checked first, so a refusal leaves the scan running as it was.
     if (!lockDataDir()) {
         setError(error, QStringLiteral("The wallets were not removed: ") + inUseElsewhere());
@@ -750,7 +764,7 @@ int WalletController::walletFilesKeptAside() const
 int WalletController::databasesKeptAside() const
 {
     QStringList files = store::Ledger::keptAsideFiles(wallet::WalletStore::databasePath());
-    files.removeIf([](const QString& name) { return name.endsWith(QLatin1String("-wal")) || name.endsWith(QLatin1String("-shm")); });
+    files.removeIf([](const QString& name) { return name.endsWith(QLatin1String("-wal")) || name.endsWith(QLatin1String("-shm")) || name.endsWith(QLatin1String(".labels-pending")); });
     return int(files.size());
 }
 
@@ -1094,7 +1108,7 @@ QString WalletController::labelsBlocker() const
     return {};
 }
 
-bool WalletController::holdsSecret(const QString& text) const
+bool WalletController::holdsSecret(const QString& text, const QSet<chain::Hash256>& alsoKnown) const
 {
     if (!wallet::looksLikeSecret(text))
         return false;
@@ -1107,7 +1121,7 @@ bool WalletController::holdsSecret(const QString& text) const
         const QString token = it.next().captured();
         chain::Hash256 txid{};
         chain::hashFromHex(token.toStdString(), &txid);
-        if (std::any_of(histories.cbegin(), histories.cend(), [&txid](const wallet::UtxoHistory* history) { return history->book()->find(txid) >= 0; }))
+        if (alsoKnown.contains(txid) || std::any_of(histories.cbegin(), histories.cend(), [&txid](const wallet::UtxoHistory* history) { return history->book()->find(txid) >= 0; }))
             rest.replace(token, QStringLiteral(" "));
     }
     return wallet::looksLikeSecret(rest);
@@ -1229,16 +1243,23 @@ QByteArray labelsText(const LabelsNow& now)
 
 // Off this thread: what `work` makes of its own copies comes back to `owner`.
 template <typename Work, typename Done>
-void offThisThread(QObject* owner, Work work, Done done)
+QThread* offThisThread(QObject* owner, Work work, Done done)
 {
     using Result = std::invoke_result_t<Work>;
     auto result = std::make_shared<Result>();
     QThread* thread = QThread::create([work = std::move(work), result]() mutable { *result = work(); });
-    QObject::connect(thread, &QThread::finished, owner, [thread, result, done = std::move(done)]() mutable {
-        thread->deleteLater();
-        done(*result);
-    });
+    QObject::connect(thread, &QThread::finished, owner, [result, done = std::move(done)]() mutable { done(*result); });
+    QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
     thread->start();
+    return thread;
+}
+
+// What it would be without any run of hex digits long enough to be a transaction's id.
+QString withoutIds(const QString& text)
+{
+    static const QRegularExpression hex(QStringLiteral("\\b[0-9a-fA-F]{64}\\b"));
+    QString rest = text;
+    return rest.replace(hex, QStringLiteral(" "));
 }
 
 } // namespace
@@ -1264,7 +1285,8 @@ void WalletController::writeLabelsFile(const QString& path, QObject* guard, cons
         bool ok = false;
         QString error;
     };
-    offThisThread(guard, [now, path] {
+    copiesBeingWritten_.removeIf([](const QPointer<QThread>& thread) { return thread.isNull(); });
+    copiesBeingWritten_ += offThisThread(guard, [now, path] {
         Written written;
         const QByteArray body = labelsText(now);
         QSaveFile file(path);
@@ -1279,25 +1301,28 @@ void WalletController::writeLabelsFile(const QString& path, QObject* guard, cons
 struct LabelImport {
     QVector<wallet::LabelLine> lines;
     QSet<int> suspect; // a field looks like a secret, unless what looks so is an id these wallets know
+    QSet<chain::Hash256> named; // what the lines themselves are about: no secret either
     qsizetype at = 0;
     int added = 0;
     int left = 0;
+    int later = 0;
     bool anyAddress = false;
     QPointer<QObject> guard;
-    std::function<void(int, int, const QString&)> done;
+    std::function<void(int, int, int, const QString&)> done;
 };
 
-void WalletController::importLabelsFile(const QString& path, QObject* guard, const std::function<void(int, int, const QString&)>& done)
+void WalletController::importLabelsFile(const QString& path, QObject* guard, const std::function<void(int, int, int, const QString&)>& done)
 {
     const QString blocker = labelsBlocker();
     if (!blocker.isEmpty()) {
-        done(-1, 0, blocker);
+        done(-1, 0, 0, blocker);
         return;
     }
     importingLabels_ = true;
     struct Read {
         QVector<wallet::LabelLine> lines;
         QSet<int> suspect;
+        QSet<chain::Hash256> named;
         int left = 0;
         QString error;
     };
@@ -1316,6 +1341,8 @@ void WalletController::importLabelsFile(const QString& path, QObject* guard, con
         read.lines = wallet::readLabelLines(file.readAll(), &read.left);
         for (int i = 0; i < read.lines.size(); ++i) {
             const wallet::LabelLine& line = read.lines.at(i);
+            if (line.isTransaction)
+                read.named.insert(line.txid);
             if (wallet::looksLikeSecret(line.label) || wallet::looksLikeSecret(line.note))
                 read.suspect.insert(i);
         }
@@ -1327,11 +1354,12 @@ void WalletController::importLabelsFile(const QString& path, QObject* guard, con
         if (!read.error.isEmpty()) {
             importingLabels_ = false;
             if (stillThere)
-                done(-1, 0, read.error);
+                done(-1, 0, 0, read.error);
             return;
         }
         import->lines = read.lines;
         import->suspect = read.suspect;
+        import->named = read.named;
         import->left = read.left;
         importNextPart(import);
     });
@@ -1348,8 +1376,12 @@ void WalletController::importNextPart(const std::shared_ptr<LabelImport>& import
         const QString label = line.label.trimmed();
         const QString note = line.note.trimmed();
         // Whatever goes into a label ends up in an export. Like a wallet's name, it never holds a secret.
-        if (import->suspect.contains(int(import->at)) && (holdsSecret(label) || holdsSecret(note))) {
-            ++import->left;
+        if (import->suspect.contains(int(import->at)) && (holdsSecret(label, import->named) || holdsSecret(note, import->named))) {
+            // If all that looks like one is an id, it may be a transaction these wallets have yet to read.
+            if (!wallet::looksLikeSecret(withoutIds(label)) && !wallet::looksLikeSecret(withoutIds(note)))
+                ++import->later;
+            else
+                ++import->left;
             continue;
         }
         if (line.isTransaction) {
@@ -1391,7 +1423,7 @@ void WalletController::importNextPart(const std::shared_ptr<LabelImport>& import
     if (import->anyAddress)
         emit labelsChanged();
     if (import->guard)
-        import->done(import->added, import->left, QString());
+        import->done(import->added, import->left, import->later, QString());
 }
 
 int WalletController::differingAddresses() const

@@ -57,6 +57,13 @@ constexpr int kStatusAhead = 2;
 constexpr int kMaxPending = 100'000;
 // What was replaced or dropped stays in the list this long, longer with a note.
 constexpr qint64 kKeepGoneSeconds = 90 * 86400;
+// One server after another lying, for as long as they all do: that many in this much time at most.
+constexpr qint64 kLieMovesLastMs = 10 * 60'000;
+// Past this many raw transactions waiting, a list only one call in so many: what it adds has to go somewhere.
+constexpr int kListEveryPastBacklog = 8;
+// A list that is not what the server's status says may be ahead of a notice on its way: for this many
+// first pauses (a minute), it is only asked again.
+constexpr int kContradictedPauses = 4;
 
 QString hexOf(const chain::Hash256& hash)
 {
@@ -186,6 +193,9 @@ void UtxoHistory::start()
     std::fill(std::begin(refused_), std::end(refused_), 0);
     pausedMs_ = 0;
     moves_ = 0;
+    lieMoves_ = 0;
+    lastLieMs_ = 0;
+    ++priceRun_;
     headerRefusals_ = 0;
     saidDishonest_ = false;
     saidDiffering_ = false;
@@ -199,6 +209,8 @@ void UtxoHistory::start()
     wanted_.clear();
     txQueue_.clear();
     refusedAddresses_.clear();
+    retrying_.clear();
+    namedHere_.clear();
     contradicted_.clear();
     differing_.clear();
     toCompare_.clear();
@@ -224,6 +236,7 @@ void UtxoHistory::stop()
 {
     running_ = false;
     ++generation_;
+    ++priceRun_;
     tokens_->stop();
     compare_->stop();
     priceTimer_->stop();
@@ -262,6 +275,7 @@ void UtxoHistory::consider(const QString& scripthash, const QString& status, boo
     if (book_->statusOf(scripthash) == status) {
         // Empty on both sides: no history here, and none there.
         refusedAddresses_.remove(scripthash);
+        retrying_.remove(scripthash);
         contradicted_.remove(scripthash);
         askedFor_.remove(scripthash); // what comes next is news, whatever it was once
         return;
@@ -340,6 +354,7 @@ void UtxoHistory::onRowsGone()
 {
     const auto gone = [this](const QString& scripthash) { return model_->findByScripthash(network_, scripthash) < 0; };
     refusedAddresses_.removeIf(gone);
+    retrying_.removeIf(gone);
     differing_.removeIf(gone);
     for (auto it = contradicted_.begin(); it != contradicted_.end();)
         it = gone(it.key()) ? contradicted_.erase(it) : std::next(it);
@@ -364,6 +379,7 @@ void UtxoHistory::onClientReady()
     retriedHere_ = false;
     movingOn_ = false;
     contradicted_.clear();
+    namedHere_.clear();
     const QStringList unfinished = reading_.keys();
     reading_.clear();
     wanted_.clear();
@@ -417,6 +433,12 @@ void UtxoHistory::pump()
     bool sent = false;
     while (inFlight_ < kMaxInFlight && takeToken()) {
         ++turn_;
+        // Lists and raw transactions by turns: what a list names is what makes a line, and is lost
+        // with the connection until it is read. News stands first in each of them, whatever the
+        // first read of everything has put behind it.
+        const bool listsWait = !addressNews_.empty() || !addressQueue_.empty();
+        const bool backlog = txQueue_.size() >= size_t(kMaxTxBacklog);
+        const bool txTurn = !listsWait || (backlog ? turn_ % kListEveryPastBacklog != 0 : turn_ % 2 == 0);
         const auto takeTx = [this] {
             const chain::Hash256 txid = txQueue_.front();
             txQueue_.pop_front();
@@ -429,6 +451,8 @@ void UtxoHistory::pump()
         };
         if (!proofQueue_.empty() && turn_ % kProofEvery == 0) {
             takeProof();
+        } else if (!txQueue_.empty() && txTurn) {
+            takeTx();
         } else if (!addressNews_.empty()) {
             const QString scripthash = addressNews_.front();
             addressNews_.pop_front();
@@ -437,8 +461,6 @@ void UtxoHistory::pump()
                 continue;
             }
             sendHistory(scripthash, true);
-        } else if (!txQueue_.empty() && (addressQueue_.empty() || txQueue_.size() >= size_t(kMaxTxBacklog) || turn_ % 2 == 0)) {
-            takeTx();
         } else if (!addressQueue_.empty()) {
             const QString scripthash = addressQueue_.front();
             addressQueue_.pop_front();
@@ -462,17 +484,37 @@ void UtxoHistory::pump()
         tokens_->stop();
 }
 
-bool UtxoHistory::moveOn(const QString& why)
+bool UtxoHistory::moveOn(const QString& why, bool lie)
 {
     if (movingOn_)
         return true;
-    // Each server once: a server's other answers say nothing of what none of them will give, and
-    // what a scanner reads there makes the client forget it has asked.
-    if (moves_ >= client_->serverCount() - 1 || !client_->tryAnotherServer(why))
-        return false;
-    ++moves_;
+    const int others = client_->serverCount() - 1;
+    if (lie) {
+        // What no server would give must not keep one that lies from being left, nor a lie that
+        // every server tells keep the client going round them.
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (now - lastLieMs_ > kLieMovesLastMs)
+            lieMoves_ = 0;
+        if (lieMoves_ >= others || !client_->tryAnotherServer(why))
+            return false;
+        ++lieMoves_;
+        lastLieMs_ = now;
+    } else {
+        // Each server once: a server's other answers say nothing of what none of them will give, and
+        // what a scanner reads there makes the client forget it has asked.
+        if (moves_ >= others || !client_->tryAnotherServer(why))
+            return false;
+        ++moves_;
+    }
     movingOn_ = true;
     return true;
+}
+
+void UtxoHistory::noteAddressRefused(const QString& scripthash)
+{
+    reading_.remove(scripthash);
+    retrying_.remove(scripthash);
+    refusedAddresses_.insert(scripthash);
 }
 
 void UtxoHistory::noteRefusal(Asked kind)
@@ -506,7 +548,7 @@ void UtxoHistory::noteAnswered(Asked kind)
 
 void UtxoHistory::noteAllWell()
 {
-    if (refusedAddresses_.isEmpty() && failedProof_.isEmpty() && refusedOnce_.isEmpty()) {
+    if (refusedAddresses_.isEmpty() && retrying_.isEmpty() && failedProof_.isEmpty() && refusedOnce_.isEmpty()) {
         moves_ = 0;
         retriedHere_ = false;
     }
@@ -529,6 +571,7 @@ void UtxoHistory::retryRefused()
         if (row < 0)
             continue;
         askedFor_.remove(scripthash);
+        retrying_.insert(scripthash);
         consider(scripthash, model_->at(row).status, false);
     }
 }
@@ -543,7 +586,7 @@ void UtxoHistory::pauseFor(int ms)
 void UtxoHistory::noteDishonest(const QString& why)
 {
     const QString server = client_->serverName();
-    const bool left = moveOn(why);
+    const bool left = moveOn(why, true);
     if (!saidDishonest_) {
         saidDishonest_ = true;
         emit problem(Problem::Failure,
@@ -577,10 +620,9 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
     --inFlight_;
     schedulePump();
     if (!error.isEmpty()) {
-        reading_.remove(scripthash);
         qCInfo(lcHistory).noquote() << "a history was refused:" << error;
         // Some servers refuse a long history. The next one may not.
-        refusedAddresses_.insert(scripthash);
+        noteAddressRefused(scripthash);
         noteRefusal(AskedHistory);
         lookAgain(scripthash);
         noteProgress();
@@ -608,8 +650,7 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
         listed.append(one);
     }
     if (!readable) {
-        reading_.remove(scripthash);
-        refusedAddresses_.insert(scripthash);
+        noteAddressRefused(scripthash);
         noteDishonest(QStringLiteral("a list of transactions cannot be read"));
         return;
     }
@@ -617,6 +658,7 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
     const int row = model_->findByScripthash(network_, scripthash);
     if (row < 0) {
         reading_.remove(scripthash);
+        retrying_.remove(scripthash);
         return; // no longer one of the wallets'
     }
     // Not what the server's own status says. It moved past that while this was on its way, and its
@@ -624,11 +666,12 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
     // in rounds there is no such status: the row is only as new as its last round, and this is newer.
     const QString rowStatus = model_->at(row).status;
     if (!rowStatus.isEmpty() && status != rowStatus && client_->isFollowing(scripthash)) {
-        reading_.remove(scripthash);
-        refusedAddresses_.insert(scripthash);
+        noteAddressRefused(scripthash);
         Contradiction& contradiction = contradicted_[scripthash];
-        contradiction.again = contradiction.status == rowStatus;
-        contradiction.status = rowStatus;
+        if (contradiction.status != rowStatus) {
+            contradiction.status = rowStatus;
+            contradiction.since = QDateTime::currentMSecsSinceEpoch();
+        }
         compareSoon(scripthash);
         lookAgain(scripthash);
         noteProgress();
@@ -651,8 +694,7 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
         }
     }
     if (against >= 0) {
-        reading_.remove(scripthash);
-        refusedAddresses_.insert(scripthash);
+        noteAddressRefused(scripthash);
         askServerOf(against, QStringLiteral("a list of transactions leaves out what is proven"));
         noteProgress();
         return;
@@ -664,8 +706,17 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
     reading.listed.reserve(listed.size());
     for (const Listed& one : std::as_const(listed)) {
         reading.listed.append(one.txid);
+        namedHere_.insert(one.txid);
         const int position = book_->find(one.txid);
         if (position >= 0) {
+            // Nothing that was waiting on where it was has anything left to wait for.
+            if (book_->at(position).height != one.height) {
+                waitingTip_.remove(one.txid);
+                proofQueued_.remove(one.txid);
+                refusedOnce_.remove(one.txid);
+                if (failedProof_.remove(one.txid))
+                    compareTouching(position);
+            }
             book_->setHeight(position, one.height);
             // A transaction read before this address was known to be one of the wallets'.
             if (!book_->hasEffectOn(position, scripthash))
@@ -679,8 +730,11 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
         const QVector<int> touching = book_->addressAt(id).txs;
         for (const int position : touching) {
             const TxRecord& tx = book_->at(position);
-            if (tx.seen == TxSeen::Alive && !named.contains(tx.txid))
+            if (tx.seen == TxSeen::Alive && !named.contains(tx.txid)) {
+                if (failedProof_.remove(tx.txid))
+                    compareTouching(position);
                 book_->markGone(position);
+            }
         }
     }
     finishIfDone(scripthash);
@@ -789,6 +843,12 @@ void UtxoHistory::finishIfDone(const QString& scripthash)
         return;
     const Reading reading = *found;
     reading_.erase(found);
+    // No longer one of the wallets': nothing it listed could have counted for it.
+    if (model_->findByScripthash(network_, scripthash) < 0) {
+        retrying_.remove(scripthash);
+        noteProgress();
+        return;
+    }
     // A list holds what touches the address, and what made what spends from it: by now each has
     // something to do with it, or the server named what it wished to.
     bool lied = false;
@@ -802,6 +862,7 @@ void UtxoHistory::finishIfDone(const QString& scripthash)
                 book_->markGone(position);
         }
     }
+    retrying_.remove(scripthash);
     if (reading.failed || lied) {
         refusedAddresses_.insert(scripthash);
         if (lied)
@@ -865,6 +926,8 @@ void UtxoHistory::queueAllProofs()
 
 void UtxoHistory::proveNext(const chain::Hash256& txid)
 {
+    if (!proofQueued_.contains(txid))
+        return; // let go of since
     const int position = book_->find(txid);
     if (position < 0) {
         proofQueued_.remove(txid);
@@ -877,6 +940,19 @@ void UtxoHistory::proveNext(const chain::Hash256& txid)
         return;
     }
     const int height = tx.height;
+    // In a block this server does not say it has. If it listed that itself, that is its lie. If another
+    // did, or this one is only behind, there is nothing to ask of it: its own list will say.
+    if (height > client_->tipHeight() + kStatusAhead) {
+        proofQueued_.remove(txid);
+        refusedOnce_.remove(txid);
+        if (namedHere_.contains(txid)) {
+            failedProof_.insert(txid);
+            compareTouching(position);
+            noteDishonest(QStringLiteral("it lists a transaction in a block it does not have"));
+        }
+        noteProgress();
+        return;
+    }
     if (chain_->at(height)) {
         book_->setBlockTime(position, chain_->at(height)->time);
         sendProof(txid, height);
@@ -893,15 +969,6 @@ void UtxoHistory::proveNext(const chain::Hash256& txid)
     }
     // Past the tip this chain holds, or below the checkpoint and not asked for yet.
     if (height > chain_->tip()) {
-        // In a block this server does not say it has.
-        if (height > client_->tipHeight() + kStatusAhead) {
-            proofQueued_.remove(txid);
-            refusedOnce_.remove(txid);
-            failedProof_.insert(txid);
-            compareTouching(position);
-            noteDishonest(QStringLiteral("it lists a transaction in a block it does not have"));
-            return;
-        }
         waitingTip_.insert(txid);
         if (!tipWait_->isActive()) {
             tipAtWait_ = chain_->tip();
@@ -954,13 +1021,15 @@ void UtxoHistory::onTipMoved()
         if (position >= 0)
             queueProof(position);
     }
+    // A new block is as good a moment as any to ask again for what was refused.
+    retryRefused();
     schedulePump();
     noteProgress();
 }
 
 void UtxoHistory::onTipWaitOver()
 {
-    if (waitingTip_.isEmpty())
+    if (waitingTip_.isEmpty() || !client_->isReady())
         return;
     if (chain_->tip() != tipAtWait_) {
         tipAtWait_ = chain_->tip();
@@ -968,17 +1037,54 @@ void UtxoHistory::onTipWaitOver()
         chain_->sync();
         return;
     }
-    // It said a block held them, and no such block has come.
-    giveUpWaitingProofs();
-    noteDishonest(QStringLiteral("it lists transactions in a block it does not give"));
+    // It said a block held them, and no such block has come. What another server said of them is not
+    // this one's to answer for: its own list will say.
+    bool itSaidSo = false;
+    const QSet<chain::Hash256> waiting = std::exchange(waitingTip_, {});
+    for (const chain::Hash256& txid : waiting) {
+        proofQueued_.remove(txid);
+        refusedOnce_.remove(txid);
+        if (namedHere_.contains(txid)) {
+            failedProof_.insert(txid);
+            itSaidSo = true;
+            const int position = book_->find(txid);
+            if (position >= 0)
+                compareTouching(position);
+        }
+    }
+    noteProgress();
+    if (itSaidSo)
+        noteDishonest(QStringLiteral("it lists transactions in a block it does not give"));
 }
 
 void UtxoHistory::onReorg(int fromHeight)
 {
     book_->unproveFrom(fromHeight);
+    // An address a server follows hears of this by itself. One read in rounds would not until its next
+    // round, and until then its transactions would be asked for where they no longer are, of servers
+    // that rightly refuse: read now, and its list says where they are.
+    QSet<QString> notFollowed;
     for (int position = 0; position < book_->size(); ++position) {
-        if (book_->at(position).height >= fromHeight)
+        if (book_->at(position).height < fromHeight)
+            continue;
+        bool followed = true;
+        for (const TxEffect& effect : book_->effectsOf(position)) {
+            const QString& scripthash = book_->addressAt(effect.address).scripthash;
+            if (!client_->isFollowing(scripthash)) {
+                notFollowed.insert(scripthash);
+                followed = false;
+            }
+        }
+        if (followed)
             queueProof(position);
+    }
+    for (const QString& scripthash : std::as_const(notFollowed)) {
+        const int row = model_->findByScripthash(network_, scripthash);
+        if (row < 0)
+            continue;
+        askedFor_.remove(scripthash);
+        book_->setStatus(scripthash, QString());
+        consider(scripthash, model_->at(row).status, false);
     }
     // A list that left out what was proven was right after all.
     retryRefused();
@@ -1139,7 +1245,8 @@ void UtxoHistory::onProof(quint64 generation, const chain::Hash256& txid, int he
     const bool hadFailed = failedProof_.remove(txid);
     book_->setBlockTime(position, header->time);
     book_->setProven(position, true, int(pos));
-    if (hadFailed)
+    // Failed before this connection or block, it may have been left out of what did not add up.
+    if (hadFailed || !differing_.isEmpty())
         compareTouching(position);
     noteAllWell();
     if (!priceTimer_->isActive() && running_)
@@ -1192,7 +1299,7 @@ void UtxoHistory::compareBalance(const QString& scripthash)
     const auto contradicted = contradicted_.constFind(scripthash);
     if (contradicted != contradicted_.cend() && contradicted->status == r.status && !onItsWay) {
         differing_.remove(scripthash);
-        if (contradicted->again) {
+        if (QDateTime::currentMSecsSinceEpoch() - contradicted->since >= qint64(kContradictedPauses) * gFirstPauseMs) {
             noteDishonest(QStringLiteral("a list of transactions is not what its status says"));
         } else {
             refusedAddresses_.remove(scripthash);
@@ -1246,12 +1353,9 @@ void UtxoHistory::askPrices()
         return;
     pricesInFlight_ = seen;
     const AssetInfo& coin = assetInfo(networkInfo(network_).coin);
-    const quint64 generation = generation_;
-    prices_->ask(coin, times, [this, generation, times](const net::PriceHistory::Answers& answers, bool failed) {
-        if (generation == generation_)
+    prices_->ask(coin, times, [this, run = priceRun_, times](const net::PriceHistory::Answers& answers, bool failed) {
+        if (run == priceRun_)
             onPrices(answers, times, failed);
-        else if (running_)
-            pricesInFlight_.clear();
     });
 }
 
