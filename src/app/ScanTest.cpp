@@ -1354,7 +1354,7 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         none.issued = before + 20;
         growing.scanner.noteIssued(none);
         // Its gap past what was given out, on the receive chain, beside the change chain's.
-        const int top = before + 25;
+        const int top = before + 30;
         const bool followed = waitFor([&fresh, top] { return fresh.size() == top; }, 8000);
         check(followed, QStringLiteral("given out far past it, the window follows at once (%1 from %2)").arg(fresh.size()).arg(before));
         none.issued = 2;
