@@ -13,9 +13,14 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
 > is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on test networks before it touches real
 > funds.
 
-![Overview](docs/screenshot-overview.png)
+![Portfolio: the total, and a row per coin](docs/screenshot-portfolio.png)
 
-![Addresses](docs/screenshot-addresses.png)
+![A coin opens to each wallet, each wallet to its addresses, with a path above](docs/screenshot-coin-wallet.png)
+
+![Receive: the next unused address, its QR code, and what was given out](docs/screenshot-receive.png)
+
+*The wallets and figures in these pictures are made up, on the addresses of public test seeds. While
+something is still being read a figure says so: "≥" for what is known so far, "—" for nothing known.*
 
 ## What it does
 
