@@ -302,6 +302,8 @@ int HistoryBook::add(const chain::Transaction& tx, int height, qint64 firstSeen,
         touch(position);
         emit changed();
     }
+    if (!known)
+        emit added(position);
     return position;
 }
 

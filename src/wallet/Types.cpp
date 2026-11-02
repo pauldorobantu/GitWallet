@@ -103,6 +103,17 @@ chain::Amount AddressRow::amount(Asset a) const
     return balances.value(a);
 }
 
+bool AddressRow::onlyDust() const
+{
+    bool holds = false;
+    bool more = false;
+    forEachBalance([&](Asset asset, const chain::Amount& amount) {
+        holds = true;
+        more = more || amount.compare(assetInfo(asset).dust) >= 0;
+    });
+    return holds && !more;
+}
+
 void AddressRow::setBalance(Asset a, const chain::Amount& value)
 {
     if (value.isZero())

@@ -59,6 +59,7 @@ private:
     AllocationBar* allocation_ = nullptr;
     HoldingsTable* table_ = nullptr;
     QCheckBox* hideZero_ = nullptr;
+    QCheckBox* hideDust_ = nullptr;
     QLabel* countLabel_ = nullptr;
     QWidget* details_ = nullptr;
     QPushButton* detailsButton_ = nullptr;

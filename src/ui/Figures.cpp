@@ -1,6 +1,9 @@
 #include "ui/Figures.h"
 
+#include "core/SettingsRepo.h"
+
 #include <QLocale>
+#include <QStringList>
 #include <QtNumeric>
 
 namespace app::ui::figures {
@@ -40,6 +43,26 @@ QString formatUsd(double value)
 QString formatCount(int n)
 {
     return QLocale(QLocale::English).toString(n);
+}
+
+QString dustLimits()
+{
+    QStringList parts;
+    for (const wallet::AssetInfo& info : wallet::assets()) {
+        if (!info.dust.isZero())
+            parts << formatAmount(info.dust, info) + QLatin1Char(' ') + info.symbol;
+    }
+    return parts.join(QStringLiteral(", "));
+}
+
+bool hideDust()
+{
+    return SettingsRepo().get(QStringLiteral("ui.hideDust")) != QLatin1String("0");
+}
+
+void setHideDust(bool hide)
+{
+    SettingsRepo().set(QStringLiteral("ui.hideDust"), hide ? QStringLiteral("1") : QStringLiteral("0"));
 }
 
 QString countSoFar(int count, bool complete)

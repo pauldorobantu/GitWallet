@@ -44,6 +44,7 @@ enum Role {
     kWalletRole, // a row of a wallet
     kHoldsRole,  // a key looks at it, and it holds something or is not known to hold nothing
     kWatchedRole, // a key looks at it
+    kDustRole,    // all answered, and all of it together is less than counts for anything
 };
 
 enum class Kind { Coins, WalletsOfCoin, AssetsOfAddress };
@@ -152,6 +153,8 @@ public:
             return h.watched && (h.holds() || !h.complete);
         case kWatchedRole:
             return h.watched;
+        case kDustRole:
+            return kind != Kind::AssetsOfAddress && h.watched && h.complete && h.holds() && h.amount.compare(wallet::assetInfo(h.asset).dust) < 0;
         case kSortRole:
             switch (column) {
             case ColName: return line.name;
@@ -208,6 +211,13 @@ public:
         endFilterChange(Direction::Rows);
     }
     bool hide() const { return hide_; }
+    void setHideDust(bool hide)
+    {
+        if (hide == hideDust_)
+            return;
+        hideDust_ = hide;
+        linesChanged();
+    }
     void linesChanged()
     {
         beginFilterChange();
@@ -215,7 +225,7 @@ public:
         anyWatched_ = false;
         const QAbstractItemModel* source = sourceModel();
         for (int row = 0; source && row < source->rowCount(); ++row) {
-            anyHolds_ = anyHolds_ || source->index(row, 0).data(kHoldsRole).toBool();
+            anyHolds_ = anyHolds_ || holdsEnough(source->index(row, 0));
             anyWatched_ = anyWatched_ || source->index(row, 0).data(kWatchedRole).toBool();
         }
         endFilterChange(Direction::Rows);
@@ -225,10 +235,12 @@ protected:
     bool filterAcceptsRow(int row, const QModelIndex& parent) const override
     {
         const QAbstractItemModel* source = sourceModel();
-        if (!hide_ || !source)
+        if (!source)
             return true;
         const QModelIndex first = source->index(row, 0, parent);
-        if (first.data(kHoldsRole).toBool())
+        if (holdsEnough(first))
+            return true;
+        if (!hide_ && !(hideDust_ && first.data(kDustRole).toBool()))
             return true;
         if (anyHolds_)
             return false;
@@ -236,7 +248,13 @@ protected:
     }
 
 private:
+    bool holdsEnough(const QModelIndex& first) const
+    {
+        return first.data(kHoldsRole).toBool() && !(hideDust_ && first.data(kDustRole).toBool());
+    }
+
     bool hide_ = false;
+    bool hideDust_ = false;
     bool anyHolds_ = false;
     bool anyWatched_ = false;
 };
@@ -748,6 +766,11 @@ void HoldingsTable::applyKind()
 void HoldingsTable::setHideZero(bool hide)
 {
     ui_->filter->setHide(hide);
+}
+
+void HoldingsTable::setHideDust(bool hide)
+{
+    ui_->filter->setHideDust(hide);
 }
 
 bool HoldingsTable::hideZero() const

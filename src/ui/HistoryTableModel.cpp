@@ -258,6 +258,28 @@ bool HistoryTableModel::makeLine(wallet::HistoryBook* book, const wallet::UtxoHi
     return true;
 }
 
+// Next to nothing came in, and nothing says it was meant: nobody was given that address to pay, it has
+// no label, and the line no note.
+bool HistoryTableModel::isDust(const Line& line, const wallet::HistoryBook& book, qint64 limit) const
+{
+    if (line.spent != 0 || line.received >= limit)
+        return false;
+    if (!book.noteOf(book.at(line.position).txid).isEmpty())
+        return false;
+    const wallet::WalletModel* model = controller_->model();
+    for (const wallet::TxEffect& effect : book.effectsOf(line.position)) {
+        if (effect.received <= 0)
+            continue;
+        const wallet::HistoryBook::AddressEntry& entry = book.addressAt(effect.address);
+        if (!controller_->addressLabel(entry.address).isEmpty())
+            return false;
+        const int row = model->findByScripthash(book.network(), entry.scripthash);
+        if (row >= 0 && controller_->isGivenOut(model->at(row)))
+            return false;
+    }
+    return true;
+}
+
 bool HistoryTableModel::lineOf(wallet::HistoryBook* book, const chain::Hash256& txid, Line* out) const
 {
     const int position = book->find(txid);
@@ -326,6 +348,8 @@ void HistoryTableModel::rebuildNow()
     QVector<Line> lines;
     qint64 receivedShown = 0;
     qint64 spentShown = 0;
+    int dustHidden = 0;
+    const bool hideDust = filter_.hideDust && filter_.scripthash.isEmpty() && filter_.query.isEmpty();
     if (controller_) {
         const QList<wallet::UtxoHistory*> histories = controller_->histories();
         for (const wallet::UtxoHistory* history : histories) {
@@ -337,12 +361,17 @@ void HistoryTableModel::rebuildNow()
                 continue;
             lines.reserve(lines.size() + book->size());
             const int tip = tipOf(*book);
+            const qint64 dustLimit = hideDust ? QString::fromStdString(coinOf(*book).dust.toDecimalString()).toLongLong() : 0;
             for (int position = 0; position < book->size(); ++position) {
                 Line line;
                 if (!makeLine(book, history, position, scope, tip, filter_, &line))
                     continue;
                 if (!matches(line, *book, book->at(position), book->effectsOf(position)))
                     continue;
+                if (hideDust && isDust(line, *book, dustLimit)) {
+                    ++dustHidden;
+                    continue;
+                }
                 // What it did, as the line says: change and moves between what is shown are nothing.
                 if (line.state == TxState::Confirming || line.state == TxState::Confirmed) {
                     const qint64 net = line.received - line.spent;
@@ -362,6 +391,7 @@ void HistoryTableModel::rebuildNow()
     lines_ = std::move(lines);
     receivedShown_ = receivedShown;
     spentShown_ = spentShown;
+    dustHidden_ = dustHidden;
     sortLines();
     endResetModel();
     lastRebuildMs_ = int(clock.elapsed());

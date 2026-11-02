@@ -51,6 +51,7 @@ public:
         qint64 from = 0;      // seconds since the epoch
         qint64 until = 0;
         QString query;
+        bool hideDust = false; // of the lines of everything, or of one wallet: one address was asked for
     };
     enum StateFilter { kStatePending, kStateConfirmed, kStateProofFailed, kStateGone };
 
@@ -79,6 +80,7 @@ public:
     // word, is not to be counted as paid.
     qint64 receivedShown() const { return receivedShown_; }
     qint64 spentShown() const { return spentShown_; }
+    int dustHidden() const { return dustHidden_; } // what the dust filter alone kept out of the lines shown
     const Line* lineAt(int row) const;
     int rowOf(wallet::HistoryBook* book, const chain::Hash256& txid) const; // -1 if it is not shown
     // The line of a transaction as it stands now, under what the page is narrowed to.
@@ -114,6 +116,7 @@ private:
     bool makeLine(wallet::HistoryBook* book, const wallet::UtxoHistory* history, int position, int scope, int tip, const Filter& filter, Line* out) const;
     TxState stateOf(const wallet::TxRecord& tx, int tip, const wallet::UtxoHistory* history) const;
     bool matches(const Line& line, const wallet::HistoryBook& book, const wallet::TxRecord& tx, const QVector<wallet::TxEffect>& effects) const;
+    bool isDust(const Line& line, const wallet::HistoryBook& book, qint64 limit) const;
     qint64 netOf(const Line& line) const { return line.received - line.spent; }
     double coinValue(const Line& line) const;
     double priceNow(const wallet::HistoryBook& book) const;
@@ -132,6 +135,7 @@ private:
     Qt::SortOrder sortOrder_ = Qt::DescendingOrder;
     qint64 receivedShown_ = 0;
     qint64 spentShown_ = 0;
+    int dustHidden_ = 0;
     int lastRebuildMs_ = 0;
     int tipsSeen_ = 0;
     int failedSeen_ = 0;

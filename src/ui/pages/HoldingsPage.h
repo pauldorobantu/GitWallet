@@ -31,6 +31,7 @@ private:
     WalletController* controller_ = nullptr;
     HoldingsTable* table_ = nullptr;
     QCheckBox* hideZero_ = nullptr;
+    QCheckBox* hideDust_ = nullptr;
     QLabel* count_ = nullptr;
 };
 

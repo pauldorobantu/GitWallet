@@ -1,6 +1,7 @@
 #pragma once
 
 #include "wallet/History.h"
+#include "wallet/Payments.h"
 #include "wallet/Types.h"
 
 #include <QByteArray>
@@ -110,6 +111,11 @@ public:
     bool saveAddressLabel(const QString& address, const QString& label, QString* why);
     bool saveAddressLabels(const QHash<QString, QString>& labels, QString* why);
     QHash<QString, QString> loadAddressLabels(QString* why);
+
+    // What came in, as the window was told: the file keeps the latest `kept`.
+    bool savePayment(const wallet::Payment& payment, int kept, QString* why);
+    bool setPaymentsRead(qint64 upTo, QString* why);
+    QList<wallet::Payment> loadPayments(QString* why);
 
     // Whatever can still be read of labels and notes in a file set aside, which stays as it is.
     static SavedLabels salvageLabels(const QString& path, const QByteArray& key);

@@ -2364,6 +2364,9 @@ void testGapsOverGivenOut(const Check& check, const QList<wallet::AccountKey>& k
 
 } // namespace
 
+// In AlertsTest.cpp.
+void runAlertsTest(const std::function<void(bool, const QString&)>& check, const QList<wallet::AccountKey>& someKeys);
+
 void runScreensTest(const Check& check, QString* report, const QList<wallet::AccountKey>& someKeys)
 {
     testQr(check, report);
@@ -2372,11 +2375,18 @@ void runScreensTest(const Check& check, QString* report, const QList<wallet::Acc
     testGivenOut(check, someKeys);
     // Leaves the box as it found it: this is one setting per Windows user.
     const QString hideZero = SettingsRepo().get(QStringLiteral("ui.hideZero"));
+    const QString hideDust = SettingsRepo().get(QStringLiteral("ui.hideDust"));
+    const QString alerts = SettingsRepo().get(QStringLiteral("ui.paymentAlerts"));
+    // These go by every row: what dust does to a list has checks of its own.
+    SettingsRepo().set(QStringLiteral("ui.hideDust"), QStringLiteral("0"));
     testFiguresHonest(check, someKeys);
     testScreens(check, someKeys);
     testHandingOut(check, someKeys);
     testGapsOverGivenOut(check, someKeys);
+    runAlertsTest(check, someKeys);
     SettingsRepo().set(QStringLiteral("ui.hideZero"), hideZero);
+    SettingsRepo().set(QStringLiteral("ui.hideDust"), hideDust);
+    SettingsRepo().set(QStringLiteral("ui.paymentAlerts"), alerts);
 }
 
 // In ScanTest.cpp, with the servers it fakes.

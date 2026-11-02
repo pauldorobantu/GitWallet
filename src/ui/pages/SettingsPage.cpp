@@ -1,6 +1,7 @@
 #include "ui/pages/SettingsPage.h"
 
 #include "app/WalletController.h"
+#include "core/SettingsRepo.h"
 #include "net/ElectrumClient.h"
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
@@ -10,6 +11,7 @@
 #include "wallet/Types.h"
 #include "wallet/WalletStore.h"
 
+#include <QCheckBox>
 #include <QFile>
 #include <QFileDialog>
 #include <QFontMetrics>
@@ -291,6 +293,27 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     column->addWidget(labels.card);
     connect(exportLabels, &QPushButton::clicked, this, &SettingsPage::exportLabels);
     connect(importLabels, &QPushButton::clicked, this, &SettingsPage::importLabels);
+
+    const page::Section alerts = page::makeSection(
+        content, QStringLiteral("Payment alerts"),
+        QStringLiteral("GitWallet says when a payment comes in, and the bell in the title bar lists them. It can only say so while it is running: what came in while it was closed is told at the next start."));
+    auto* alertsOn = new QCheckBox(QStringLiteral("Tell me when a payment comes in"), alerts.card);
+    alertsOn->setObjectName(QStringLiteral("paymentAlerts"));
+    alertsOn->setChecked(SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) != QLatin1String("0"));
+    auto* alertsWindows = new QCheckBox(QStringLiteral("As a Windows notification when this window is not in front"), alerts.card);
+    alertsWindows->setObjectName(QStringLiteral("paymentAlertsWindows"));
+    alertsWindows->setChecked(SettingsRepo().get(QStringLiteral("ui.paymentAlertsWindows")) != QLatin1String("0"));
+    alertsWindows->setEnabled(alertsOn->isChecked());
+    connect(alertsOn, &QCheckBox::toggled, this, [alertsWindows](bool on) {
+        SettingsRepo().set(QStringLiteral("ui.paymentAlerts"), on ? QStringLiteral("1") : QStringLiteral("0"));
+        alertsWindows->setEnabled(on);
+    });
+    connect(alertsWindows, &QCheckBox::toggled, this, [](bool on) {
+        SettingsRepo().set(QStringLiteral("ui.paymentAlertsWindows"), on ? QStringLiteral("1") : QStringLiteral("0"));
+    });
+    alerts.body->addWidget(alertsOn);
+    alerts.body->addWidget(alertsWindows);
+    column->addWidget(alerts.card);
 
     column->addStretch(1);
     scroll->setWidget(content);

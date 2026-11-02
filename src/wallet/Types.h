@@ -146,6 +146,8 @@ struct AddressRow {
     // This row's balance in `a` (UTXO: confirmed + unconfirmed, floored at 0; zero for
     // assets of another network).
     chain::Amount amount(Asset a) const;
+    // It holds something, and of each asset less than AssetInfo::dust.
+    bool onlyDust() const;
     // Sets an Evm balance, keeping balances free of zeros.
     void setBalance(Asset a, const chain::Amount& value);
     // Calls `f(asset, amount)` for what the row holds.

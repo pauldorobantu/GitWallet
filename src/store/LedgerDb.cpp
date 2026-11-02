@@ -11,7 +11,7 @@ namespace store {
 
 namespace {
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 constexpr int kOutPointBytes = 36;
 
 // Finalizes on every path out of a query.
@@ -361,6 +361,25 @@ bool LedgerDb::migrate(QString* why)
         if (!exec(schema, why))
             return false;
     }
+    if (have < 3) {
+        const char* schema = R"sql(
+            CREATE TABLE payment(
+                id INTEGER PRIMARY KEY,
+                at INTEGER NOT NULL,
+                asset TEXT NOT NULL,
+                amount BLOB NOT NULL,
+                usd REAL NOT NULL,
+                wallet INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                addresses INTEGER NOT NULL,
+                txid BLOB,
+                is_read INTEGER NOT NULL,
+                while_closed INTEGER NOT NULL
+            );
+        )sql";
+        if (!exec(schema, why))
+            return false;
+    }
     const QByteArray set = "PRAGMA user_version = " + QByteArray::number(kSchemaVersion);
     if (!exec(set.constData(), why))
         return false;
@@ -696,6 +715,15 @@ bool LedgerDb::removeWallet(quint32 wallet, QString* why, QStringList* labelsGon
                 return false;
             }
         }
+        Statement payments;
+        if (!prepare("DELETE FROM payment WHERE wallet = ?", payments.slot(), failure))
+            return false;
+        sqlite3_bind_int64(payments.get(), 1, wallet);
+        if (sqlite3_step(payments.get()) != SQLITE_DONE) {
+            if (failure)
+                *failure = lastError();
+            return false;
+        }
         Statement remove;
         if (!prepare("DELETE FROM address WHERE wallet = ?", remove.slot(), failure))
             return false;
@@ -740,6 +768,93 @@ bool LedgerDb::savePrices(const QList<SavedPrice>& prices, QString* why)
         }
         return true;
     }, why);
+}
+
+bool LedgerDb::savePayment(const wallet::Payment& payment, int kept, QString* why)
+{
+    return writeInTransaction([this, &payment, kept](QString* failure) {
+        Statement put;
+        if (!prepare("INSERT OR REPLACE INTO payment(id, at, asset, amount, usd, wallet, address, addresses, txid, is_read, while_closed) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     put.slot(), failure))
+            return false;
+        sqlite3_bind_int64(put.get(), 1, payment.id);
+        sqlite3_bind_int64(put.get(), 2, payment.at);
+        bindText(put.get(), 3, payment.asset);
+        const chain::Bytes& amount = payment.amount.bigEndian();
+        // An empty blob is not a null one: the column takes no null.
+        sqlite3_bind_blob(put.get(), 4, amount.empty() ? "" : reinterpret_cast<const char*>(amount.data()), int(amount.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_double(put.get(), 5, payment.usd);
+        sqlite3_bind_int64(put.get(), 6, payment.wallet);
+        bindText(put.get(), 7, payment.address);
+        sqlite3_bind_int(put.get(), 8, payment.addresses);
+        if (payment.hasTx)
+            sqlite3_bind_blob(put.get(), 9, payment.txid.data(), int(payment.txid.size()), SQLITE_TRANSIENT);
+        else
+            sqlite3_bind_null(put.get(), 9);
+        sqlite3_bind_int(put.get(), 10, payment.read ? 1 : 0);
+        sqlite3_bind_int(put.get(), 11, payment.whileClosed ? 1 : 0);
+        if (sqlite3_step(put.get()) != SQLITE_DONE) {
+            if (failure)
+                *failure = lastError();
+            return false;
+        }
+        Statement old;
+        if (!prepare("DELETE FROM payment WHERE id NOT IN (SELECT id FROM payment ORDER BY id DESC LIMIT ?)", old.slot(), failure))
+            return false;
+        sqlite3_bind_int(old.get(), 1, kept);
+        if (sqlite3_step(old.get()) != SQLITE_DONE) {
+            if (failure)
+                *failure = lastError();
+            return false;
+        }
+        return true;
+    }, why);
+}
+
+bool LedgerDb::setPaymentsRead(qint64 upTo, QString* why)
+{
+    return writeInTransaction([this, upTo](QString* failure) {
+        Statement set;
+        if (!prepare("UPDATE payment SET is_read = 1 WHERE id <= ?", set.slot(), failure))
+            return false;
+        sqlite3_bind_int64(set.get(), 1, upTo);
+        if (sqlite3_step(set.get()) != SQLITE_DONE) {
+            if (failure)
+                *failure = lastError();
+            return false;
+        }
+        return true;
+    }, why);
+}
+
+QList<wallet::Payment> LedgerDb::loadPayments(QString* why)
+{
+    QList<wallet::Payment> out;
+    Statement list;
+    if (!db_ || !prepare("SELECT id, at, asset, amount, usd, wallet, address, addresses, txid, is_read, while_closed FROM payment ORDER BY id", list.slot(), why))
+        return out;
+    while (sqlite3_step(list.get()) == SQLITE_ROW) {
+        wallet::Payment payment;
+        payment.id = sqlite3_column_int64(list.get(), 0);
+        payment.at = sqlite3_column_int64(list.get(), 1);
+        payment.asset = columnText(list.get(), 2);
+        const auto* amount = static_cast<const uint8_t*>(sqlite3_column_blob(list.get(), 3));
+        const int amountBytes = sqlite3_column_bytes(list.get(), 3);
+        payment.amount = chain::Amount::fromBigEndian(amount && amountBytes > 0 ? chain::Bytes(amount, amount + amountBytes) : chain::Bytes());
+        payment.usd = sqlite3_column_double(list.get(), 4);
+        payment.wallet = quint32(sqlite3_column_int64(list.get(), 5));
+        payment.address = columnText(list.get(), 6);
+        payment.addresses = sqlite3_column_int(list.get(), 7);
+        if (sqlite3_column_bytes(list.get(), 8) == int(payment.txid.size())) {
+            std::memcpy(payment.txid.data(), sqlite3_column_blob(list.get(), 8), payment.txid.size());
+            payment.hasTx = true;
+        }
+        payment.read = sqlite3_column_int(list.get(), 9) != 0;
+        payment.whileClosed = sqlite3_column_int(list.get(), 10) != 0;
+        out.append(payment);
+    }
+    return out;
 }
 
 QList<SavedPrice> LedgerDb::loadPrices(QString* why)

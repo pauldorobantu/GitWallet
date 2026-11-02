@@ -20,6 +20,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDate>
 #include <QDateTime>
@@ -123,6 +124,7 @@ struct HistoryPage::Ui : QObject
     QComboBox* type = nullptr;
     QComboBox* state = nullptr;
     QComboBox* period = nullptr;
+    QCheckBox* hideDust = nullptr;
     QLabel* count = nullptr;
     QPushButton* details = nullptr;
     QPushButton* exportCsv = nullptr;
@@ -233,12 +235,20 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->period->addItems({QStringLiteral("All time"), QStringLiteral("Last 24 hours"), QStringLiteral("Last 7 days"),
                            QStringLiteral("Last 30 days"), QStringLiteral("This year"), QStringLiteral("Last year")});
     ui_->period->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    ui_->hideDust = new QCheckBox(QStringLiteral("Hide dust"), bar.widget);
+    ui_->hideDust->setObjectName(QStringLiteral("historyHideDust"));
+    ui_->hideDust->setChecked(figures::hideDust());
+    connect(ui_->hideDust, &QCheckBox::toggled, this, [this](bool on) {
+        figures::setHideDust(on);
+        applyFilter();
+    });
     ui_->count = page::makeBarCount(bar.widget);
     bar.left->addWidget(ui_->search);
     bar.left->addWidget(ui_->wallet);
     bar.left->addWidget(ui_->type);
     bar.left->addWidget(ui_->state);
     bar.left->addWidget(ui_->period);
+    bar.left->addWidget(ui_->hideDust);
     page::finishBarLeft(bar, ui_->search, ui_->count);
     ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
     ui_->details = new QPushButton(QStringLiteral("Details"), bar.widget);
@@ -302,6 +312,7 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
         ui_->exportCsv->setToolTip(trText(QStringLiteral("Save the lines shown to a spreadsheet file. It is not encrypted: anyone who reads it "
                                                          "sees these transactions, labels and notes.")));
         ui_->count->setToolTip(trText(QStringLiteral("In and out: what the lines shown came to, of those proven in a block.")));
+        ui_->hideDust->setToolTip(trText(QStringLiteral("Less than %1 coming in leaves this list, unless the address was given out or has a label, or the line has a note. It still counts in every balance, and a search still finds it.")).arg(figures::dustLimits()));
     };
     setTips();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this, setTips] {
@@ -342,6 +353,7 @@ HistoryTableModel* HistoryPage::tableModel() const
 void HistoryPage::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
+    ui_->hideDust->setChecked(figures::hideDust());
     becomeWhole();
     ui_->model->setWatched(true);
     ui_->periodAgain->start();
@@ -479,6 +491,8 @@ void HistoryPage::applyFilter()
     filter.kind = ui_->type->currentData().toInt();
     filter.state = ui_->state->currentData().toInt();
     filter.query = ui_->search->text().trimmed();
+    filter.hideDust = ui_->hideDust->isChecked();
+    ui_->hideDust->setVisible(ui_->scripthash.isEmpty());
     const QDateTime now = QDateTime::currentDateTime();
     ui_->yearOfFilter = now.date().year();
     switch (ui_->period->currentIndex()) {
@@ -538,6 +552,8 @@ void HistoryPage::updateState()
             }
         }
     }
+    if (hasWallet && ui_->model->dustHidden() > 0)
+        line += QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(grouped(ui_->model->dustHidden()));
     ui_->count->setText(line);
     ui_->count->setVisible(hasWallet);
 
@@ -859,7 +875,9 @@ void HistoryPage::finishExport(bool ok, const QString& error)
     ui_->exporting.clear();
     updateState();
     if (ok)
-        Feedback::show(ui_->exportCsv, Feedback::Type::Success, trText(QStringLiteral("Transactions exported")));
+        Feedback::show(ui_->exportCsv, ui_->model->dustHidden() > 0 ? Feedback::Type::Info : Feedback::Type::Success,
+                       ui_->model->dustHidden() > 0 ? trText(QStringLiteral("Transactions exported, without the %1 hidden as dust")).arg(grouped(ui_->model->dustHidden()))
+                                                    : trText(QStringLiteral("Transactions exported")));
     else
         Feedback::show(this, Feedback::Type::Error, error);
 }

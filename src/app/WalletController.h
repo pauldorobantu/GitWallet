@@ -29,6 +29,7 @@ class Ledger;
 
 namespace wallet {
 class HistoryBook;
+class PaymentBook;
 class UtxoHistory;
 class WalletModel;
 } // namespace wallet
@@ -120,6 +121,7 @@ public:
     const wallet::WalletStore& store() const { return store_; }
     wallet::WalletModel* model() const { return model_; }
     net::PriceFeed* prices() const { return prices_; }
+    wallet::PaymentBook* payments() const { return payments_; }
 
     void refresh(); // prices + a round of every balance that is polled, now (what is followed live is live)
 
@@ -288,6 +290,7 @@ private:
     wallet::WalletModel* model_ = nullptr;
     net::PriceFeed* prices_ = nullptr;
     wallet::Scheduler* scheduler_ = nullptr;
+    wallet::PaymentBook* payments_ = nullptr;
     store::Ledger* ledger_ = nullptr;
     QTimer* priceTimer_ = nullptr;
     QTimer* statusTimer_ = nullptr; // single-shot throttle behind queueStatus()

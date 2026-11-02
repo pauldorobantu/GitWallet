@@ -27,6 +27,7 @@
         "decimals": 8,
         "shown": 8,
         "maxSupply": 21000000,
+        "dust": "1000",
         "icon": { "color": "#F7931A", "glyph": "₿" },
         "prices": { "defillama": "coingecko:bitcoin", "coingecko": "bitcoin", "coinbase": "BTC" }
       },
@@ -59,6 +60,7 @@
         "name": "Ethereum",
         "decimals": 18,
         "shown": 6,
+        "dust": "10000000000000",
         "icon": { "color": "#627EEA", "glyph": "Ξ" },
         "prices": { "defillama": "coingecko:ethereum", "coingecko": "ethereum", "coinbase": "ETH" }
       },
@@ -72,6 +74,7 @@
           "shown": 2,
           "dollar": true,
           "contract": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+          "dust": "10000",
           "icon": { "color": "#26A17B", "glyph": "₮" },
           "prices": { "defillama": "ethereum:0xdAC17F958D2ee523a2206206994597C13D831ec7", "coingecko": "tether", "coinbase": "USDT" }
         },
@@ -84,6 +87,7 @@
           "shown": 2,
           "dollar": true,
           "contract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+          "dust": "10000",
           "icon": { "color": "#2775CA", "glyph": "$" },
           "prices": { "defillama": "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "coingecko": "usd-coin", "coinbase": "USDC" }
         }

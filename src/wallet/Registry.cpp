@@ -99,6 +99,9 @@ QString readAsset(const QJsonObject& o, const NetworkInfo& network, bool token, 
     out->dollar = o.value(QLatin1String("dollar")).toBool();
     out->contract = o.value(QLatin1String("contract")).toString();
     out->maxSupply = o.value(QLatin1String("maxSupply")).toDouble();
+    const QString dust = o.value(QLatin1String("dust")).toString();
+    if (!dust.isEmpty() && !chain::Amount::fromDecimal(dust.toStdString(), &out->dust))
+        return QStringLiteral("%1 has no usable dust limit").arg(out->key);
     const QJsonObject icon = o.value(QLatin1String("icon")).toObject();
     out->iconColor = icon.value(QLatin1String("color")).toString();
     out->iconGlyph = icon.value(QLatin1String("glyph")).toString();

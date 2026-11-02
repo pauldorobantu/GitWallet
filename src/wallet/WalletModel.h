@@ -69,6 +69,7 @@ public:
 signals:
     void rowsAppended(int first, int last);
     void rowChanged(int row);
+    void rowMoved(int row, const wallet::AddressRow& before); // what it said until now, before rowChanged()
     void totalsChanged();
     void cleared();
     void rowsDropped();

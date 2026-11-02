@@ -44,6 +44,33 @@ QIcon tbIcon(icon::Kind kind, const QColor& color)
     }
 }
 
+// The bell, with how many wait on it.
+QIcon bellIcon(const QColor& color, const QColor& accent, int unread, qreal dpr)
+{
+    constexpr int kSide = 22;
+    QPixmap out(qRound(kSide * dpr), qRound(kSide * dpr));
+    out.setDevicePixelRatio(dpr);
+    out.fill(Qt::transparent);
+    QPainter p(&out);
+    p.setRenderHint(QPainter::Antialiasing);
+    makeIcon(icon::Kind::Bell, color, 17, 1.8).paint(&p, QRect(2, 4, 17, 17));
+    if (unread > 0) {
+        constexpr qreal kBadge = 13.0;
+        const QRectF badge(kSide - kBadge, 0.0, kBadge, kBadge);
+        p.setPen(Qt::NoPen);
+        p.setBrush(accent);
+        p.drawEllipse(badge);
+        QFont font = p.font();
+        font.setPixelSize(9);
+        font.setBold(true);
+        p.setFont(font);
+        p.setPen(QColor(0xFF, 0xFF, 0xFF));
+        p.drawText(badge, Qt::AlignCenter, unread > 9 ? QStringLiteral("9+") : QString::number(unread));
+    }
+    p.end();
+    return QIcon(out);
+}
+
 QPixmap statusDotPixmap(bool active, qreal dpr)
 {
     const int d = 8;
@@ -135,13 +162,24 @@ TitleBar::TitleBar(QWidget* window, QWidget* parent)
         btn->setToolTip(tip);
         return btn;
     };
+    bellBtn_ = makeUtilityBtn(QString());
+    bellBtn_->setObjectName(QStringLiteral("tbBell"));
+    bellBtn_->setIconSize(QSize(22, 22));
+    lockBtn_ = makeUtilityBtn(QString());
+    lockBtn_->setObjectName(QStringLiteral("tbLock"));
+    lockBtn_->hide();
     settingsBtn_ = makeUtilityBtn(QStringLiteral("Settings"));
     aboutBtn_ = makeUtilityBtn(QStringLiteral("About"));
     refreshUtilityIcons();
+    connect(bellBtn_, &QToolButton::clicked, this, &TitleBar::paymentsRequested);
+    connect(lockBtn_, &QToolButton::clicked, this, &TitleBar::lockRequested);
+    connect(LanguageManager::instance(), &LanguageManager::changed, this, [this]() { refreshUtilityIcons(); });
     connect(settingsBtn_, &QToolButton::clicked, this, &TitleBar::settingsRequested);
     connect(aboutBtn_, &QToolButton::clicked, this, &TitleBar::aboutRequested);
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this,
             [this]() { refreshUtilityIcons(); });
+    layout->addWidget(bellBtn_, 0, Qt::AlignVCenter);
+    layout->addWidget(lockBtn_, 0, Qt::AlignVCenter);
     layout->addWidget(settingsBtn_, 0, Qt::AlignVCenter);
     layout->addWidget(aboutBtn_, 0, Qt::AlignVCenter);
     layout->addSpacing(8);
@@ -186,9 +224,23 @@ TitleBar::TitleBar(QWidget* window, QWidget* parent)
 
 void TitleBar::setUtilityButtonsVisible(bool on)
 {
-    for (QToolButton* b : { settingsBtn_, aboutBtn_ })
+    utilityVisible_ = on;
+    for (QToolButton* b : { settingsBtn_, aboutBtn_, bellBtn_ })
         if (b)
             b->setVisible(on);
+    lockBtn_->setVisible(on && lockAvailable_);
+}
+
+void TitleBar::setUnreadPayments(int unread)
+{
+    unreadPayments_ = unread;
+    refreshUtilityIcons();
+}
+
+void TitleBar::setLockAvailable(bool available)
+{
+    lockAvailable_ = available;
+    lockBtn_->setVisible(utilityVisible_ && available);
 }
 
 void TitleBar::setStatus(const QString& text)
@@ -235,6 +287,14 @@ void TitleBar::refreshUtilityIcons()
         settingsBtn_->setIcon(makeIcon(icon::Kind::Settings, c, 17, 1.8));
     if (aboutBtn_)
         aboutBtn_->setIcon(makeIcon(icon::Kind::Shield, c, 17, 1.8));
+    if (bellBtn_) {
+        bellBtn_->setIcon(bellIcon(c, theme::ThemeManager::instance()->color(QStringLiteral("accent")), unreadPayments_, devicePixelRatioF()));
+        bellBtn_->setToolTip(unreadPayments_ > 0 ? trText(QStringLiteral("Payments received: %1 not looked at yet")).arg(unreadPayments_) : trText(QStringLiteral("Payments received")));
+    }
+    if (lockBtn_) {
+        lockBtn_->setIcon(makeIcon(icon::Kind::Lock, c, 17, 1.8));
+        lockBtn_->setToolTip(trText(QStringLiteral("Lock GitWallet")));
+    }
 }
 
 void TitleBar::refreshLangButton()

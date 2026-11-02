@@ -3,6 +3,7 @@
     <file>theme.qss</file>
     <file>bip39/english.txt</file>
     <file>coins.json</file>
+    <file>icons/lucide/Bell.svg</file>
     <file>icons/lucide/Brush.svg</file>
     <file>icons/lucide/Check.svg</file>
     <file>icons/lucide/CheckBox.svg</file>
@@ -27,6 +28,7 @@
     <file>icons/lucide/LayoutGrid.svg</file>
     <file>icons/lucide/List.svg</file>
     <file>icons/lucide/ListRows.svg</file>
+    <file>icons/lucide/Lock.svg</file>
     <file>icons/lucide/LogOut.svg</file>
     <file>icons/lucide/Logs.svg</file>
     <file>icons/lucide/Mail.svg</file>

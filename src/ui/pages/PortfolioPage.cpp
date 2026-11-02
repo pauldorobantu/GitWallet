@@ -271,6 +271,21 @@ QWidget* PortfolioPage::buildWalletState()
         refreshView();
     });
     bar.left->addWidget(hideZero_);
+    hideDust_ = new QCheckBox(QStringLiteral("Hide dust"), bar.widget);
+    hideDust_->setObjectName(QStringLiteral("hideDust"));
+    hideDust_->setChecked(figures::hideDust());
+    table_->setHideDust(hideDust_->isChecked());
+    const auto dustTip = [this] {
+        hideDust_->setToolTip(trText(QStringLiteral("Less than %1 in all leaves this list. It still counts in the total.")).arg(figures::dustLimits()));
+    };
+    dustTip();
+    connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
+    connect(hideDust_, &QCheckBox::toggled, this, [this](bool on) {
+        figures::setHideDust(on);
+        table_->setHideDust(on);
+        refreshView();
+    });
+    bar.left->addWidget(hideDust_);
     countLabel_ = page::makeBarCount(bar.widget);
     bar.left->addWidget(countLabel_);
     bar.left->addStretch(1);
@@ -309,6 +324,7 @@ void PortfolioPage::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
     hideZero_->setChecked(SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
+    hideDust_->setChecked(figures::hideDust());
 }
 
 void PortfolioPage::showState()

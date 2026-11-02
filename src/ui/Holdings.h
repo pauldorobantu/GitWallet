@@ -98,6 +98,8 @@ public:
     // Rows known to hold nothing go, unless that is all there is.
     void setHideZero(bool hide);
     bool hideZero() const;
+    // And those known to hold only dust. Never of one address, which was asked for by name.
+    void setHideDust(bool hide);
 
     QTableView* view() const;
     int rowsShown() const;

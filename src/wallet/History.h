@@ -209,6 +209,7 @@ public:
 
 signals:
     void changed(); // lines of the table may have moved; comes as often as things do
+    void added(int position); // a transaction not here before came off the wire, not off the database
     void cleared();
     void positionsAboutToMove(); // still as they were
     void positionsMoved(); // what was at a position may be gone: nobody goes by one kept from before

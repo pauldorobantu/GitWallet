@@ -332,6 +332,7 @@ AddressTableModel::AddressTableModel(WalletController* controller, QObject* pare
     });
     if (wallet::WalletModel* model = controller_->model()) {
         rows_ = model->size();
+        readDust();
         connect(model, &wallet::WalletModel::rowsAppended, this, &AddressTableModel::appendRows);
         connect(model, &wallet::WalletModel::rowChanged, this, &AddressTableModel::changeRow);
         connect(model, &wallet::WalletModel::cleared, this, &AddressTableModel::resetRows);
@@ -543,6 +544,8 @@ void AddressTableModel::announceRows()
     if (size <= rows_)
         return;
     beginInsertRows(QModelIndex(), rows_, size - 1);
+    for (int row = rows_; row < size; ++row)
+        noteDust(row);
     rows_ = size;
     endInsertRows();
 }
@@ -555,6 +558,7 @@ void AddressTableModel::changeRow(int row)
         appendRows(); // not announced yet: the insert carries the new data
         return;
     }
+    noteDust(row);
     emit dataChanged(index(row, 0), index(row, ColumnCount - 1));
 }
 
@@ -565,6 +569,7 @@ void AddressTableModel::resetRows()
     beginResetModel();
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
     rows_ = model ? model->size() : 0;
+    readDust();
     endResetModel();
 }
 
@@ -591,9 +596,46 @@ void AddressTableModel::refreshPrices()
     }
 }
 
+void AddressTableModel::noteDust(int row)
+{
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (model && row < model->size() && model->at(row).onlyDust())
+        dust_.insert(row);
+    else
+        dust_.remove(row);
+}
+
+void AddressTableModel::readDust()
+{
+    dust_.clear();
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (!model)
+        return;
+    for (int row = 0; row < rows_ && row < model->size(); ++row) {
+        if (model->at(row).state() == wallet::AddressState::Funded && model->at(row).onlyDust())
+            dust_.insert(row);
+    }
+}
+
+bool AddressTableModel::isDust(int row) const
+{
+    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+    if (!model || row >= model->size() || !dust_.contains(row))
+        return false;
+    const wallet::AddressRow& it = model->at(row);
+    return !wasGivenOut(it) && controller_->addressLabel(it.address).isEmpty();
+}
+
 bool AddressTableModel::waitingForPayment(const wallet::AddressRow& row) const
 {
-    if (row.change != 0 || row.used || row.state() == wallet::AddressState::Funded || !controller_)
+    if (row.used || row.state() == wallet::AddressState::Funded)
+        return false;
+    return wasGivenOut(row);
+}
+
+bool AddressTableModel::wasGivenOut(const wallet::AddressRow& row) const
+{
+    if (row.change != 0 || !controller_)
         return false;
     if (givenStale_) {
         givenStale_ = false;

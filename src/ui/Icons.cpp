@@ -66,6 +66,8 @@ QString svgPathFor(icon::Kind kind)
     case icon::Kind::Moon:         return QStringLiteral(":/icons/lucide/Moon.svg");
     case icon::Kind::User:         return QStringLiteral(":/icons/lucide/User.svg");
     case icon::Kind::LogOut:       return QStringLiteral(":/icons/lucide/LogOut.svg");
+    case icon::Kind::Bell:         return QStringLiteral(":/icons/lucide/Bell.svg");
+    case icon::Kind::Lock:         return QStringLiteral(":/icons/lucide/Lock.svg");
     }
     return QString();
 }
@@ -391,6 +393,19 @@ QIcon makeIcon(icon::Kind kind, const QColor& color, int size, qreal stroke)
         p.drawPath(circlePath(7.5, 10.5, 3.5));
         p.drawPath(line(10, 13, 17.5, 20.5));
         p.drawPath(line(14.5, 17.5, 17.5, 14.5));
+        break;
+    case icon::Kind::Bell:
+        p.drawArc(QRectF(6, 2, 12, 12), 0, 180 * 16);
+        p.drawPath(line(6, 8, 6, 13));
+        p.drawPath(line(18, 8, 18, 13));
+        p.drawPath(line(4, 17, 20, 17));
+        p.drawPath(line(10.5, 21, 13.5, 21));
+        break;
+    case icon::Kind::Lock:
+        p.drawPath(roundedRectPath(3, 11, 18, 11, 2));
+        p.drawArc(QRectF(7, 2, 10, 10), 0, 180 * 16);
+        p.drawPath(line(7, 7, 7, 11));
+        p.drawPath(line(17, 7, 17, 11));
         break;
     case icon::Kind::User: // head circle + shoulders
         p.drawPath(circlePath(12, 7, 4));

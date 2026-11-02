@@ -23,6 +23,13 @@ QString formatCount(int n);
 // Dust that only reads "<0.000001" or "<$0.01" becomes "> 0" / "> $0".
 QString atLeast(const QString& figure);
 
+// What counts as dust, coin by coin: "0.00001 BTC, 0.01 USDT".
+QString dustLimits();
+
+// Whether the lists leave dust out, as the reader last chose. They do until told otherwise.
+bool hideDust();
+void setHideDust(bool hide);
+
 // A count of what has answered so far: plain once all of it has, "≥ 3" before that, "—" for none yet.
 QString countSoFar(int count, bool complete);
 

@@ -12,7 +12,9 @@
 #include "ui/TitleBar.h"
 #include "ui/WindowShell.h"
 #include "ui/design/Style.h"
+#include "ui/Figures.h"
 #include "ui/dialogs/ImportSeedDialog.h"
+#include "ui/dialogs/PaymentsDialog.h"
 #include "ui/pages/WalletsPage.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
@@ -20,11 +22,13 @@
 #include "ui/pages/PortfolioPage.h"
 #include "ui/pages/ReceivePage.h"
 #include "ui/pages/SettingsPage.h"
+#include "wallet/Payments.h"
 #include "wallet/Types.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
 #include <QApplication>
+#include "core/SettingsRepo.h"
 #include <QDateTime>
 #include <QDebug>
 #include <QEvent>
@@ -40,6 +44,7 @@
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QStackedWidget>
+#include <QSystemTrayIcon>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -233,7 +238,10 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     // only a debugger, and these messages are what explains a balance that is
     // missing or stale. They go on screen.
     connect(controller_, &WalletController::errorOccurred, this, &MainWindow::onWalletError);
+    connect(controller_->payments(), &wallet::PaymentBook::told, this, &MainWindow::onPaymentsTold);
+    connect(controller_->payments(), &wallet::PaymentBook::changed, this, &MainWindow::refreshBell);
     refreshStatus();
+    refreshBell();
 }
 
 void MainWindow::buildUi()
@@ -375,6 +383,7 @@ void MainWindow::buildUi()
     connect(title_, &TitleBar::languageSelected, this,
             [](const QString& code) { LanguageManager::instance()->setLanguage(code); });
     connect(title_, &TitleBar::settingsRequested, this, [this] { openPage(PageSettings); });
+    connect(title_, &TitleBar::paymentsRequested, this, &MainWindow::openPayments);
 
     connect(nav_, &SideNav::navigate, this, [this](int pageId, int) { openPage(pageId); });
     connect(nav_, &SideNav::toggleRequested, this,
@@ -565,6 +574,83 @@ void MainWindow::afterWalletChange()
         goTo(place, placeBar_->tab());
     }
     placeBar_->showPlace(placeBar_->place(), placeBar_->tab());
+}
+
+// ---------------------------------------------------------------- payments ----
+
+void MainWindow::refreshBell()
+{
+    title_->setUnreadPayments(controller_->payments()->unread());
+}
+
+void MainWindow::openPayments()
+{
+    auto* dialog = new PaymentsDialog(controller_, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &PaymentsDialog::openAddressRequested, this, [this](const wallet::AddressRow& row) {
+        Place place;
+        place.root = Place::Root::Addresses;
+        place.address = row;
+        // A network with no history yet opens on what the address holds.
+        goTo(place, controller_->historyOf(row.network) ? Place::Tab::History : Place::Tab::Holdings);
+    });
+    // open(), not exec(): the scanners go on, and so does the list.
+    dialog->open();
+}
+
+void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
+{
+    if (payments.isEmpty() || SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) == QLatin1String("0"))
+        return;
+    const auto worth = [](const wallet::Payment& payment) {
+        const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
+        QString text = info ? figures::formatAmount(payment.amount, *info) + QLatin1Char(' ') + info->symbol : payment.asset;
+        if (payment.usd > 0.0)
+            text += QStringLiteral(" (%1)").arg(figures::formatUsd(payment.usd));
+        return text;
+    };
+    const bool whileClosed = std::any_of(payments.cbegin(), payments.cend(), [](const wallet::Payment& payment) { return payment.whileClosed; });
+    QString text;
+    if (payments.size() == 1 && !whileClosed) {
+        const wallet::WalletEntry* entry = controller_->store().find(payments.first().wallet);
+        text = trText(QStringLiteral("Received %1 · %2")).arg(worth(payments.first()), entry ? entry->label : QString());
+    } else if (whileClosed) {
+        text = payments.size() == 1 ? trText(QStringLiteral("A payment came in while GitWallet was closed: %1")).arg(worth(payments.first()))
+                                    : trText(QStringLiteral("%1 payments came in while GitWallet was closed")).arg(figures::formatCount(int(payments.size())));
+    } else {
+        double usd = 0.0;
+        bool priced = true;
+        for (const wallet::Payment& payment : payments) {
+            usd += payment.usd;
+            priced = priced && payment.usd > 0.0;
+        }
+        text = priced ? trText(QStringLiteral("%1 payments came in · %2")).arg(figures::formatCount(int(payments.size())), figures::formatUsd(usd))
+                      : trText(QStringLiteral("%1 payments came in")).arg(figures::formatCount(int(payments.size())));
+    }
+    lastPaymentAlert_ = text;
+    if (isActiveWindow()) {
+        Feedback::show(this, Feedback::Type::Success, text);
+        return;
+    }
+    if (SettingsRepo().get(QStringLiteral("ui.paymentAlertsWindows")) != QLatin1String("0") && QSystemTrayIcon::isSystemTrayAvailable()) {
+        if (!tray_) {
+            tray_ = new QSystemTrayIcon(QApplication::windowIcon(), this);
+            tray_->setToolTip(QStringLiteral("GitWallet"));
+            const auto bringBack = [this] {
+                setWindowState((windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+                raise();
+                activateWindow();
+            };
+            connect(tray_, &QSystemTrayIcon::activated, this, bringBack);
+            connect(tray_, &QSystemTrayIcon::messageClicked, this, [this, bringBack] {
+                bringBack();
+                openPayments();
+            });
+            tray_->show();
+        }
+        tray_->showMessage(QStringLiteral("GitWallet"), text, QSystemTrayIcon::Information);
+    }
+    QApplication::alert(this); // the taskbar button says so too
 }
 
 void MainWindow::editAddressLabel(const QString& address)

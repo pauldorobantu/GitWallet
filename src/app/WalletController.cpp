@@ -4,10 +4,12 @@
 #include "chain/Hash.h"
 #include "net/PriceFeed.h"
 #include "store/Ledger.h"
+#include "ui/Figures.h"
 #include "ui/LanguageManager.h"
 #include "wallet/BulkImport.h"
 #include "wallet/EvmScanner.h"
 #include "wallet/History.h"
+#include "wallet/Payments.h"
 #include "wallet/UtxoHistory.h"
 #include "wallet/UtxoScanner.h"
 #include "wallet/WalletModel.h"
@@ -256,6 +258,17 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     const QList<wallet::HistoryBook*> books = scheduler_->books();
     for (wallet::HistoryBook* book : books)
         ledger_->addBook(book);
+    payments_ = new wallet::PaymentBook(model_, books, this);
+    wallet::PaymentBook::Hooks hooks;
+    hooks.price = [this](wallet::Asset asset) { return prices_->usd(asset); };
+    hooks.givenOut = [this](const wallet::AddressRow& row) { return isGivenOut(row); };
+    hooks.labelled = [this](const QString& address) { return addressLabels_.contains(address); };
+    hooks.starting = [this] { return showingSaved_; };
+    hooks.hideDust = [] { return ui::figures::hideDust(); };
+    payments_->setHooks(hooks);
+    connect(payments_, &wallet::PaymentBook::recorded, ledger_, &store::Ledger::savePayment);
+    connect(payments_, &wallet::PaymentBook::readUpTo, ledger_, &store::Ledger::setPaymentsRead);
+    connect(ledger_, &store::Ledger::paymentsRead, payments_, &wallet::PaymentBook::addSaved);
     connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::historyProgress);
     connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::queueStatus); // an address may not add up
 
@@ -408,6 +421,7 @@ bool WalletController::loadExisting(QString* error)
     stopServices();
     ledger_->close();
     model_->clear();
+    payments_->clear();
     const QList<wallet::HistoryBook*> books = scheduler_->books();
     for (wallet::HistoryBook* book : books)
         book->clear();
@@ -674,6 +688,7 @@ bool WalletController::removeWallet(quint32 id, QString* error)
     for (wallet::HistoryBook* book : books)
         book->forgetWallet(id);
     ledger_->forgetWallet(id);
+    payments_->forgetWallet(id);
     model_->removeWallet(id);
     startServices();
     emit walletChanged();
@@ -781,6 +796,7 @@ bool WalletController::removeAllWallets(QString* error)
     for (wallet::HistoryBook* book : books)
         book->clear();
     addressLabels_.clear();
+    payments_->clear();
     emit labelsChanged();
     emit walletChanged();
     emit statusChanged();

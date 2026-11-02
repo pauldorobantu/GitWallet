@@ -25,6 +25,11 @@ public:
     // nothing to configure yet (language + theme stay). The account lives in
     // the sidebar's profile section (ProfileChip).
     void setUtilityButtonsVisible(bool on);
+    // What came in and has not been looked at, on the bell.
+    void setUnreadPayments(int unread);
+    int unreadPayments() const { return unreadPayments_; }
+    // There is a password to lock with.
+    void setLockAvailable(bool available);
 
 signals:
     void minimised();
@@ -33,6 +38,8 @@ signals:
     void menuToggled();
     void languageSelected(const QString& code);
     void settingsRequested();
+    void paymentsRequested();
+    void lockRequested();
     void aboutRequested();
 
 protected:
@@ -59,6 +66,11 @@ private:
     QToolButton* langBtn_ = nullptr;
     QToolButton* settingsBtn_ = nullptr;
     QToolButton* aboutBtn_ = nullptr;
+    QToolButton* bellBtn_ = nullptr;
+    QToolButton* lockBtn_ = nullptr;
+    int unreadPayments_ = 0;
+    bool lockAvailable_ = false;
+    bool utilityVisible_ = true;
     QVector<QPair<QToolButton*, QIcon>> closeButtons_; // icon alb la hover (Win11)
     bool dragging_ = false;
     QPoint dragOrigin_;

@@ -54,6 +54,8 @@ enum class Kind {
     Moon,         // temă dark (toggle în bara de titlu)
     User,         // the profile avatar when there is no initial
     LogOut,       // door + arrow out (profile menu → Log out)
+    Bell,         // what came in
+    Lock,         // the app password
 };
 
 } // namespace icon

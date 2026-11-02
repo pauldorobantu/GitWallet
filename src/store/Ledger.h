@@ -59,6 +59,9 @@ public:
     // Many, in one transaction.
     bool saveNotes(wallet::Network network, const QHash<chain::Hash256, wallet::TxNote>& notes);
     bool saveAddressLabels(const QHash<QString, QString>& labels);
+    // What came in. Nothing but the list of them hangs on it: the transactions are read again.
+    void savePayment(const wallet::Payment& payment);
+    void setPaymentsRead(qint64 upTo);
 
     void flush(); // what waits goes now
     // Writes what waits and closes: when this returns, the file is complete and let go.
@@ -73,6 +76,7 @@ public:
 signals:
     // Before any row: what can be edited on a row has to be there with it.
     void labelsRead(const QHash<QString, QString>& addressLabels);
+    void paymentsRead(const QList<wallet::Payment>& payments);
     // Everything has been read. `savedAt`: when each network last had a full answer.
     void loaded(const QList<SavedPrice>& prices, const QList<SavedTime>& times);
     void problem(const QString& message);

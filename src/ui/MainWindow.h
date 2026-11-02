@@ -8,12 +8,14 @@
 
 class QLabel;
 class QPushButton;
+class QSystemTrayIcon;
 class QTimer;
 class QVBoxLayout;
 class QStackedWidget;
 
 namespace wallet {
 enum class Problem;
+struct Payment;
 }
 
 namespace app {
@@ -51,6 +53,9 @@ public:
     // A step down from a total: where it goes, and which tab of it.
     void goTo(Place place, Place::Tab tab);
     PlaceBar* placeBar() const { return placeBar_; }
+    TitleBar* titleBar() const { return title_; }
+    void openPayments(); // the list of what came in
+    QString lastPaymentAlert() const { return lastPaymentAlert_; } // for tests
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -114,6 +119,8 @@ private:
     void renderNotices();
     void dismissNotices();
     void flushToast();
+    void onPaymentsTold(const QList<wallet::Payment>& payments);
+    void refreshBell();
     Inputs currentInputs() const;
 
     WalletController* controller_ = nullptr;
@@ -138,6 +145,8 @@ private:
     bool toastPosted_ = false;
     bool loadAttempted_ = false;
     QTimer* clickGuard_ = nullptr;
+    QSystemTrayIcon* tray_ = nullptr; // made at the first alert with the window out of sight
+    QString lastPaymentAlert_;
 };
 
 } // namespace app::ui

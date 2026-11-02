@@ -3,6 +3,7 @@
 #include <QAbstractTableModel>
 #include <QHash>
 #include <QList>
+#include <QSet>
 #include <QString>
 
 #include "wallet/Types.h"
@@ -36,6 +37,11 @@ public:
     QVariant data(const QModelIndex& index, int role) const override;
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
 
+    // The row holds only dust, and nothing says it is meant: an address given out was for someone
+    // to pay, and one with a label is someone's.
+    bool isDust(int row) const;
+    const QSet<int>& rowsOfDust() const { return dust_; } // of those, before what says it is meant
+
 private:
     WalletController* controller_ = nullptr;
 
@@ -47,6 +53,9 @@ private:
     void refreshPrices();   // repaints Balance / USD when a price changed
     void refreshLabels();   // the wallets' names, read per cell and per sort comparison
     bool waitingForPayment(const wallet::AddressRow& row) const; // given out, with no history yet
+    bool wasGivenOut(const wallet::AddressRow& row) const;
+    void noteDust(int row);
+    void readDust();
 
     // A key by what tells it apart, cheap to hash: a lookup per row when the list sorts or filters by state.
     struct KeyId {
@@ -64,6 +73,7 @@ private:
     mutable bool givenStale_ = true;
 
     QHash<quint32, QString> labels_;
+    QSet<int> dust_;
     int rows_ = 0;                // the row count the views know (moves only inside begin/endInsertRows)
     bool announcePosted_ = false; // an announceRows() waits for the next event-loop turn
     QList<double> prices_;        // the last prices seen, in wallet::assets() order

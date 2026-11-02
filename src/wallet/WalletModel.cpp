@@ -121,6 +121,7 @@ int WalletModel::upsert(const AddressRow& row)
         takeFromTotals(old);
         addToTotals(now);
     }
+    emit rowMoved(i, old);
     emit rowChanged(i);
     if (balanceChanged) emit totalsChanged();
     return i;

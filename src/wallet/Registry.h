@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chain/Address.h"
+#include "chain/Amount.h"
 #include "chain/Transaction.h"
 
 #include <QHash>
@@ -36,6 +37,7 @@ struct AssetInfo {
     bool dollar = false; // a dollar token: always shows its cents
     QString contract;    // the token's contract; empty for a network's own coin
     double maxSupply = 0.0; // whole coins an honest server can report at most; 0: not known
+    chain::Amount dust;     // in smallest units: less than this is what strangers scatter, no payment; zero: nothing is
     QString defillamaId; // "coingecko:bitcoin", "ethereum:0xdAC1…"
     QString coingeckoId; // "bitcoin"
     QString coinbaseSymbol; // "BTC"; symbols collide, so it is only ever asked about a listed asset
