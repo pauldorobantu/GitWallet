@@ -918,8 +918,10 @@ void Walkthrough::buildSteps()
              const QString shown = visibleText(importDialog());
              expect(shown.contains(QStringLiteral("3 wallets ready")) && shown.contains(QStringLiteral("Line 2:")),
                     QStringLiteral("the type chosen: 3 wallets ready, line 2 to fix"));
-             expect(shown.contains(QStringLiteral("Line 3: 1")),
+             expect(shown.contains(QStringLiteral("Line 3, Legacy (P2PKH): 1")),
                     QStringLiteral("and a legacy xpub shows its first address, a legacy one, to compare"));
+             expect(shown.contains(QStringLiteral("Whole wallet, Ethereum")) || shown.contains(QStringLiteral("Whole wallet, Legacy")),
+                    QStringLiteral("as does each xpub of a line that holds a whole wallet"));
              expect(listEnabled(), QStringLiteral("and Add wallets enabled"));
          },
          importDialog},

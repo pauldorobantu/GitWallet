@@ -8,8 +8,9 @@ that makes a fresh address per order), where ordinary wallets stop scanning
 after the first gap and miss funds further down.
 
 > **Status: stage 1 (view-only) works.** The single-seed view is verified — see
-> *Verification* below. Spending (stage 2: BTC, stage 3: ETH and tokens) is added
-> next and is tested on test networks before it touches real funds.
+> *Verification* below. Where it goes from here, with history, many more coins and
+> spending, is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on test networks
+> before it touches real funds.
 
 ![Overview](docs/screenshot-overview.png)
 
@@ -23,11 +24,12 @@ after the first gap and miss funds further down.
    or one set of public keys per line, pasted or from a text or CSV file, each with
    a name if you want (`Shop 1: word word ...`, `"Shop 2","word word ..."`, a
    numbered list). The good lines go in together; what did not go in stays in the
-   field, each line named by its number with the reason and never quoted. A seed
-   already here, a name in use and a line that can be read two ways are refused,
-   and seed words or a private key are never taken as a name. A line of public keys
-   can hold a whole wallet: its second xpub is read as the Ethereum account. GitWallet
-   derives the account public keys and scans every
+   field, each line named by its number with the reason and never quoted. A line goes
+   in only when it has one reading: a stray comma inside a phrase, a name that could
+   be part of the phrase, a seed already here and a name in use are refused, as a
+   checksum alone passes by chance too often. Seed words or a private key are never
+   taken as a name. A line of public keys can hold a whole wallet: its second xpub is
+   read as the Ethereum account. GitWallet derives the account public keys and scans every
    Bitcoin address type (native SegWit, nested SegWit, legacy — receive and
    change) and Ethereum (ETH, USDT, USDC) far past the last used address (gap
    limits are configurable, default 200 / 50 / 100). The Wallets page lists what

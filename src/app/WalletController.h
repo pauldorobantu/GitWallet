@@ -77,6 +77,8 @@ public:
 
     // The older files removeAllWallets() would delete with wallet.dat.
     int walletFilesKeptAside() const;
+    // The file this session last kept aside, as errorOccurred() named it.
+    QString fileSetAside() const { return fileSetAside_; }
     // What happens to a wallet.dat that could not be loaded, for the user to read:
     // kept aside at the next add, or moved by hand if it cannot even be opened.
     QString unreadFileNote() const;
@@ -206,6 +208,7 @@ private:
     // written over an existing wallet.dat only while it still has this digest,
     // so nothing written there since by someone else is replaced.
     QByteArray fileDigest_;
+    QString fileSetAside_;
 };
 
 } // namespace app

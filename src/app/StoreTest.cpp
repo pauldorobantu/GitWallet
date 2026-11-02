@@ -15,6 +15,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRandomGenerator>
 #include <QStringList>
 
 #include <algorithm>
@@ -283,14 +284,37 @@ StoreTestResult runStoreTest()
         check(keyLines.size() == 4 && keyLines.at(2).name == QStringLiteral("Partner B"),
               QStringLiteral("a numbered line of keys keeps its name"));
         check(keyLines.size() == 4 && !keyLines.at(3).problem.isEmpty(), QStringLiteral("a line without a key says so"));
+        const auto oneKeyLine = [](const QString& text) {
+            const QList<wallet::KeyLine> parsed = wallet::parseKeyLines(text);
+            return parsed.size() == 1 ? parsed.first() : wallet::KeyLine();
+        };
+        const QString zpub = first.at(0).xpub;
+        check(oneKeyLine(zpub + QStringLiteral(",Shop 1")).name == QStringLiteral("Shop 1"),
+              QStringLiteral("a name can follow the key"));
+        check(oneKeyLine(QStringLiteral("\"%1\",\"Shop 1\"").arg(zpub)).name == QStringLiteral("Shop 1"),
+              QStringLiteral("also in CSV quotes"));
+        check(oneKeyLine(QStringLiteral("\"Shop 1\",\"%1\"").arg(zpub)).name == QStringLiteral("Shop 1"),
+              QStringLiteral("before it as well"));
+        check(oneKeyLine(QStringLiteral("Magazin \"Central\": %1").arg(zpub)).name == QStringLiteral("Magazin \"Central\""),
+              QStringLiteral("quotes in a name beside a key stay"));
+        check(oneKeyLine(QStringLiteral("\"Magazin \"\"Central\"\"\",%1").arg(zpub)).name == QStringLiteral("Magazin \"Central\""),
+              QStringLiteral("and CSV quotes read as CSV"));
+        check(oneKeyLine(QStringLiteral("#1 Shop: %1").arg(zpub)).problem.contains(QStringLiteral("starts with #")),
+              QStringLiteral("a key behind a # is not left out unseen"));
+        check(oneKeyLine(QString(QChar(0x200B)) + zpub).keys == QStringList{zpub},
+              QStringLiteral("a key behind an invisible character is still that key"));
+        check(oneKeyLine(QStringLiteral("[d34db33f/84h/0h/0h]") + zpub).keys == QStringList{zpub}
+                  && oneKeyLine(QStringLiteral("[d34db33f/84h/0h/0h]") + zpub).name.isEmpty(),
+              QStringLiteral("and so is one with its origin in front"));
+        check(oneKeyLine(QStringLiteral("key=") + zpub).keys == QStringList{zpub}, QStringLiteral("or a label"));
 
-        const int nameLimit = wallet::WalletStore::kMaxLabelChars;
-        check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).left(nameLimit), nameLimit),
-              QStringLiteral("a phrase cut at the longest name is still seen as one"));
+        check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic)), QStringLiteral("a whole phrase reads as one"));
+        check(wallet::looksLikeSeedWords(QStringLiteral("legal winner thank yeer wave sausage worth useful legal winner thank yellow")),
+              QStringLiteral("also with a word mistyped"));
         check(!wallet::looksLikeSeedWords(QStringLiteral("Online shop main account family business")),
-              QStringLiteral("a real name made of list words is not"));
-        check(wallet::looksLikeSeedWords(QStringLiteral("1. abandon 2. abandon 3. abandon 4. abandon 5. abandon 6. abando"), nameLimit),
-              QStringLiteral("a numbered phrase cut there is"));
+              QStringLiteral("a real name made of list words does not"));
+        check(!wallet::looksLikeSeedWords(QStringLiteral("Shop 14 Main Street North Side Cash Account Bucharest Sector 3 Romania")),
+              QStringLiteral("nor a long address"));
         check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).replace(QLatin1Char(' '), QChar(0x3000))),
               QStringLiteral("and so is one with other kinds of space"));
         check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).replace(QLatin1Char(' '), QStringLiteral(", "))),
@@ -324,13 +348,13 @@ StoreTestResult runStoreTest()
                   QStringLiteral("15 valid words whose last 12 are valid too can be read two ways: refused"));
             check(both.words.empty() && both.name.isEmpty(), QStringLiteral("and neither its words nor a name are kept"));
             const wallet::SeedLine stray = oneLine(QStringLiteral("legal winner thank, %1 adult").arg(eleven));
-            check(stray.problem.isEmpty() && stray.words.size() == 15 && stray.name.isEmpty(),
-                  QStringLiteral("a phrase with a stray comma and no other reading is that phrase"));
+            check(stray.problem.contains(QStringLiteral("inside the phrase")) && stray.words.empty(),
+                  QStringLiteral("a phrase with a stray comma says so, as it could be a name and a word lost"));
             const wallet::SeedLine thirteen = oneLine(QStringLiteral("zoo,%1,about").arg(QString(eleven).replace(QLatin1Char(' '), QLatin1Char(','))));
             check(thirteen.problem.contains(QStringLiteral("it has 13")),
                   QStringLiteral("13 words parted by commas are 13 words, not a name and a phrase"));
             const wallet::SeedLine colon = oneLine(QStringLiteral("Office: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon achieve"));
-            check(colon.problem.contains(QStringLiteral("after the name")) && colon.problem.contains(QStringLiteral("it has 11")),
+            check(colon.problem.contains(QStringLiteral("beside the name")) && colon.problem.contains(QStringLiteral("it has 11")),
                   QStringLiteral("a name and 11 words is not a phrase that starts with the name"));
             const wallet::SeedLine listWords = oneLine(QStringLiteral("Main office, north: %1 express").arg(eleven));
             check(!listWords.problem.isEmpty() && listWords.words.empty(),
@@ -370,6 +394,154 @@ StoreTestResult runStoreTest()
             check(privateName.problem.contains(QStringLiteral("private key")) && privateName.name.isEmpty()
                       && privateName.words.empty(),
                   QStringLiteral("a private key is no name"));
+
+            // The slips a list really holds. Each passes some checksum by chance, so
+            // each would make a wallet from the wrong words if it were read at all.
+            const QString p = QString::fromLatin1(kSecondMnemonic);
+            const auto refused = [&oneLine](const QString& text) {
+                const wallet::SeedLine line = oneLine(text);
+                return !line.problem.isEmpty() && line.words.empty() && line.name.isEmpty();
+            };
+            check(refused(p + QStringLiteral(", beach shop south")), QStringLiteral("a phrase and a name of list words: refused"));
+            check(refused(QStringLiteral("legal,winner thank year wave sausage worth useful legal winner thank yellow, Main")),
+                  QStringLiteral("a comma inside a phrase with a name after it: refused"));
+            check(refused(QStringLiteral("rely phrase kind depart twenty sausage celery upset filter assist broccoli dizzy, describe little currentx sudden cluster index")),
+                  QStringLiteral("a longer phrase with a comma and a word mistyped: refused"));
+            check(refused(QStringLiteral("action hat glimpse wear sing board odor drink spice perfect peace physical, damage economy panic hover avocado")),
+                  QStringLiteral("a longer phrase with a comma and a word lost: refused"));
+            check(refused(QStringLiteral("Office,abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon achieve")),
+                  QStringLiteral("a name, a comma and a word lost: refused"));
+            check(refused(QStringLiteral("Shop, ") + p), QStringLiteral("a comma after one list word could be a slip: refused"));
+            const wallet::SeedLine firmName = oneLine(QStringLiteral("Shop: ") + p);
+            check(firmName.problem.isEmpty() && firmName.name == QStringLiteral("Shop"), QStringLiteral("a colon after it is meant"));
+            for (const QString& blank : {QStringLiteral(",%1"), QStringLiteral(";%1"), QStringLiteral("\"\",%1"),
+                                         QStringLiteral("\" \",%1"), QStringLiteral(",,%1"), QStringLiteral(": %1"),
+                                         QStringLiteral("%1,"), QStringLiteral("\"%1\"")}) {
+                const wallet::SeedLine line = oneLine(blank.arg(p));
+                check(line.problem.isEmpty() && line.name.isEmpty() && line.words.size() == 12,
+                      QStringLiteral("a blank column says nothing: ") + blank);
+            }
+            const auto nameOf = [&oneLine](const QString& text) {
+                const wallet::SeedLine line = oneLine(text);
+                return line.problem.isEmpty() && line.words.size() == 12 ? line.name : QStringLiteral("<no>");
+            };
+            check(nameOf(p + QStringLiteral(",Shop 1,")) == QStringLiteral("Shop 1"), QStringLiteral("nor at the end, after a name"));
+            check(nameOf(QStringLiteral("\"%1\",\"Shop 1\",").arg(p)) == QStringLiteral("Shop 1"), QStringLiteral("also in quotes"));
+            check(nameOf(QStringLiteral("\"%1, Shop 1\"").arg(p)) == QStringLiteral("Shop 1"), QStringLiteral("quotes around a whole line say nothing"));
+            check(nameOf(QStringLiteral("Cluj: Shop 1,") + p) == QStringLiteral("Cluj: Shop 1"), QStringLiteral("every mark is tried"));
+            check(nameOf(p + QStringLiteral(",\"Cluj: Shop 1\"")) == QStringLiteral("Cluj: Shop 1"), QStringLiteral("a mark in quotes is no mark"));
+            check(nameOf(QStringLiteral("Magazin 1, Cluj;") + p) == QStringLiteral("Magazin 1, Cluj"), QStringLiteral("a comma in an Excel name"));
+            check(nameOf(QString(p).replace(QLatin1Char(' '), QLatin1Char(',')) + QStringLiteral(",Shop 1")) == QStringLiteral("Shop 1"),
+                  QStringLiteral("twelve word columns, then a name"));
+            check(nameOf(QStringLiteral("\"Alfa\" si \"Beta\", ") + p) == QStringLiteral("\"Alfa\" si \"Beta\""),
+                  QStringLiteral("quotes that are not around a whole field stay"));
+            const wallet::SeedLine typo = oneLine(QStringLiteral("legal winner thank yeer wave sausage worth useful legal winner thank yellow, Shop 1"));
+            check(typo.problem.contains(QStringLiteral("word 4")), QStringLiteral("a mistake in a phrase before its name is named as one"));
+            const std::vector<wallet::SeedLine> wrapped = wallet::parseSeedLines(
+                "online farm apology glad music bamboo shock finger affair barrel exotic pilot\n"
+                "mixture fresh crush valley weird tattoo muffin strike gather nature maximum motor");
+            check(wrapped.size() == 2 && wrapped[0].problem.contains(QStringLiteral("one phrase")) && wrapped[0].words.empty()
+                      && wrapped[1].problem.contains(QStringLiteral("one phrase")),
+                  QStringLiteral("half of a long phrase wrapped over two lines is not a seed of its own"));
+        }
+
+        // Random slips over random phrases, from a fixed seed: a line may always be refused,
+        // but whatever goes in is the phrase itself. A checksum passes by chance often
+        // enough that hand-picked lines do not show this.
+        {
+            QFile wordFile(QStringLiteral(":/bip39/english.txt"));
+            QStringList wordList;
+            if (wordFile.open(QIODevice::ReadOnly | QIODevice::Text))
+                wordList = QString::fromLatin1(wordFile.readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            for (QString& word : wordList)
+                word = word.trimmed();
+            check(wordList.size() == 2048, QStringLiteral("the word list is there to test with"));
+            QRandomGenerator random(20261101);
+            const auto randomPhrase = [&wordList, &random](int count) {
+                const int entropyBits = count * 32 / 3;
+                QByteArray entropy(entropyBits / 8, '\0');
+                for (char& byte : entropy)
+                    byte = char(random.bounded(256));
+                const QByteArray hash = QCryptographicHash::hash(entropy, QCryptographicHash::Sha256);
+                const auto bitAt = [&](int bit) {
+                    const QByteArray& from = bit < entropyBits ? entropy : hash;
+                    const int at = bit < entropyBits ? bit : bit - entropyBits;
+                    return (static_cast<unsigned char>(from.at(at / 8)) >> (7 - at % 8)) & 1;
+                };
+                QStringList phrase;
+                for (int w = 0; w < count; ++w) {
+                    int index = 0;
+                    for (int b = 0; b < 11; ++b)
+                        index = index * 2 + bitAt(w * 11 + b);
+                    phrase << wordList.at(index);
+                }
+                return phrase;
+            };
+            const QStringList names{QStringLiteral("Shop 1"), QStringLiteral("Magazin Cluj"), QStringLiteral("Main"),
+                                    QStringLiteral("beach shop south"), QStringLiteral("Main office north"),
+                                    QStringLiteral("main account online business family shop")};
+            const char marks[] = {',', ';', ':'};
+            int wrong = 0;
+            int goodRead = 0;
+            int goodRefused = 0;
+            for (int round = 0; round < 3000 && !wordList.isEmpty(); ++round) {
+                const QStringList phrase = randomPhrase(12 + 3 * random.bounded(5));
+                const QString joined = phrase.join(QLatin1Char(' '));
+                const QString name = names.at(random.bounded(names.size()));
+                // Reads as `phrase` with `expectedName`, or is refused.
+                const auto safe = [&](const QString& text, const QString& expectedName) {
+                    const std::vector<wallet::SeedLine> parsed = wallet::parseSeedLines(text.toStdString());
+                    if (parsed.size() != 1) {
+                        ++wrong;
+                        return false;
+                    }
+                    const wallet::SeedLine& got = parsed.front();
+                    if (!got.problem.isEmpty())
+                        return false;
+                    bool same = got.name == expectedName && qsizetype(got.words.size()) == phrase.size();
+                    for (qsizetype w = 0; same && w < phrase.size(); ++w)
+                        same = QString::fromStdString(got.words[size_t(w)]) == phrase.at(w);
+                    if (!same)
+                        ++wrong;
+                    return same;
+                };
+                // A name that says it is one always reads, on both sides of the phrase.
+                (safe(QStringLiteral("Shop 1: ") + joined, QStringLiteral("Shop 1")) ? goodRead : goodRefused)++;
+                (safe(joined + QStringLiteral(", Magazin Cluj"), QStringLiteral("Magazin Cluj")) ? goodRead : goodRefused)++;
+                safe(joined + QStringLiteral(", ") + name, name);
+                safe(joined + QStringLiteral(": ") + name, name);
+                safe(name + QStringLiteral(", ") + joined, name);
+                safe(name + QStringLiteral(": ") + joined, name);
+                safe(QLatin1Char('"') + name + QStringLiteral("\",\"") + joined + QLatin1Char('"'), name);
+
+                // A stray mark inside the phrase, alone and beside a name.
+                const qsizetype at = random.bounded(phrase.size() - 1);
+                QStringList slipped = phrase;
+                slipped[at] += QLatin1Char(marks[random.bounded(3)]);
+                const QString stray = slipped.join(QLatin1Char(' '));
+                safe(stray, QString());
+                safe(stray + QStringLiteral(", ") + name, name);
+                safe(name + QStringLiteral(": ") + stray, name);
+
+                // A comma and a word mistyped or lost: no phrase as written, so nothing goes in.
+                const auto refusedOutright = [&wrong](const QString& text) {
+                    const std::vector<wallet::SeedLine> parsed = wallet::parseSeedLines(text.toStdString());
+                    if (parsed.size() != 1 || parsed.front().problem.isEmpty())
+                        ++wrong;
+                };
+                QStringList typo = phrase;
+                typo[random.bounded(typo.size())] += QLatin1Char('x');
+                typo[at] += QLatin1Char(',');
+                refusedOutright(typo.join(QLatin1Char(' ')));
+                QStringList lost = phrase;
+                lost.removeAt(random.bounded(lost.size()));
+                lost[qMin(at, lost.size() - 2)] += QLatin1Char(',');
+                refusedOutright(lost.join(QLatin1Char(' ')));
+            }
+            check(wrong == 0, QStringLiteral("in 3,000 rounds of slips, no wallet from other words or under another name: %1 wrong").arg(wrong));
+            check(goodRefused < 300, QStringLiteral("and a plain name beside a phrase reads, nearly always (%1 of %2 refused)")
+                                         .arg(goodRefused)
+                                         .arg(goodRead + goodRefused));
         }
 
         // What must never become a name.
@@ -382,6 +554,19 @@ StoreTestResult runStoreTest()
         check(!wallet::looksLikePrivateKey(QStringLiteral("Shop 1 bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")),
               QStringLiteral("an address does not"));
         check(!wallet::looksLikePrivateKey(first.at(0).xpub), QStringLiteral("nor a public key"));
+        check(!wallet::looksLikePrivateKey(QStringLiteral("0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2")),
+              QStringLiteral("nor one in hex"));
+        const QString wif = QStringLiteral("KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn");
+        check(wallet::looksLikePrivateKey(wif.left(8) + QChar(0x200B) + wif.mid(8)),
+              QStringLiteral("a key with an invisible character in it reads as one"));
+        QString wideWif;
+        for (const QChar c : wif)
+            wideWif.append(QChar(c.unicode() + 0xFEE0));
+        check(wallet::looksLikePrivateKey(wideWif), QStringLiteral("so does one in full-width letters"));
+        check(wallet::looksLikePrivateKey(QStringLiteral("e8f32e72 3decf405 1aefac8e 2c93c9c5 b2143138 17cdb01a 1494b917 c8436b35")),
+              QStringLiteral("and a raw one in groups"));
+        check(wallet::looksLikePrivateKey(QStringLiteral("Shop 1 e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8")),
+              QStringLiteral("or cut"));
         QString hidden = QString::fromLatin1(kSecondMnemonic);
         hidden.replace(QLatin1Char(' '), QString(QChar(0x200B)) + QLatin1Char(' '));
         check(wallet::looksLikeSeedWords(hidden), QStringLiteral("a phrase with invisible characters reads as one"));
@@ -392,14 +577,29 @@ StoreTestResult runStoreTest()
         check(wallet::looksLikeSeedWords(numberedWords), QStringLiteral("and so does one with a number on each word"));
         check(wallet::looksLikeSeedWords(QString::fromLatin1(kSecondMnemonic).replace(QLatin1Char(' '), QLatin1Char('-'))),
               QStringLiteral("or joined by dashes"));
-        check(!wallet::keyListHoldsSecret(QStringLiteral("Online shop main account family: %1").arg(first.at(0).xpub)),
+        check(wallet::linesHoldingSecrets(QStringLiteral("Online shop main account family: %1").arg(first.at(0).xpub)).isEmpty(),
               QStringLiteral("a name of list words beside a key is no secret"));
-        check(!wallet::keyListHoldsSecret(QStringLiteral("# Public key list for the main office, one key per line, shop accounts\n%1").arg(first.at(0).xpub)),
+        check(wallet::linesHoldingSecrets(QStringLiteral("# Public key list for the main office, one key per line, shop accounts\n%1").arg(first.at(0).xpub)).isEmpty(),
               QStringLiteral("nor is a long comment"));
-        check(wallet::keyListHoldsSecret(QStringLiteral("%1\n%2").arg(first.at(0).xpub, QString::fromLatin1(kSecondMnemonic))),
-              QStringLiteral("a phrase on one line of a key list is"));
-        check(wallet::keyListHoldsSecret(QStringLiteral("xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi %1").arg(first.at(0).xpub)),
+        check(wallet::linesHoldingSecrets(QStringLiteral("%1\n%2").arg(first.at(0).xpub, QString::fromLatin1(kSecondMnemonic))) == QList<int>{1},
+              QStringLiteral("a phrase on one line of a key list is, and only that line"));
+        check(wallet::linesHoldingSecrets(QStringLiteral("xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi %1").arg(first.at(0).xpub)) == QList<int>{0},
               QStringLiteral("and a private key beside a public one"));
+
+        // List files, as Windows programs save them.
+        const auto decoded = [](const QByteArray& bytes) {
+            QString text;
+            return wallet::decodeListFile(bytes, &text) ? text : QStringLiteral("<refused>");
+        };
+        check(decoded(QByteArray("Iași")) == QStringLiteral("Iași"), QStringLiteral("a list file in UTF-8 reads as it is"));
+        check(decoded(QByteArray("\xEF\xBB\xBF") + QByteArray("abc")) == QStringLiteral("abc"), QStringLiteral("with its mark too"));
+        check(decoded(QByteArray("\xFF\xFE" "a\0b\0", 6)) == QStringLiteral("ab"), QStringLiteral("UTF-16 by its mark"));
+        check(decoded(QByteArray("\xFE\xFF\0a\0b", 6)) == QStringLiteral("ab"), QStringLiteral("in either byte order"));
+        check(decoded(QByteArray("a\0b\0c\0", 6)) == QStringLiteral("abc"), QStringLiteral("and with no mark"));
+        check(decoded(QByteArray("Cas\xE3")).size() == 4, QStringLiteral("a code-page file, its one letter the last byte, loses nothing"));
+        check(decoded(QByteArray("Ia\xC8\x99i Cas\xE3")) == QStringLiteral("<refused>"),
+              QStringLiteral("two encodings at once are refused"));
+        check(decoded(QByteArray("abc\0def", 7)) == QStringLiteral("<refused>"), QStringLiteral("and so is what is not text"));
 
         // The address model, per wallet.
         wallet::WalletModel model;
@@ -571,6 +771,21 @@ StoreTestResult runStoreTest()
             const WalletController::GapImpact run = controller.gapImpact(gapped);
             check(run.atMost && run.used == 2450 && run.funded == 1,
                   QStringLiteral("smaller ones say how many the row limit can cut"));
+            controller.model()->clear();
+
+            // Already past the limit, a smaller gap still loses what the fresh scan cannot
+            // reach: the rows go, whatever the settings in use wanted past it before.
+            wallet::ScanSettings wideGaps = controller.store().settings;
+            wideGaps.btcReceiveGap = 5000;
+            done(controller.applySettings(wideGaps, &error), QStringLiteral("larger gaps save"));
+            for (quint32 index = 0; index < 29850; ++index) {
+                wallet::AddressRow row = rowOf(runId, index, 0);
+                row.used = true;
+                controller.model()->upsert(row);
+            }
+            wideGaps.btcReceiveGap = 421;
+            const WalletController::GapImpact pastLimit = controller.gapImpact(wideGaps);
+            check(pastLimit.atMost && pastLimit.used == 3003, QStringLiteral("past the limit, a smaller gap still says what it loses"));
             controller.model()->clear();
             done(controller.removeAllWallets(&error), QStringLiteral("and it can be removed"));
 

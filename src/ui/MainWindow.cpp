@@ -22,6 +22,7 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QEvent>
+#include <QFile>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHash>
@@ -489,6 +490,8 @@ void MainWindow::onWalletError(wallet::Problem kind, const QString& message, con
     // Reported again while still listed (an identical restart, or a new
     // outage): the latest wording, inputs and time, one more in the count.
     Notice reported = classify(kind, message, serverDetail);
+    if (kind == wallet::Problem::FileSetAside)
+        reported.detail = controller_->fileSetAside(); // what pruneNotices() looks for
     reported.inputs = currentInputs();
     const qint64 wall = QDateTime::currentMSecsSinceEpoch();
     qsizetype i = 0;
@@ -547,9 +550,9 @@ bool MainWindow::pruneNotices()
     const Inputs now = currentInputs();
     const qsizetype dropped = notices_.removeIf([this, &now](const Notice& n) {
         const Inputs& was = n.inputs;
-        // The only line that names the file kept aside: it stays as long as the file does.
+        // The only line that names the file kept aside: it stays as long as that file does.
         if (n.key == QLatin1String("file-set-aside"))
-            return controller_->walletFilesKeptAside() == 0;
+            return !QFile::exists(n.detail);
         if (was.wallet != now.wallet)
             return true; // another wallet, or none
         const bool btcGaps = was.receiveGap != now.receiveGap || was.changeGap != now.changeGap;

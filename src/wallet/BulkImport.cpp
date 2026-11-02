@@ -2,13 +2,14 @@
 
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
-#include "wallet/WalletStore.h"
 
-#include <QByteArray>
 #include <QRegularExpression>
+#include <QStringDecoder>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <optional>
 #include <utility>
 
 namespace wallet {
@@ -19,23 +20,31 @@ namespace {
 // front: a word's buffer sits inside the vector's, so a vector that grew would leave
 // copies of the words behind in the memory it freed.
 constexpr size_t kMaxKeptWords = 25;
+// A line with more marks than this holds no name: tried at each one, it would take long.
+constexpr size_t kMaxMarksTried = 64;
 
 constexpr const char* kNameIsSecret = "its name looks like seed words or a private key";
+constexpr const char* kCommentSkipped = "it starts with #, so it was skipped: remove the # to add it";
 
-// A ':' or a tab is meant as the end of a name; a ',' or ';' may only part words.
-bool isFirmEnd(char c)
+// A ':' or a tab is meant as the end of a field; a ',' or ';' may be a slip inside a phrase.
+bool isFirmMark(char c)
 {
     return c == ':' || c == '\t';
 }
 
-bool isNameEnd(char c)
+bool isMark(char c)
 {
-    return isFirmEnd(c) || c == ';' || c == ',';
+    return isFirmMark(c) || c == ';' || c == ',';
+}
+
+bool isSpace(char c)
+{
+    return c == ' ' || c == '\r';
 }
 
 bool isGap(char c)
 {
-    return c == ' ' || c == '"' || c == '\r' || isNameEnd(c);
+    return isSpace(c) || c == '"' || isMark(c);
 }
 
 bool isValidWordCount(size_t count)
@@ -87,7 +96,7 @@ void readWord(std::string& word)
     nfkd.fill(QChar(u'\0'));
 }
 
-// The words of [from, to).
+// Adds the words of [from, to).
 void readWords(const std::string& text, size_t from, size_t to, Words* out)
 {
     out->list.reserve(kMaxKeptWords);
@@ -109,18 +118,19 @@ void readWords(const std::string& text, size_t from, size_t to, Words* out)
     }
 }
 
-// Why these words are no phrase, by count or position, never by text. Empty if they are one.
-QString problemWith(const Words& words, bool afterName)
+// Why these words are no phrase, by count or position, never by text. Empty if they are
+// one. `beside`: they stand beside what reads as a name.
+QString problemWith(const Words& words, bool beside)
 {
     if (!isValidWordCount(words.count)) {
-        return (afterName ? QStringLiteral("it needs 12, 15, 18, 21 or 24 words after the name (it has %1)")
-                          : QStringLiteral("it needs 12, 15, 18, 21 or 24 words (it has %1)"))
+        return (beside ? QStringLiteral("it needs 12, 15, 18, 21 or 24 words beside the name (it has %1)")
+                       : QStringLiteral("it needs 12, 15, 18, 21 or 24 words (it has %1)"))
             .arg(words.count);
     }
     for (size_t i = 0; i < words.list.size(); ++i) {
         if (!chain::bip39::isWord(words.list[i])) {
-            return (afterName ? QStringLiteral("word %1 after the name is not in the BIP39 list")
-                              : QStringLiteral("word %1 is not in the BIP39 list"))
+            return (beside ? QStringLiteral("word %1 of the phrase is not in the BIP39 list")
+                           : QStringLiteral("word %1 is not in the BIP39 list"))
                 .arg(i + 1);
         }
     }
@@ -131,11 +141,25 @@ QString problemWith(const Words& words, bool afterName)
     return valid ? QString() : QStringLiteral("the checksum does not match: a word is wrong or out of order");
 }
 
+size_t listWordsIn(const Words& words)
+{
+    return size_t(std::count_if(words.list.cbegin(), words.list.cend(),
+                                [](const std::string& word) { return chain::bip39::isWord(word); }));
+}
+
 bool allInList(const Words& words)
 {
-    return words.count > 0 && words.count == words.list.size()
-           && std::all_of(words.list.cbegin(), words.list.cend(),
-                          [](const std::string& word) { return chain::bip39::isWord(word); });
+    return words.count > 0 && words.count == words.list.size() && listWordsIn(words) == words.count;
+}
+
+// One letters-only word off the list and the rest on it: a phrase with a word mistyped.
+bool oneSlipFromList(const Words& words)
+{
+    if (words.count != words.list.size() || listWordsIn(words) + 1 != words.count)
+        return false;
+    return std::all_of(words.list.cbegin(), words.list.cend(), [](const std::string& word) {
+        return std::all_of(word.cbegin(), word.cend(), [](char c) { return c >= 'a' && c <= 'z'; });
+    });
 }
 
 // "12. " and "12)\t" at the start of a line: a numbered list, not a name.
@@ -152,149 +176,232 @@ size_t afterListNumber(const std::string& text, size_t begin, size_t end)
     return p;
 }
 
-// Where a line parts in two: the field before the mark and what follows it.
-struct Parts {
-    bool found = false;
-    bool firm = false; // quotes, a ':' or a tab: meant as a field of its own
-    size_t firstEnd = 0;
-    size_t secondBegin = 0;
-};
-
-Parts partsOf(const std::string& text, size_t begin, size_t end)
+// [from, to) is one field in quotes, with "" for a quote inside.
+bool isOneQuotedField(const std::string& text, size_t from, size_t to)
 {
-    Parts parts;
-    const auto partAt = [&parts](size_t mark, bool firm) {
-        parts.found = true;
-        parts.firm = firm;
-        parts.firstEnd = mark;
-        parts.secondBegin = mark + 1;
-    };
-    if (text[begin] == '"') {
-        // A first field in quotes holds whatever is inside them; "" is a quote.
-        size_t close = begin + 1;
-        while (close < end) {
-            if (text[close] == '"') {
-                if (close + 1 >= end || text[close + 1] != '"')
-                    break;
+    if (to < from + 2 || text[from] != '"' || text[to - 1] != '"')
+        return false;
+    for (size_t i = from + 1; i + 1 < to; ++i) {
+        if (text[i] != '"')
+            continue;
+        if (i + 2 >= to || text[i + 1] != '"')
+            return false;
+        ++i;
+    }
+    return true;
+}
+
+// Spaces, blank columns at either end and quotes around the whole line say nothing.
+void trimFields(const std::string& text, size_t* begin, size_t* end)
+{
+    for (;;) {
+        size_t b = *begin;
+        size_t e = *end;
+        while (b < e && (isSpace(text[b]) || isMark(text[b])))
+            ++b;
+        while (e > b && (isSpace(text[e - 1]) || isMark(text[e - 1])))
+            --e;
+        if (e - b >= 2 && text[b] == '"') { // a blank quoted column first
+            size_t close = b + 1;
+            while (close < e && text[close] == ' ')
                 ++close;
-            }
-            ++close;
+            if (close < e && text[close] == '"' && (close + 1 == e || isSpace(text[close + 1]) || isMark(text[close + 1])))
+                b = close + 1;
         }
-        size_t after = close + 1;
-        while (after < end && text[after] == ' ')
-            ++after;
-        if (close < end && after < end && isNameEnd(text[after])) {
-            partAt(after, true);
-            return parts;
+        if (e - b >= 2 && text[e - 1] == '"') { // a blank quoted column last
+            size_t open = e - 1;
+            while (open > b && text[open - 1] == ' ')
+                --open;
+            if (open > b && text[open - 1] == '"'
+                && (open - 1 == b || isSpace(text[open - 2]) || isMark(text[open - 2])))
+                e = open - 1;
         }
+        if (e > b && isOneQuotedField(text, b, e)) {
+            ++b;
+            --e;
+        }
+        if (b == *begin && e == *end)
+            return;
+        *begin = b;
+        *end = e;
     }
-    const auto first = [&](auto pred) {
-        const auto it = std::find_if(text.cbegin() + std::ptrdiff_t(begin), text.cbegin() + std::ptrdiff_t(end), pred);
-        return size_t(it - text.cbegin());
-    };
-    size_t mark = first([](char c) { return c == ':'; });
-    if (mark < end) {
-        partAt(mark, true);
-        return parts;
+}
+
+// The marks of a line, outside quotes. A quote with no partner is only a character.
+std::vector<size_t> marksOf(const std::string& text, size_t begin, size_t end)
+{
+    const auto first = text.cbegin() + std::ptrdiff_t(begin);
+    const auto last = text.cbegin() + std::ptrdiff_t(end);
+    const bool quotesPair = std::count(first, last, '"') % 2 == 0;
+    std::vector<size_t> marks;
+    bool inQuotes = false;
+    for (size_t i = begin; i < end; ++i) {
+        if (text[i] == '"' && quotesPair)
+            inQuotes = !inQuotes;
+        else if (!inQuotes && isMark(text[i]))
+            marks.push_back(i);
     }
-    mark = first([](char c) { return c == '\t'; });
-    if (mark < end) {
-        partAt(mark, true);
-        return parts;
-    }
-    mark = first([](char c) { return isNameEnd(c); });
-    if (mark < end)
-        partAt(mark, false);
-    return parts;
+    return marks;
 }
 
 // A mark between every two words is how some lists write one phrase, not a name.
-bool marksPartEveryWord(const std::string& text, size_t begin, size_t end, const Words& whole)
+bool marksPartEveryWord(const std::vector<size_t>& marks, const Words& whole)
 {
-    if (whole.count < 2 || whole.list.empty() || !chain::bip39::isWord(whole.list.front()))
-        return false;
-    const auto marks = std::count_if(text.cbegin() + std::ptrdiff_t(begin), text.cbegin() + std::ptrdiff_t(end), isNameEnd);
-    return size_t(marks) + 1 >= whole.count;
+    return whole.count >= 2 && !whole.list.empty() && chain::bip39::isWord(whole.list.front())
+           && marks.size() + 1 >= whole.count;
 }
 
-// As typed, without one pair of outer quotes and with the CSV form of a quote undone.
-// Worked on in place: if this turns out to be seed words, only one buffer holds them.
-QString nameIn(const std::string& text, size_t from, size_t to)
+// A name as typed: without what parts it from the rest, including the closing quote of a
+// key's own field, and with one field in quotes read as CSV. Worked on in place: if this
+// turns out to be seed words, only one buffer holds them.
+QString fieldName(QString field)
 {
-    QString name = QString::fromUtf8(text.data() + from, qsizetype(to - from));
-    name = std::move(name).trimmed();
-    if (name.size() >= 2 && name.startsWith(QLatin1Char('"')) && name.endsWith(QLatin1Char('"'))) {
-        name.chop(1);
-        name.remove(0, 1);
-        name.replace(QStringLiteral("\"\""), QStringLiteral("\""));
-        name = std::move(name).trimmed();
+    static const QRegularExpression leading(QStringLiteral("^[\\s,;:]*(\"\\s*[,;:]+)?[\\s,;:]*"),
+                                            QRegularExpression::UseUnicodePropertiesOption);
+    static const QRegularExpression trailing(QStringLiteral("[\\s,;:]*([,;:]+\\s*\")?[\\s,;:]*$"),
+                                             QRegularExpression::UseUnicodePropertiesOption);
+    field.remove(leading);
+    field.remove(trailing);
+    if (field == QLatin1String("\""))
+        return QString(); // only the opening quote of a key's own field
+    bool quoted = field.size() >= 2 && field.startsWith(QLatin1Char('"')) && field.endsWith(QLatin1Char('"'));
+    for (qsizetype i = 1; quoted && i + 1 < field.size(); ++i) {
+        if (field.at(i) != QLatin1Char('"'))
+            continue;
+        if (i + 2 >= field.size() || field.at(i + 1) != QLatin1Char('"'))
+            quoted = false;
+        ++i;
     }
-    return name.normalized(QString::NormalizationForm_C);
-}
-
-void takeName(SeedLine* line, QString name)
-{
-    if (looksLikeSecret(name, WalletStore::kMaxLabelChars)) {
-        name.fill(QChar(u'\0'));
-        line->problem = QString::fromLatin1(kNameIsSecret);
-        return;
+    if (quoted) {
+        field.chop(1);
+        field.remove(0, 1);
+        field.replace(QStringLiteral("\"\""), QStringLiteral("\""));
     }
-    line->name = std::move(name);
+    field = std::move(field).trimmed();
+    return field.normalized(QString::NormalizationForm_C);
 }
 
-// Reads [begin, end) as a phrase, with a name if there is one: every way the line can
-// be read is judged in full. Any problem leaves the words for the caller to wipe.
-void readLine(const std::string& text, size_t begin, size_t end, SeedLine* line)
+// One way a line can be meant.
+struct Reading {
+    size_t phraseFrom = 0;
+    size_t phraseTo = 0;
+    size_t nameFrom = 0;
+    size_t nameTo = 0;
+    bool firm = false; // the name is meant as a field: a firm mark or quotes
+};
+
+void addReading(const std::string& text, Reading reading, std::vector<Reading>* readings)
+{
+    const auto bounds = [&text](size_t* from, size_t* to) {
+        while (*from < *to && isGap(text[*from]))
+            ++*from;
+        while (*to > *from && isGap(text[*to - 1]))
+            --*to;
+    };
+    bounds(&reading.phraseFrom, &reading.phraseTo);
+    const bool sameWords = std::any_of(readings->cbegin(), readings->cend(), [&reading](const Reading& other) {
+        return other.phraseFrom == reading.phraseFrom && other.phraseTo == reading.phraseTo;
+    });
+    if (!sameWords)
+        readings->push_back(reading);
+}
+
+// Reads [begin, end) as a phrase, with a name if there is one. Any problem leaves what
+// was read for the caller to wipe. `plain`: the line has no mark at all.
+void readLine(const std::string& text, size_t begin, size_t end, SeedLine* line, bool* plain)
 {
     Words whole;
     readWords(text, begin, end, &whole);
     const QString wholeProblem = problemWith(whole, false);
-    const Parts parts = partsOf(text, begin, end);
-    if (!parts.found || marksPartEveryWord(text, begin, end, whole)) {
+    const std::vector<size_t> marks = marksOf(text, begin, end);
+    *plain = marks.empty();
+    if (marks.empty() || marks.size() > kMaxMarksTried || marksPartEveryWord(marks, whole)) {
         line->problem = wholeProblem;
         if (wholeProblem.isEmpty())
             line->words.swap(whole.list);
         return;
     }
 
-    Words first;
-    Words second;
-    readWords(text, begin, parts.firstEnd, &first);
-    readWords(text, parts.secondBegin, end, &second);
-    const QString firstProblem = problemWith(first, false);
-    const QString secondProblem = problemWith(second, true);
-    static const QString twoWays = QStringLiteral(
-        "it can be read as one phrase, or as a name and a shorter phrase: join the words or change the name");
-    static const QString wordsAsName = QStringLiteral(
-        "what stands beside the phrase could be part of it, as all of it is in the BIP39 list: change the name");
-
-    if (wholeProblem.isEmpty() && secondProblem.isEmpty()) {
-        line->problem = twoWays;
-    } else if (wholeProblem.isEmpty()) {
-        // The whole line is a phrase. A ':' in the middle of one is not a slip, it is
-        // a name with a word missing after it.
-        if (parts.firm && second.count > 0)
-            line->problem = secondProblem;
-        else
-            line->words.swap(whole.list);
-    } else if (secondProblem.isEmpty()) {
-        if (allInList(first) && isValidWordCount(first.count + second.count)) {
-            line->problem = wordsAsName;
-        } else {
-            takeName(line, nameIn(text, begin, parts.firstEnd));
-            line->words.swap(second.list);
+    std::vector<Reading> readings;
+    for (const size_t mark : marks) {
+        Words before;
+        Words after;
+        readWords(text, begin, mark, &before);
+        readWords(text, mark + 1, end, &after);
+        const bool firmMark = isFirmMark(text[mark]);
+        if (problemWith(after, false).isEmpty()) {
+            Reading reading{mark + 1, end, begin, mark, firmMark};
+            size_t b = begin;
+            size_t e = mark;
+            while (b < e && isSpace(text[b]))
+                ++b;
+            while (e > b && isSpace(text[e - 1]))
+                --e;
+            reading.firm = reading.firm || isOneQuotedField(text, b, e);
+            addReading(text, reading, &readings);
         }
-    } else if (firstProblem.isEmpty()) {
-        if (allInList(second) && isValidWordCount(first.count + second.count)) {
-            line->problem = wordsAsName;
-        } else {
-            takeName(line, nameIn(text, parts.secondBegin, end));
-            line->words.swap(first.list);
+        if (problemWith(before, false).isEmpty()) {
+            Reading reading{begin, mark, mark + 1, end, firmMark};
+            size_t b = mark + 1;
+            size_t e = end;
+            while (b < e && isSpace(text[b]))
+                ++b;
+            while (e > b && isSpace(text[e - 1]))
+                --e;
+            reading.firm = reading.firm || isOneQuotedField(text, b, e);
+            addReading(text, reading, &readings);
         }
-    } else {
-        // No phrase either way: said of the line the person most likely meant.
-        line->problem = parts.firm || !allInList(first) ? secondProblem : wholeProblem;
     }
+
+    const bool wholeIsPhrase = wholeProblem.isEmpty();
+    if (readings.size() > 1 || (wholeIsPhrase && !readings.empty())) {
+        line->problem = QStringLiteral("it can be read two ways, as one phrase or as a name and a phrase: remove the "
+                                       "mark that does not belong, or change the name");
+        return;
+    }
+    if (readings.empty()) {
+        // No phrase beside any mark: said of the line the person most likely meant.
+        const auto firm = std::find_if(marks.cbegin(), marks.cend(), [&text](size_t mark) { return isFirmMark(text[mark]); });
+        const size_t mark = firm != marks.cend() ? *firm : marks.front();
+        Words before;
+        Words after;
+        readWords(text, begin, mark, &before);
+        readWords(text, mark + 1, end, &after);
+        const bool afterIsPhrase = listWordsIn(after) >= listWordsIn(before);
+        const Words& phrase = afterIsPhrase ? after : before;
+        const Words& other = afterIsPhrase ? before : after;
+        if (wholeIsPhrase && !isFirmMark(text[mark]))
+            line->problem = QStringLiteral("a ',' or ';' stands inside the phrase: remove it if this is one phrase");
+        else if (isFirmMark(text[mark]) || !allInList(other))
+            line->problem = problemWith(phrase, true);
+        else
+            line->problem = wholeProblem;
+        return;
+    }
+
+    const Reading& reading = readings.front();
+    Words name;
+    Words phrase;
+    readWords(text, reading.nameFrom, reading.nameTo, &name);
+    readWords(text, reading.phraseFrom, reading.phraseTo, &phrase);
+    // A comma can be a slip inside a longer phrase, and a checksum proves little.
+    const bool totalIsPhraseSized = isValidWordCount(name.count + phrase.count);
+    if ((allInList(name) && (totalIsPhraseSized || !reading.firm))
+        || (!reading.firm && totalIsPhraseSized && oneSlipFromList(name))) {
+        line->problem = QStringLiteral("its name could be part of the phrase: change it, for example by adding a number, "
+                                       "or write it before a ':'");
+        return;
+    }
+    if (name.count > 0 || reading.nameTo > reading.nameFrom) {
+        QString typed = fieldName(QString::fromUtf8(text.data() + reading.nameFrom, qsizetype(reading.nameTo - reading.nameFrom)));
+        if (looksLikeSecret(typed)) {
+            typed.fill(QChar(u'\0'));
+            line->problem = QString::fromLatin1(kNameIsSecret);
+            return;
+        }
+        line->name = std::move(typed);
+    }
+    line->words.swap(phrase.list);
 }
 
 } // namespace
@@ -310,7 +417,13 @@ void SeedLine::wipe()
 
 std::vector<SeedLine> parseSeedLines(const std::string& text)
 {
+    struct Span {
+        size_t begin = 0;
+        size_t end = 0;
+        bool plain = false;
+    };
     std::vector<SeedLine> out;
+    std::vector<Span> spans;
     int number = 0;
     size_t lineStart = 0;
     while (lineStart <= text.size()) {
@@ -321,35 +434,64 @@ std::vector<SeedLine> parseSeedLines(const std::string& text)
 
         size_t begin = lineStart;
         size_t end = lineEnd;
-        const size_t next = lineEnd + 1;
-        while (begin < end && (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\r'))
+        lineStart = lineEnd + 1;
+        while (begin < end && (isSpace(text[begin]) || text[begin] == '\t'))
             ++begin;
-        while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r'))
+        while (end > begin && (isSpace(text[end - 1]) || text[end - 1] == '\t'))
             --end;
-        lineStart = next;
         if (begin == end)
             continue;
 
         SeedLine line;
         line.number = number;
+        Span span;
         if (text[begin] == '#') {
             // A comment, unless a phrase follows: then a seed would be left out unseen.
             size_t after = begin + 1;
             while (after < end && (text[after] == ' ' || text[after] == '\t'))
                 ++after;
-            if (after == end)
+            after = afterListNumber(text, after, end);
+            trimFields(text, &after, &end);
+            if (after >= end)
                 continue;
             SeedLine inside;
-            readLine(text, afterListNumber(text, after, end), end, &inside);
+            bool plain = false;
+            readLine(text, after, end, &inside, &plain);
             if (!inside.problem.isEmpty())
                 continue;
-            line.problem = QStringLiteral("it starts with #, so it was skipped: remove the # to add it");
+            line.problem = QString::fromLatin1(kCommentSkipped);
         } else {
-            readLine(text, afterListNumber(text, begin, end), end, &line);
+            begin = afterListNumber(text, begin, end);
+            trimFields(text, &begin, &end);
+            if (begin >= end)
+                continue; // a row of blank columns
+            readLine(text, begin, end, &line, &span.plain);
+            span.begin = begin;
+            span.end = end;
             if (!line.problem.isEmpty())
                 line.wipe();
         }
         out.push_back(std::move(line));
+        spans.push_back(span);
+    }
+
+    // One long phrase wrapped over two lines: half of it alone can pass its checksum.
+    for (size_t i = 0; i + 1 < out.size(); ++i) {
+        if (out[i].number + 1 != out[i + 1].number || !spans[i].plain || !spans[i + 1].plain)
+            continue;
+        if (!out[i].problem.isEmpty() && !out[i + 1].problem.isEmpty())
+            continue; // neither goes in anyway
+        Words joined;
+        readWords(text, spans[i].begin, spans[i].end, &joined);
+        readWords(text, spans[i + 1].begin, spans[i + 1].end, &joined);
+        if (!problemWith(joined, false).isEmpty())
+            continue;
+        const QString why = QStringLiteral("this line and the one beside it also read as one phrase: join them if they "
+                                           "are one, or add them one at a time if they are two");
+        for (const size_t k : {i, i + 1}) {
+            out[k].wipe();
+            out[k].problem = why;
+        }
     }
     return out;
 }
@@ -357,20 +499,31 @@ std::vector<SeedLine> parseSeedLines(const std::string& text)
 QList<KeyLine> parseKeyLines(const QString& text)
 {
     // Any kind of space: a key copied from a document or a page can come with one.
-    static const QRegularExpression gap(QStringLiteral("[\\s,;:\"]+"), QRegularExpression::UseUnicodePropertiesOption);
-    static const QRegularExpression listNumber(QStringLiteral("^\\d+[.)]\\s+"),
-                                               QRegularExpression::UseUnicodePropertiesOption);
+    static const QRegularExpression gap(QStringLiteral("[\\s,;:\"=\\[\\]]+"), QRegularExpression::UseUnicodePropertiesOption);
+    static const QRegularExpression listNumber(QStringLiteral("^\\d+[.)]\\s+"), QRegularExpression::UseUnicodePropertiesOption);
+    static const QRegularExpression origin(QStringLiteral("\\[[0-9a-fA-F]{8}[^\\]]*\\]")); // a key's origin in a descriptor
     QList<KeyLine> out;
     const QStringList lines = text.split(QLatin1Char('\n'));
     for (qsizetype i = 0; i < lines.size(); ++i) {
-        QString line = lines.at(i).trimmed();
-        if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
+        QString line;
+        line.reserve(lines.at(i).size());
+        for (const QChar c : lines.at(i)) {
+            if (c.category() != QChar::Other_Format)
+                line.append(c);
+        }
+        line = std::move(line).trimmed();
+        if (line.isEmpty())
             continue;
+        const bool comment = line.startsWith(QLatin1Char('#'));
+        if (comment)
+            line = std::move(line).mid(1).trimmed();
+        line.remove(origin);
         line.remove(listNumber);
 
         KeyLine entry;
         entry.number = int(i + 1);
         qsizetype firstKey = -1;
+        qsizetype lastKeyEnd = 0;
         qsizetype searched = 0;
         const QStringList tokens = line.split(gap, Qt::SkipEmptyParts);
         for (const QString& token : tokens) {
@@ -380,17 +533,22 @@ QList<KeyLine> parseKeyLines(const QString& text)
                 || token.startsWith(QLatin1String("xpub"))) {
                 if (firstKey < 0)
                     firstKey = at;
+                lastKeyEnd = searched;
                 entry.keys << token;
             }
         }
-        if (entry.keys.isEmpty()) {
-            entry.problem = QStringLiteral("it has no zpub, ypub or xpub");
+        if (comment) {
+            if (entry.keys.isEmpty())
+                continue;
+            entry.keys.clear();
+            entry.problem = QString::fromLatin1(kCommentSkipped);
+        } else if (entry.keys.isEmpty()) {
+            entry.problem = QStringLiteral("no zpub, ypub or xpub could be read on it");
         } else {
-            QString name = line.left(firstKey);
-            static const QRegularExpression edges(QStringLiteral("^[\\s,;:\"]+|[\\s,;:\"]+$"),
-                                                  QRegularExpression::UseUnicodePropertiesOption);
-            name.remove(edges);
-            if (looksLikeSecret(name, WalletStore::kMaxLabelChars))
+            QString name = fieldName(line.left(firstKey));
+            if (name.isEmpty())
+                name = fieldName(line.mid(lastKeyEnd));
+            if (looksLikeSecret(name))
                 entry.problem = QString::fromLatin1(kNameIsSecret);
             else
                 entry.name = name;
@@ -400,26 +558,33 @@ QList<KeyLine> parseKeyLines(const QString& text)
     return out;
 }
 
-bool looksLikeSeedWords(QStringView text, int cutAt)
+bool looksLikeSeedWords(QStringView text)
 {
-    const int needed = cutAt > 0 && text.size() >= cutAt ? 5 : 12;
     // Read the way the seed fields read it. normalized() can hand back the very buffer
     // of `copy`; filling both zeroes it whichever owns it by then.
     QString copy = text.toString();
     QString nfkd = copy.normalized(QString::NormalizationForm_KD);
+    constexpr int kWindow = 12;
+    constexpr int kInList = 10;
+    std::array<bool, kWindow> window{};
+    int position = 0;
+    int seen = 0;
+    int inList = 0;
     std::string word; // a list word fits the string itself, so no allocation holds it
     bool plain = true; // ASCII letters only, and short enough to be a list word
-    int run = 0;
     bool found = false;
     const auto endWord = [&] {
-        if (!word.empty() || !plain) {
-            if (plain && chain::bip39::isWord(word)) {
-                if (++run >= needed)
-                    found = true;
-            } else {
-                run = 0;
-            }
-        }
+        if (word.empty() && plain)
+            return;
+        const bool hit = plain && chain::bip39::isWord(word);
+        if (seen == kWindow)
+            inList -= window[size_t(position)] ? 1 : 0;
+        else
+            ++seen;
+        window[size_t(position)] = hit;
+        inList += hit ? 1 : 0;
+        position = (position + 1) % kWindow;
+        found = found || (seen == kWindow && inList >= kInList);
         word.clear();
         plain = true;
     };
@@ -455,46 +620,133 @@ bool looksLikePrivateKey(QStringView text)
     const auto isHex = [](QChar c) {
         return (c >= u'0' && c <= u'9') || (c >= u'A' && c <= u'F') || (c >= u'a' && c <= u'f');
     };
+    // As the seed fields read text, and as cleanLabel would store it. Same care as above.
+    QString copy = text.toString();
+    QString nfkd = copy.normalized(QString::NormalizationForm_KD);
+    QString clean;
+    clean.reserve(nfkd.size());
+    for (const QChar c : std::as_const(nfkd)) {
+        if (c.category() != QChar::Other_Format)
+            clean.append(c);
+    }
+
+    // A raw key is 64 hex digits, cut or not, and written in groups or not. 66 or 130 are
+    // public keys, which are no secret.
+    constexpr qsizetype kFewestHexDigits = 56;
+    constexpr qsizetype kMostHexDigits = 64;
+    constexpr qsizetype kShortestGroup = 4;
+    qsizetype hexRun = 0;
+    bool found = false;
+    const auto endHexRun = [&] {
+        found = found || (hexRun >= kFewestHexDigits && hexRun <= kMostHexDigits);
+        hexRun = 0;
+    };
+    const QStringView view(clean);
     qsizetype i = 0;
-    while (i < text.size()) {
-        while (i < text.size() && !isAlnum(text[i]))
+    while (i < view.size() && !found) {
+        while (i < view.size() && !isAlnum(view[i]))
             ++i;
         qsizetype end = i;
-        while (end < text.size() && isAlnum(text[end]))
+        while (end < view.size() && isAlnum(view[end]))
             ++end;
-        QStringView token = text.mid(i, end - i);
+        QStringView token = view.mid(i, end - i);
         i = end;
+        if (token.isEmpty())
+            break;
 
         // The prefixes of extended private keys, at any length a field may have cut them to.
         static const char16_t* const kPrefixes[] = {u"xprv", u"yprv", u"zprv", u"Yprv", u"Zprv",
                                                     u"tprv", u"uprv", u"vprv", u"Uprv", u"Vprv"};
-        for (const char16_t* prefix : kPrefixes) {
-            if (token.size() >= 44 && token.startsWith(QStringView(prefix)))
-                return true;
-        }
+        for (const char16_t* prefix : kPrefixes)
+            found = found || (token.size() >= 44 && token.startsWith(QStringView(prefix)));
         // A key in Wallet Import Format.
         const bool wifSize = (token.size() == 51 && token.front() == u'5')
                              || (token.size() == 52 && (token.front() == u'K' || token.front() == u'L'));
-        if (wifSize && std::all_of(token.cbegin(), token.cend(), isBase58))
-            return true;
-        // A raw key in hex, cut or not.
+        found = found || (wifSize && std::all_of(token.cbegin(), token.cend(), isBase58));
+
         if (token.startsWith(u"0x") || token.startsWith(u"0X"))
             token = token.mid(2);
-        if (token.size() >= 60 && std::all_of(token.cbegin(), token.cend(), isHex))
-            return true;
+        if (token.size() >= kShortestGroup && std::all_of(token.cbegin(), token.cend(), isHex)) {
+            found = found || (token.size() >= kFewestHexDigits && token.size() <= kMostHexDigits);
+            hexRun += token.size();
+        } else {
+            endHexRun();
+        }
     }
-    return false;
+    endHexRun();
+    copy.fill(QChar(u'\0'));
+    nfkd.fill(QChar(u'\0'));
+    clean.fill(QChar(u'\0'));
+    return found;
 }
 
-bool looksLikeSecret(QStringView text, int cutAt)
+bool looksLikeSecret(QStringView text)
 {
-    return looksLikeSeedWords(text, cutAt) || looksLikePrivateKey(text);
+    return looksLikeSeedWords(text) || looksLikePrivateKey(text);
 }
 
-bool keyListHoldsSecret(const QString& text)
+QList<int> linesHoldingSecrets(const QString& text)
 {
+    QList<int> found;
     const QList<QStringView> lines = QStringView(text).split(u'\n');
-    return std::any_of(lines.cbegin(), lines.cend(), [](QStringView line) { return looksLikeSecret(line); });
+    for (qsizetype i = 0; i < lines.size(); ++i) {
+        if (looksLikeSecret(lines.at(i)))
+            found.append(int(i));
+    }
+    return found;
+}
+
+bool decodeListFile(const QByteArray& bytes, QString* out)
+{
+    const auto decodeAs = [&bytes, out](QStringConverter::Encoding encoding) {
+        QStringDecoder decoder(encoding, QStringDecoder::Flag::Stateless);
+        QString text = decoder.decode(bytes);
+        if (decoder.hasError() || text.contains(QChar(u'\0'))) {
+            text.fill(QChar(u'\0'));
+            return false;
+        }
+        *out = std::move(text);
+        return true;
+    };
+    if (const std::optional<QStringConverter::Encoding> marked = QStringConverter::encodingForData(bytes))
+        return decodeAs(*marked);
+
+    // UTF-16 with no mark: every other byte is zero.
+    qsizetype zerosEven = 0;
+    qsizetype zerosOdd = 0;
+    for (qsizetype i = 0; i < bytes.size(); ++i) {
+        if (bytes.at(i) == '\0')
+            ++(i % 2 == 0 ? zerosEven : zerosOdd);
+    }
+    const qsizetype mostOfHalf = bytes.size() / 2 * 8 / 10;
+    if (mostOfHalf > 0 && zerosEven == 0 && zerosOdd >= mostOfHalf)
+        return decodeAs(QStringConverter::Utf16LE);
+    if (mostOfHalf > 0 && zerosOdd == 0 && zerosEven >= mostOfHalf)
+        return decodeAs(QStringConverter::Utf16BE);
+
+    qsizetype validSequences = 0;
+    qsizetype strayBytes = 0;
+    for (qsizetype i = 0; i < bytes.size();) {
+        const auto c = static_cast<unsigned char>(bytes.at(i));
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        const qsizetype length = c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+        bool whole = length > 0 && i + length <= bytes.size();
+        for (qsizetype k = 1; whole && k < length; ++k)
+            whole = (static_cast<unsigned char>(bytes.at(i + k)) & 0xC0) == 0x80;
+        if (whole) {
+            ++validSequences;
+            i += length;
+        } else {
+            ++strayBytes;
+            ++i;
+        }
+    }
+    if (strayBytes == 0)
+        return decodeAs(QStringConverter::Utf8);
+    return validSequences == 0 && decodeAs(QStringConverter::System);
 }
 
 } // namespace wallet

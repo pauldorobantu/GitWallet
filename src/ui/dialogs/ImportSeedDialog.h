@@ -63,6 +63,7 @@ private:
     void validateKeys();        // the status line + parsedKeys_, on every edit
     void validateSeedList();    // the status line + listReady_, on every edit
     void validateKeyList();     // the same
+    void removeKeyLines(const QList<int>& lines); // those that hold a secret, 0-based
     void updateImportEnabled();
     void importSeed();
     void addOneSeed();
@@ -113,6 +114,7 @@ private:
     std::string listPassphrase_;
     QMap<int, QString> listToFix_;
     QList<wallet::WalletRequest> listRequests_;
+    QString removedNote_;     // for the next status: which lines of the key list were removed
     int addedTotal_ = 0;
     QString result_;
 };

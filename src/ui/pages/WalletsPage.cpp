@@ -486,10 +486,12 @@ void WalletsPage::renameSelected()
     auto* column = new QVBoxLayout(dialog);
     page::applyDialogLayout(column);
     auto* name = new QLineEdit(entry->label, dialog);
-    name->setMaxLength(wallet::WalletStore::kMaxLabelChars);
+    // More than any name, so seed words or a key pasted here are seen whole. Saving cuts a real name.
+    name->setMaxLength(1024);
     name->selectAll();
     column->addWidget(name);
     auto* status = new QLabel(dialog);
+    status->setTextFormat(Qt::PlainText); // it can quote a wallet's name
     status->setWordWrap(true);
     setStatus(status, QString(), Tone::Muted);
     column->addWidget(status);
@@ -513,7 +515,7 @@ void WalletsPage::renameSelected()
         }
         setStatus(status, error, Tone::Error);
         // Not kept on screen either, if that is why it was refused.
-        if (wallet::looksLikeSecret(name->text(), wallet::WalletStore::kMaxLabelChars)) {
+        if (wallet::looksLikeSecret(name->text())) {
             name->setText(QString(name->text().size(), QLatin1Char(' ')));
             name->clear();
         }

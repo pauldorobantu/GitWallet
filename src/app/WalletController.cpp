@@ -79,6 +79,12 @@ std::optional<QByteArray> diskDigest()
     return hash.result();
 }
 
+// Two names that read the same on screen are one name, whatever their case or Unicode form.
+QString nameKey(const QString& label)
+{
+    return label.normalized(QString::NormalizationForm_C).toCaseFolded();
+}
+
 // `base`, then the first number no wallet goes by, always within a name's length.
 QString nextFreeName(const QString& base, const QSet<QString>& taken, const QSet<QString>& asked)
 {
@@ -88,7 +94,7 @@ QString nextFreeName(const QString& base, const QSet<QString>& taken, const QSet
         if (!head.isEmpty() && head.back().isHighSurrogate()) // never half a character
             head.chop(1);
         const QString name = head.trimmed() + suffix;
-        const QString key = name.toCaseFolded();
+        const QString key = nameKey(name);
         if (!taken.contains(key) && !asked.contains(key))
             return name;
     }
@@ -420,10 +426,10 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
     QSet<QString> taken;
     QSet<QString> asked;
     for (const wallet::WalletEntry& other : std::as_const(store_.wallets))
-        taken.insert(other.label.toCaseFolded());
+        taken.insert(nameKey(other.label));
     for (const wallet::WalletRequest& request : std::as_const(*requests)) {
-        if (!request.numbered)
-            asked.insert(wallet::WalletStore::cleanLabel(request.label).toCaseFolded());
+        if (!request.numbered && !wallet::looksLikeSecret(request.label))
+            asked.insert(nameKey(wallet::WalletStore::cleanLabel(request.label)));
     }
 
     qsizetype room = wallet::WalletStore::kMaxWallets - store_.wallets.size();
@@ -431,7 +437,7 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
     for (wallet::WalletRequest& request : *requests) {
         request.refused.clear();
         // Whatever the screen let through: wallet.dat never holds a secret as a name.
-        if (wallet::looksLikeSecret(request.label, wallet::WalletStore::kMaxLabelChars)) {
+        if (wallet::looksLikeSecret(request.label)) {
             request.refused = QStringLiteral("its name looks like seed words or a private key.");
             continue;
         }
@@ -458,11 +464,11 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
         if (label.isEmpty() || request.numbered) {
             // Only what really goes in takes a number.
             label = nextFreeName(label.isEmpty() ? QStringLiteral("Wallet") : label, taken, asked);
-        } else if (taken.contains(label.toCaseFolded())) {
+        } else if (taken.contains(nameKey(label))) {
             request.refused = QStringLiteral("a wallet is already named “%1”.").arg(label);
             continue;
         }
-        taken.insert(label.toCaseFolded());
+        taken.insert(nameKey(label));
         --room;
 
         wallet::WalletEntry entry;
@@ -505,6 +511,7 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
     emit walletChanged();
     emit statusChanged();
     if (!movedTo.isEmpty()) {
+        fileSetAside_ = QDir::toNativeSeparators(movedTo);
         emit errorOccurred(wallet::Problem::FileSetAside,
                            QStringLiteral("The old wallet.dat could not be read, so it was kept as %1. "
                                           "Wallets it holds are not shown here.")
@@ -550,17 +557,18 @@ bool WalletController::removeWallet(quint32 id, QString* error)
 bool WalletController::renameWallet(quint32 id, const QString& label, QString* error)
 {
     setError(error, QString());
+    // First: cleaning makes copies.
+    if (wallet::looksLikeSecret(label)) {
+        setError(error, QStringLiteral("That looks like seed words or a private key, so it was not kept as a name."));
+        return false;
+    }
     const QString clean = wallet::WalletStore::cleanLabel(label);
     if (clean.isEmpty()) {
         setError(error, QStringLiteral("Enter a name for the wallet."));
         return false;
     }
-    if (wallet::looksLikeSecret(label, wallet::WalletStore::kMaxLabelChars)) {
-        setError(error, QStringLiteral("That looks like seed words or a private key, so it was not kept as a name."));
-        return false;
-    }
     const bool nameInUse = std::any_of(store_.wallets.cbegin(), store_.wallets.cend(), [&](const wallet::WalletEntry& w) {
-        return w.id != id && w.label.toCaseFolded() == clean.toCaseFolded();
+        return w.id != id && nameKey(w.label) == nameKey(clean);
     });
     if (nameInUse) {
         setError(error, QStringLiteral("A wallet is already named “%1”.").arg(clean));
@@ -655,6 +663,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         bool funded;
         bool found; // a fresh scan reads it as used, which is what moves its window
         bool bitcoin;
+        bool pastGap = false; // beyond what its chain's gap alone reaches from index 0
     };
     struct Chain {
         QList<Row> rows;
@@ -700,7 +709,9 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
                 if (!cut) {
                     if (row.found)
                         last = row.index;
-                    reach.rows.append(row);
+                    Row reached = row;
+                    reached.pastGap = qint64(row.index) >= gap;
+                    reach.rows.append(reached);
                 } else if (leftOut) {
                     ++leftOut->used;
                     if (row.funded)
@@ -716,7 +727,8 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
 
     // A run of used addresses has no hole for the walk to find, but a scan also stops
     // at a limit over all accounts, which the Bitcoin one falls with the gaps. What
-    // these settings want past the limit, beyond what the ones in use do already.
+    // these settings want past the limit: all of it if the rows go, as nothing they
+    // hold then stays; else beyond what the settings in use want already.
     qint64 btcGapsNow = 0;
     qint64 btcGapsBefore = 0;
     qint64 ethAccounts = 0;
@@ -730,20 +742,29 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         }
     }
     const auto overBy = [](qint64 wanted, qint64 limit) { return qMax(qint64(0), wanted - limit); };
-    const qint64 btcOver = overBy(btcGapsNow + reachNow.btcGrown, wallet::BtcScanner::rowLimitFor(btcGapsNow))
-                           - overBy(btcGapsBefore + reachBefore.btcGrown, wallet::BtcScanner::rowLimitFor(btcGapsBefore));
-    const qint64 ethOver = overBy(ethAccounts * s.ethGap + reachNow.ethGrown, wallet::EthScanner::kMaxFollowedRows)
-                           - overBy(ethAccounts * before.ethGap + reachBefore.ethGrown, wallet::EthScanner::kMaxFollowedRows);
-    impact.overLimit = qMax(qint64(0), btcOver) + qMax(qint64(0), ethOver);
+    const qint64 btcLimit = wallet::BtcScanner::rowLimitFor(btcGapsNow);
+    const qint64 ethLimit = wallet::EthScanner::kMaxFollowedRows;
+    const qint64 btcWanted = overBy(btcGapsNow + reachNow.btcGrown, btcLimit);
+    const qint64 ethWanted = overBy(ethAccounts * s.ethGap + reachNow.ethGrown, ethLimit);
+    const qint64 btcOver =
+        cleared ? btcWanted
+                : qMax(qint64(0), btcWanted - overBy(btcGapsBefore + reachBefore.btcGrown, wallet::BtcScanner::rowLimitFor(btcGapsBefore)));
+    const qint64 ethOver =
+        cleared ? ethWanted : qMax(qint64(0), ethWanted - overBy(ethAccounts * before.ethGap + reachBefore.ethGrown, ethLimit));
+    impact.overLimit = btcOver + ethOver;
     if (impact.overLimit > 0) {
-        // Which ones depends on the order the chains grow in: the furthest out, at
-        // most this many, since the ends of the windows go first.
+        // When the gaps alone fill the limit no window grows at all, so every address past
+        // its gap goes. Otherwise which ones depends on the order the chains grow in: the
+        // furthest out, at most this many, since the ends of the windows go first.
+        const bool btcNoGrowth = btcGapsNow >= btcLimit;
+        const bool ethNoGrowth = ethAccounts * s.ethGap >= ethLimit;
         std::sort(reachNow.rows.begin(), reachNow.rows.end(), [](const Row& a, const Row& b) { return a.index > b.index; });
         qint64 btcLeft = btcOver;
         qint64 ethLeft = ethOver;
         for (const Row& row : std::as_const(reachNow.rows)) {
             qint64& left = row.bitcoin ? btcLeft : ethLeft;
-            if (left <= 0)
+            const bool noGrowth = cleared && (row.bitcoin ? btcNoGrowth : ethNoGrowth);
+            if (noGrowth ? !row.pastGap : left <= 0)
                 continue;
             --left;
             ++impact.used;
