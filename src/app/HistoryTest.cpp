@@ -1549,7 +1549,8 @@ void testLiars(const Check& check, const wallet::AccountKey& key)
         wallet::UtxoScanner::setPacesForTest(5 * 60 * 1000, 5000, 30 * 1000);
     }
     {
-        // Rounds go on by themselves, at a wait a coarse timer would have come back from too early.
+        // Rounds go on by themselves. A timer cannot be made to fire early at will, so this does not
+        // bring back what stopped them when one did: it says only that they go on.
         wallet::UtxoScanner::setLivePlacesForTest(1);
         wallet::UtxoScanner::setPacesForTest(2500, 0, 0);
         FakeChain server;
@@ -1568,16 +1569,17 @@ void testLiars(const Check& check, const wallet::AccountKey& key)
         wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
         wallet::UtxoScanner::setPacesForTest(5 * 60 * 1000, 5000, 30 * 1000);
     }
-    {
-        // A server that is only behind is not asked for what it has not got to, and nobody is blamed.
-        // It is asked when it has, with nothing else to bring that about: an address read in rounds.
+    // A server that is only behind is not asked for what it has not got to, and nobody is blamed. It is
+    // asked when it has, with nothing else to bring that about: an address read in rounds. However little
+    // it is behind: one block is as much as it takes to refuse.
+    for (const int blocksBehind : {4, 1}) {
         wallet::UtxoScanner::setLivePlacesForTest(1);
         wallet::UtxoScanner::setPacesForTest(5000, 0, 0);
         wallet::UtxoHistory::setFirstPauseForTest(200);
         const AddressOf far = addressOf(key, 0, 2);
         FakeChain ahead;
         FakeChain behind;
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < blocksBehind - 1; ++i)
             ahead.mine();
         const chain::Hash256 txid = ahead.fund(far.script, 7000);
         ahead.mine();
@@ -1591,7 +1593,7 @@ void testLiars(const Check& check, const wallet::AccountKey& key)
             pause(300);
             check(proofs() == 0 && run.problems.isEmpty(), QStringLiteral("that one is not asked for it, and not blamed"));
             check(run.history.proofFailed(txid), QStringLiteral("and the page does not say it is proven"));
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < blocksBehind - 1; ++i)
                 behind.mine();
             behind.fund(far.script, 7000);
             behind.mine();
