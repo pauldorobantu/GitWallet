@@ -6,6 +6,7 @@
 #include <QString>
 
 #include <functional>
+#include <optional>
 
 class QTimer;
 class QWidget;
@@ -65,7 +66,7 @@ private:
     // Values remembered across steps.
     int rowsBeforeReopen_ = 0;
     QString givenOutAddress_;
-    bool hideZeroWas_ = true;
+    std::optional<bool> hideZeroWas_;
     quint32 givenOutIndex_ = 0;
     QString totalsBeforeReopen_;
     quint32 removedWallet_ = 0;

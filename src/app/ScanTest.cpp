@@ -1417,6 +1417,23 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         check(waitFor([&model] { return model.size() == 17 && model.checkedCount() == 17; }, 10000), QStringLiteral("given out while it runs, its rows come and are read without waiting for a refresh (%1)").arg(model.size()));
         run.scanner.stop();
     }
+    // A pass longer than the refresh: what was given out goes ahead of it too, wherever it lies.
+    {
+        wallet::EvmScanner::setMinRefreshForTest(1);
+        wallet::AccountKey key = account;
+        key.given.add(500);
+        FakeRpc rpc;
+        rpc.delayMs = 100;
+        rpc.nonces.insert(evmAddress(key, 1000), 1); // used past it
+        wallet::WalletModel model;
+        EvmRun::Options quick;
+        quick.refreshSeconds = 1;
+        EvmRun run(&model, {rpc.url()}, key, 2000, quick);
+        check(waitFor([&run] { return run.finished; }, 60000), QStringLiteral("a pass longer than the refresh ends"));
+        check(run.scanner.tiers().live == 21, QStringLiteral("and what was given out went ahead of it, beside the next unused ones: %1").arg(run.scanner.tiers().live));
+        run.scanner.stop();
+        wallet::EvmScanner::setMinRefreshForTest(10);
+    }
     // An endpoint that said a lie leaves what was given out where it is.
     {
         wallet::AccountKey key = account;
@@ -1750,6 +1767,21 @@ void testStartAtScale(const Check& check, const QList<wallet::AccountKey>& keys,
 }
 
 } // namespace
+
+void runGivenOutScans(const Check& check, const QList<wallet::AccountKey>& someKeys)
+{
+    wallet::AccountKey segwit;
+    wallet::AccountKey account;
+    for (const wallet::AccountKey& key : someKeys) {
+        if (key.type == chain::ScriptType::P2WPKH)
+            segwit = key;
+        else if (key.type == chain::ScriptType::EthAccount)
+            account = key;
+    }
+    segwit.wallet = 1;
+    account.wallet = 1;
+    testGivenOutScans(check, segwit, account);
+}
 
 void runScanTest(const Check& check, QString* report, const QList<wallet::AccountKey>& someKeys)
 {

@@ -1522,6 +1522,9 @@ void runScreensTest(const Check& check, QString* report, const QList<wallet::Acc
     SettingsRepo().set(QStringLiteral("ui.hideZero"), hideZero);
 }
 
+// In ScanTest.cpp, with the servers it fakes.
+void runGivenOutScans(const std::function<void(bool, const QString&)>& check, const QList<wallet::AccountKey>& someKeys);
+
 // The screens with something in them, to look at: made-up figures on public test seeds, in a throw-away
 // folder and with no server. For the docs and for reports, which say so.
 bool writeScreenPictures(const QString& folder)
@@ -1666,7 +1669,9 @@ StoreTestResult runScreensTestAlone()
             ++result.passed;
         result.report += (ok ? QStringLiteral("ok    ") : QStringLiteral("FAIL  ")) + what + QLatin1Char('\n');
     };
-    runScreensTest(check, &result.report, wallet::WalletStore::deriveAccounts(chain::bip39::split("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), {}));
+    const QList<wallet::AccountKey> keys = wallet::WalletStore::deriveAccounts(chain::bip39::split("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), {});
+    runScreensTest(check, &result.report, keys);
+    runGivenOutScans(check, keys);
     QFile::remove(wallet::WalletStore::filePath());
     return result;
 }

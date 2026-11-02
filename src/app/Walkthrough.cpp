@@ -567,9 +567,6 @@ void Walkthrough::buildSteps()
              for (const ui::AllocationBar::Part& part : window_->findChild<ui::PortfolioPage*>()->table()->parts())
                  sum += part.usd;
              expect(qAbs(sum - controller()->totalUsd()) < 0.01, QStringLiteral("what it is made of adds up to it"));
-             // One setting per Windows user: as it was found.
-             if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")))
-                 hide->setChecked(hideZeroWas_);
          },
          nullptr},
         {QStringLiteral("coin"),
@@ -1569,6 +1566,10 @@ void Walkthrough::finishStep(int index, bool timedOut)
 
 void Walkthrough::finish()
 {
+    // One setting per Windows user: as it was found. The steps that open a coin need it off, whatever the
+    // public seeds happen to hold.
+    if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")); hide && hideZeroWas_)
+        hide->setChecked(*hideZeroWas_);
     const QJsonObject summary{{QStringLiteral("failures"), failures_}, {QStringLiteral("steps"), results_}};
     QFile f(outDir_ + QStringLiteral("/walkthrough.json"));
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
