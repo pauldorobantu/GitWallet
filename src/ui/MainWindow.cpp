@@ -52,10 +52,9 @@ enum PageId { PageOverview = 0, PageWallets, PageAddresses, PageSend, PageSettin
 // What a notice depends on besides the wallet (Notice::depends). It goes when
 // one of them changes: the scanners then restart and report again whatever
 // still holds.
-constexpr int kDependsBtcGaps = 1;     // the Bitcoin receive and change gaps
+constexpr int kDependsBtcGaps = 1;     // the receive and change gaps
 constexpr int kDependsEthGap = 2;
-constexpr int kDependsEthEndpoints = 4;
-constexpr int kDependsElectrum = 8;    // the Electrum server list
+constexpr int kDependsServers = 4;     // a network's server list
 constexpr int kDependsAnySetting = 16; // any scan setting: a failure, not a state
 
 // Notice::severity.
@@ -147,6 +146,7 @@ QString safeDetail(const QString& detail)
     static const QRegularExpression hostNotFound(QStringLiteral("^Host \\S{1,253} not found$"));
     static const QRegularExpression deadline(
         QStringLiteral("^no complete reply within ([0-9]{1,4}) s$"));
+    static const QRegularExpression otherNetwork(QStringLiteral("^endpoint is not on ([A-Za-z0-9 ]{1,40}) \\("));
 
     const QString d = detail.trimmed();
     if (fixed.contains(d))
@@ -159,8 +159,12 @@ QString safeDetail(const QString& detail)
         return QStringLiteral("no complete reply within %1 s").arg(m.captured(1));
     if (d.startsWith(QLatin1String("reply is not a JSON array")))
         return QStringLiteral("reply is not a JSON array");
-    if (d.startsWith(QLatin1String("endpoint is not on Ethereum mainnet")))
-        return QStringLiteral("endpoint not on Ethereum mainnet");
+    if (const QRegularExpressionMatch m = otherNetwork.match(d); m.hasMatch()) {
+        // Only a name from the list: this is a server's text, whatever it looks like.
+        const QList<wallet::NetworkInfo>& known = wallet::networks();
+        if (std::any_of(known.cbegin(), known.cend(), [&m](const wallet::NetworkInfo& n) { return n.name == m.captured(1); }))
+            return QStringLiteral("endpoint not on %1").arg(m.captured(1));
+    }
     if (hostNotFound.match(d).hasMatch())
         return QStringLiteral("host not found");
     if (d.startsWith(QLatin1String("Connection refused")))
@@ -424,22 +428,22 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
         n.key = QStringLiteral("limit:") + own;
         n.headline = trText(QStringLiteral("Address limit reached"));
         n.severity = kSeverityIncomplete;
-        n.depends = kDependsBtcGaps | kDependsEthGap | kDependsElectrum | kDependsEthEndpoints;
+        n.depends = kDependsBtcGaps | kDependsEthGap | kDependsServers;
         n.settingsFix = true;
         break;
     case wallet::Problem::WrongChain:
         // One notice whatever the evidence (a chain id, no Multicall3, a token
         // contract missing); the latest sentence names it.
         n.key = QStringLiteral("wrong-chain");
-        n.headline = trText(QStringLiteral("Ethereum endpoint is not on mainnet"));
+        n.headline = trText(QStringLiteral("A server answers for another network"));
         n.severity = kSeverityIncomplete;
-        n.depends = kDependsEthEndpoints;
+        n.depends = kDependsServers;
         n.settingsFix = true;
         break;
     case wallet::Problem::BuiltInServers:
         n.key = QStringLiteral("built-in-servers");
         n.headline = trText(QStringLiteral("Using the built-in Electrum servers"));
-        n.depends = kDependsElectrum;
+        n.depends = kDependsServers;
         n.settingsFix = true;
         break;
     case wallet::Problem::Skipped:
@@ -453,6 +457,28 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
     case wallet::Problem::FileSetAside:
         n.key = QStringLiteral("file-set-aside");
         n.headline = trText(QStringLiteral("The old wallet file was kept aside"));
+        n.depends = 0;
+        break;
+    case wallet::Problem::SavedData:
+        // Nothing on screen is wrong: the next start only has to read everything again.
+        n.key = QStringLiteral("saved-data");
+        n.headline = trText(QStringLiteral("Saved balances are not being kept"));
+        n.depends = 0;
+        break;
+    case wallet::Problem::FolderHeld:
+        n.key = QStringLiteral("folder-held");
+        n.headline = trText(QStringLiteral("Saved balances are not being kept"));
+        n.depends = 0;
+        break;
+    case wallet::Problem::FilesLeft:
+        n.key = QStringLiteral("files-left");
+        n.headline = trText(QStringLiteral("Some files could not be deleted"));
+        n.depends = 0;
+        break;
+    case wallet::Problem::SavedDataAside:
+        // The same: a new database is in use, and this says what became of the old one.
+        n.key = QStringLiteral("saved-data-aside");
+        n.headline = trText(QStringLiteral("Saved balances are being read again"));
         n.depends = 0;
         break;
     }
@@ -491,7 +517,7 @@ void MainWindow::onWalletError(wallet::Problem kind, const QString& message, con
     // outage): the latest wording, inputs and time, one more in the count.
     Notice reported = classify(kind, message, serverDetail);
     if (kind == wallet::Problem::FileSetAside)
-        reported.detail = controller_->fileSetAside(); // what pruneNotices() looks for
+        reported.file = controller_->fileSetAside(); // what pruneNotices() looks for
     reported.inputs = currentInputs();
     const qint64 wall = QDateTime::currentMSecsSinceEpoch();
     qsizetype i = 0;
@@ -515,6 +541,7 @@ void MainWindow::onWalletError(wallet::Problem kind, const QString& message, con
         n.headline = reported.headline;
         n.text = reported.text;
         n.detail = reported.detail;
+        n.file = reported.file;
         n.severity = reported.severity;
         n.depends = reported.depends;
         n.settingsFix = reported.settingsFix;
@@ -552,18 +579,17 @@ bool MainWindow::pruneNotices()
         const Inputs& was = n.inputs;
         // The only line that names the file kept aside: it stays as long as that file does.
         if (n.key == QLatin1String("file-set-aside"))
-            return !QFile::exists(n.detail);
+            return !QFile::exists(n.file);
+        if (n.key == QLatin1String("folder-held"))
+            return controller_->keepingSaved();
         if (was.wallet != now.wallet)
             return true; // another wallet, or none
         const bool btcGaps = was.receiveGap != now.receiveGap || was.changeGap != now.changeGap;
         const bool ethGap = was.ethGap != now.ethGap;
-        const bool ethEndpoints = was.ethEndpoints != now.ethEndpoints;
-        const bool electrum = was.electrumServers != now.electrumServers;
-        const bool anySetting = btcGaps || ethGap || ethEndpoints || electrum
-                                || was.refreshSeconds != now.refreshSeconds;
+        const bool servers = was.servers != now.servers;
+        const bool anySetting = btcGaps || ethGap || servers || was.refreshSeconds != now.refreshSeconds;
         return ((n.depends & kDependsBtcGaps) && btcGaps) || ((n.depends & kDependsEthGap) && ethGap)
-               || ((n.depends & kDependsEthEndpoints) && ethEndpoints)
-               || ((n.depends & kDependsElectrum) && electrum)
+               || ((n.depends & kDependsServers) && servers)
                || ((n.depends & kDependsAnySetting) && anySetting);
     });
     return dropped > 0;
@@ -665,12 +691,11 @@ MainWindow::Inputs MainWindow::currentInputs() const
     if (!accounts.isEmpty() && in.wallet == 0)
         in.wallet = 1; // 0 stands for "no wallet"
     const wallet::ScanSettings& s = store.settings;
-    in.receiveGap = s.btcReceiveGap;
-    in.changeGap = s.btcChangeGap;
-    in.ethGap = s.ethGap;
-    in.refreshSeconds = s.ethRefreshSeconds;
-    in.electrumServers = s.electrumServers; // implicitly shared: comparing is cheap while unchanged
-    in.ethEndpoints = s.ethEndpoints;
+    in.receiveGap = s.utxoReceiveGap;
+    in.changeGap = s.utxoChangeGap;
+    in.ethGap = s.evmGap;
+    in.refreshSeconds = s.evmRefreshSeconds;
+    in.servers = s.servers; // implicitly shared: comparing is cheap while unchanged
     return in;
 }
 

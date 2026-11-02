@@ -25,15 +25,19 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QSet>
 #include <QSortFilterProxyModel>
 #include <QTimer>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -53,23 +57,35 @@ constexpr int kRepaintMs = 300;
 constexpr int kSortRole = Qt::UserRole + 1;
 constexpr int kIdRole = Qt::UserRole + 2;
 
-enum Column { ColName, ColSource, ColAddresses, ColFunded, ColBtc, ColEth, ColUsdt, ColUsdc, ColUsd, ColState, ColumnCount };
+// The fixed columns, then one per asset of the list of coins, then USD and State.
+enum Column { ColName, ColSource, ColAddresses, ColFunded, ColFirstAsset };
+
+int usdColumn()
+{
+    return ColFirstAsset + int(wallet::assets().size());
+}
+
+int stateColumn()
+{
+    return usdColumn() + 1;
+}
+
+int columnTotal()
+{
+    return stateColumn() + 1;
+}
 
 // The asset of a balance column; nullptr for any other column.
 const wallet::AssetInfo* assetOf(int column)
 {
-    switch (column) {
-    case ColBtc: return &wallet::assetInfo(wallet::Asset::BTC);
-    case ColEth: return &wallet::assetInfo(wallet::Asset::ETH);
-    case ColUsdt: return &wallet::assetInfo(wallet::Asset::USDT);
-    case ColUsdc: return &wallet::assetInfo(wallet::Asset::USDC);
-    default: return nullptr;
-    }
+    if (column < ColFirstAsset || column >= usdColumn())
+        return nullptr;
+    return &wallet::assets().at(column - ColFirstAsset);
 }
 
 bool numericColumn(int column)
 {
-    return column >= ColAddresses && column <= ColUsd;
+    return column >= ColAddresses && column <= usdColumn();
 }
 
 // What the State column says of a wallet, the most pressing first.
@@ -106,11 +122,11 @@ public:
         if (wallets_.isEmpty())
             return;
         takeSnapshot();
-        emit dataChanged(index(0, ColAddresses), index(int(wallets_.size()) - 1, ColumnCount - 1));
+        emit dataChanged(index(0, ColAddresses), index(int(wallets_.size()) - 1, columnTotal() - 1));
     }
 
     int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : int(wallets_.size()); }
-    int columnCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : ColumnCount; }
+    int columnCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : columnTotal(); }
 
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override
     {
@@ -118,17 +134,27 @@ public:
             return QAbstractTableModel::headerData(section, orientation, role);
         if (role == Qt::TextAlignmentRole && numericColumn(section))
             return QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
+        if (role == Qt::ToolTipRole && section == usdColumn() && controller_)
+            return controller_->pricesLine();
         if (role != Qt::DisplayRole)
             return {};
-        if (const wallet::AssetInfo* info = assetOf(section))
-            return info->symbol;
+        if (const wallet::AssetInfo* info = assetOf(section)) {
+            // With its network where another network has the same symbol.
+            const QList<wallet::AssetInfo>& all = wallet::assets();
+            const auto same = std::count_if(all.cbegin(), all.cend(), [info](const wallet::AssetInfo& other) {
+                return other.symbol == info->symbol;
+            });
+            return same > 1 ? QStringLiteral("%1 %2").arg(info->symbol, wallet::networkInfo(info->network).name) : info->symbol;
+        }
+        if (section == usdColumn())
+            return QStringLiteral("USD");
+        if (section == stateColumn())
+            return trText(QStringLiteral("State"));
         switch (section) {
         case ColName: return trText(QStringLiteral("Name"));
         case ColSource: return trText(QStringLiteral("Source"));
         case ColAddresses: return trText(QStringLiteral("Addresses"));
         case ColFunded: return trText(QStringLiteral("Funded"));
-        case ColUsd: return QStringLiteral("USD");
-        case ColState: return trText(QStringLiteral("State"));
         default: return {};
         }
     }
@@ -159,7 +185,7 @@ public:
                 return numericColumn(column) ? QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter))
                                              : QVariant();
             case Qt::ForegroundRole:
-                if (column != ColState)
+                if (column != stateColumn())
                     return {};
                 switch (state) {
                 case RowState::Limit: return toneColor(Tone::Error);
@@ -173,19 +199,21 @@ public:
             case kSortRole:
                 if (const wallet::AssetInfo* info = assetOf(column))
                     return model->total(info->asset, entry.id).toDouble(info->decimals);
+                if (column == usdColumn())
+                    return controller_->totalUsd(entry.id);
+                if (column == stateColumn())
+                    return int(state);
                 switch (column) {
                 case ColName: return entry.label;
                 case ColSource: return entry.fromKeys ? 1 : 0;
                 case ColAddresses: return counts.rows;
                 case ColFunded: return counts.funded;
-                case ColUsd: return controller_->totalUsd(entry.id);
-                case ColState: return int(state);
                 default: return {};
                 }
             case Qt::ToolTipRole:
                 if (column == ColName)
                     return entry.label;
-                if (column == ColState && state != RowState::UpToDate)
+                if (column == stateColumn() && state != RowState::UpToDate)
                     return status_; // the whole of it, as the title bar says it
                 if (const wallet::AssetInfo* info = assetOf(column); info && !watches(shown, *info))
                     return trText(QStringLiteral("This wallet has no key for this chain, so nothing was looked at."));
@@ -204,19 +232,10 @@ public:
                     return formatAmount(amount, *info);
                 return amount.isZero() ? dash() : atLeast(formatAmount(amount, *info));
             }
-            switch (column) {
-            case ColName:
-                return entry.label;
-            case ColSource:
-                return entry.fromKeys ? trText(QStringLiteral("Public keys")) : trText(QStringLiteral("Seed"));
-            case ColAddresses:
-                return formatCount(counts.rows);
-            case ColFunded:
-                return formatCount(counts.funded);
-            case ColUsd: {
+            if (column == usdColumn()) {
                 // An asset with a balance but no price would make the sum too low.
                 for (const wallet::AssetInfo& info : wallet::assets()) {
-                    if (!model->total(info.asset, entry.id).isZero() && controller_->prices()->usd(info.symbol) <= 0.0)
+                    if (!model->total(info.asset, entry.id).isZero() && controller_->prices()->usd(info.asset) <= 0.0)
                         return dash();
                 }
                 const double usd = controller_->totalUsd(entry.id);
@@ -224,7 +243,7 @@ public:
                     return formatUsd(usd);
                 return usd > 0.0 ? atLeast(formatUsd(usd)) : dash();
             }
-            case ColState:
+            if (column == stateColumn()) {
                 switch (state) {
                 case RowState::Limit: return trText(QStringLiteral("Address limit reached"));
                 case RowState::Scanning: return trText(QStringLiteral("Scanning"));
@@ -235,6 +254,16 @@ public:
                 }
                 return trText(QStringLiteral("Checking %1 of %2"))
                     .arg(formatCount(counts.checked), formatCount(counts.rows));
+            }
+            switch (column) {
+            case ColName:
+                return entry.label;
+            case ColSource:
+                return entry.fromKeys ? trText(QStringLiteral("Public keys")) : trText(QStringLiteral("Seed"));
+            case ColAddresses:
+                return formatCount(counts.rows);
+            case ColFunded:
+                return formatCount(counts.funded);
             default:
                 return {};
             }
@@ -245,18 +274,20 @@ public:
 
 private:
     struct Shown {
-        bool allRows = false;  // every account has rows
-        bool bitcoin = false;  // the wallet has a key on that chain
-        bool ethereum = false;
+        bool allRows = false;      // every account has rows
+        QSet<wallet::Network> networks; // the wallet has a key on these
     };
 
     static bool watches(const Shown& shown, const wallet::AssetInfo& info)
     {
-        return info.asset == wallet::Asset::BTC ? shown.bitcoin : shown.ethereum;
+        return shown.networks.contains(info.network);
     }
 
     RowState stateOf(const wallet::WalletCounts& counts, const Shown& shown) const
     {
+        // Part of what the database kept: no figure is whole yet.
+        if (loading_)
+            return RowState::Checking;
         if (limit_)
             return RowState::Limit;
         if (!shown.allRows || counts.rows == 0)
@@ -271,15 +302,20 @@ private:
         shown_.clear();
         if (!controller_)
             return;
+        loading_ = controller_->loadingSaved();
         limit_ = controller_->addressLimitReached();
-        current_ = controller_->balancesComplete();
+        current_ = controller_->figuresCurrent();
         scanning_ = controller_->isScanning();
         status_ = controller_->statusText();
         for (const wallet::WalletEntry& entry : std::as_const(wallets_)) {
             Shown shown;
             shown.allRows = controller_->walletHasAllRows(entry);
-            for (const wallet::AccountKey& key : entry.accounts)
-                (chain::isBitcoin(key.type) ? shown.bitcoin : shown.ethereum) = true;
+            for (const wallet::AccountKey& key : entry.accounts) {
+                for (const wallet::NetworkInfo& network : wallet::networks()) {
+                    if (key.serves(network.network))
+                        shown.networks.insert(network.network);
+                }
+            }
             shown_.insert(entry.id, shown);
         }
     }
@@ -287,6 +323,7 @@ private:
     WalletController* controller_ = nullptr;
     QList<wallet::WalletEntry> wallets_;
     QHash<quint32, Shown> shown_;
+    bool loading_ = false;  // the database is still handing over what it kept
     bool limit_ = false;    // the scan is cut at the address limit
     bool current_ = false;  // every balance is whole and current
     bool scanning_ = false;
@@ -410,7 +447,7 @@ WalletsPage::WalletsPage(WalletController* controller, QWidget* parent)
     connect(ui_->keys, &QPushButton::clicked, this, &WalletsPage::showKeysOfSelected);
 
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this] {
-        emit ui_->model->headerDataChanged(Qt::Horizontal, 0, ColumnCount - 1);
+        emit ui_->model->headerDataChanged(Qt::Horizontal, 0, columnTotal() - 1);
         ui_->model->repaintFigures();
         updateState();
     });
@@ -537,13 +574,17 @@ void WalletsPage::confirmRemoveSelected()
                                 QMessageBox::NoButton, this);
     box->setTextFormat(Qt::PlainText); // a name is never markup
     box->setInformativeText(
-        entry->fromKeys
+        (entry->fromKeys
             ? QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
                              "wallets stay as they are. Nothing changes on the blockchain, but this PC has "
                              "no seed for it: to add it back you need these keys, which Public keys shows now.")
             : QStringLiteral("GitWallet forgets its public keys and stops watching its addresses. The other "
                              "wallets stay as they are. Nothing changes on the blockchain: adding its seed "
-                             "again shows the same addresses."));
+                             "again shows the same addresses."))
+            + (controller_->walletFilesKeptAside() > 0
+                   ? QStringLiteral(" An older wallet file kept beside wallet.dat may still hold its keys, until Remove "
+                                    "all wallets in Settings.")
+                   : QString()));
     QPushButton* remove = box->addButton(QStringLiteral("Remove wallet"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));
     QPushButton* cancel = box->addButton(QMessageBox::Cancel);
@@ -587,6 +628,19 @@ void WalletsPage::showKeysOfSelected()
     for (const wallet::AccountKey& key : entry->accounts)
         form->addRow(accountLabel(key), makeXpubField(dialog, key));
     column->addLayout(form);
+    // Of a kind or network this version does not know: not scanned, and they go with the wallet.
+    for (const QJsonValue& kept : entry->keptAccounts) {
+        const QJsonObject key = kept.toObject();
+        auto* line = new QLabel(QStringLiteral("%1 (%2): %3")
+                                    .arg(key.value(QStringLiteral("type")).toString(),
+                                         trText(QStringLiteral("not scanned by this version")),
+                                         key.value(QStringLiteral("xpub")).toString()),
+                                dialog);
+        line->setWordWrap(true);
+        line->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        setTone(line, Tone::Warning);
+        column->addWidget(line);
+    }
     column->addStretch(1);
     auto* buttons = new QHBoxLayout;
     buttons->addStretch(1);

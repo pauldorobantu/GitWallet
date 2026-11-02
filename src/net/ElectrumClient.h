@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QDateTime>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -7,6 +8,7 @@
 #include <QList>
 #include <QObject>
 #include <QQueue>
+#include <QSet>
 #include <QString>
 
 #include <functional>
@@ -25,13 +27,10 @@ struct ElectrumServer {
     static bool fromString(const QString& text, ElectrumServer* out);
 };
 
-// Public servers whose TLS certificate verifies against the Windows CA store
-// and that answered Electrum protocol 1.4 with batch support in a probe on
-// 2026-10-31. Self-signed servers are deliberately not used: GitWallet always
-// verifies TLS.
-QList<ElectrumServer> defaultElectrumServers();
-
-// Electrum protocol client: JSON-RPC 2.0 over TLS, one JSON message per line.
+// Electrum protocol client: JSON-RPC 2.0 over TLS, one JSON message per line, for
+// one network: the list it is given says which. The built-in lists hold public
+// servers whose TLS certificate verifies against the Windows CA store. Self-signed
+// servers are deliberately not used: GitWallet always verifies TLS.
 // Talks to one server at a time and rotates through the list when a server
 // fails (connect error, TLS error, timeout, disconnect, a malformed or
 // unexpected message). A server whose session had proved itself is asked again
@@ -51,7 +50,12 @@ public:
     explicit ElectrumClient(QObject* parent = nullptr);
     ~ElectrumClient() override;
 
-    void setServers(const QList<ElectrumServer>& servers); // empty = defaultElectrumServers()
+    void setServers(const QList<ElectrumServer>& servers);
+    // The hash of the network's first block, as block explorers show it. A server that
+    // answers with another one is on another chain: it is left, and wrongChain() says so.
+    void setGenesis(const QString& hash) { genesis_ = hash; }
+    // Plain TCP, for a test's server on this PC. Everything else always verifies TLS.
+    void usePlainTcpForTest() { plainForTest_ = true; }
     void start(); // connect (async); ready() after the server.version handshake
     void stop();  // disconnect; pending replies get the error "stopped"
 
@@ -71,11 +75,29 @@ public:
     // Restored after a reconnect, and a status that changed while disconnected
     // is reported through scripthashChanged() as well.
     void subscribeScripthash(const QString& scripthash, Reply firstStatus);
+    // Lets one go. A server too old to know the call goes on sending what changes,
+    // which is ignored; it costs a place there until the connection ends. So does a
+    // notification already on its way.
+    void unsubscribeScripthash(const QString& scripthash);
+    // One the server refused: nothing to let go there, and no new connection is to ask for it.
+    void forgetScripthash(const QString& scripthash);
+
+    // This server will not do what it is asked: the next on the list gets the chance, each
+    // of them once, so what no server will do cannot keep the client hopping. False when
+    // none is left, and the client stays where it is.
+    bool tryAnotherServer(const QString& why);
+    // It does what it is asked: the next difficulty may move the client again.
+    void noteServerWorks() { movesAsked_ = 0; }
+    int serverCount() const { return int(servers_.size()); }
+    // When a server that could say anything of an address was last heard from, on the wall
+    // clock: a sleep counts, and a handshake with one on the way out does not.
+    QDateTime lastHeardAt() const { return lastHeardAt_; }
 
 signals:
     void ready(const QString& server);
     void connectionLost(const QString& reason);
     void scripthashChanged(const QString& scripthash, const QString& status); // "" = no history
+    void wrongChain(const QString& server);
     void tipChanged(int height);
     void log(const QString& line); // diagnostics; never carries keys or seeds
 
@@ -107,7 +129,10 @@ private:
     void handleLine(const QByteArray& line);
     void handleNotification(const QString& method, const QJsonArray& params);
     void handleVersionReply(const QJsonValue& result, const QString& error);
+    void handleGenesisReply(const QJsonValue& result, const QString& error);
     void handleHeadersReply(const QJsonValue& result, const QString& error);
+    void askHeaders();
+    qsizetype lineLimit() const; // the longest line that may come now
     void becomeReady(int height);
     void restoreSubscriptions();
     void sendPing();
@@ -136,6 +161,14 @@ private:
     QQueue<Pending> queue_;                 // not yet sent
     QHash<int, Pending> inFlight_;          // sent, awaiting a reply
     QHash<QString, QString> subscriptions_; // lowercase scripthash -> last known status ("" = null)
+    QSet<QString> letGo_;             // unsubscribed on this connection: what still comes for them is ignored
+    QString genesis_;                 // what the first block's hash must be; empty: not checked
+    bool plainForTest_ = false;
+    qint64 longLinesSinceMs_ = 0;     // start of the window longLineBytes_ counts in
+    qint64 longLineBytes_ = 0;        // bytes of long lines in that window
+    QDateTime lastHeardAt_;           // see lastHeardAt()
+    int movesAsked_ = 0;              // tryAnotherServer() since a server last did all it was asked
+    bool moving_ = false;             // this connection is about to be left for that
 
     QTimer* watchdogTimer_ = nullptr; // request + ping timeouts, every 5 s while ready
     ElectrumServer current_;          // the server socket_ talks to
@@ -150,6 +183,7 @@ private:
     qint64 unsolicitedSinceMs_ = 0;   // start of the window unsolicitedCount_ counts in
     qsizetype unsolicitedCount_ = 0;  // notifications and blank lines in that window
     int versionId_ = 0;               // ids of the internal requests in flight; 0 = none
+    int genesisId_ = 0;
     int headersId_ = 0;
     int pingId_ = 0;
     qint64 pingSentAtMs_ = 0;

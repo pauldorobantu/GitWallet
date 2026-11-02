@@ -1,5 +1,7 @@
 #include "net/ElectrumClient.h"
 
+#include "chain/Hash.h"
+
 #include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonParseError>
@@ -38,11 +40,17 @@ constexpr int kStickyWindowMs = 180'000;
 // A subscription the server refused is asked again on this many ping ticks
 // before the client looks for a server that accepts it.
 constexpr int kRefusedRetries = 2;
-// The longest line accepted. Every reply and notification of the methods this
-// client uses is well under 1 KB. Each line is parsed in full on the GUI thread
-// before its meaning is known, so this bounds what one line can cost in memory
-// and in time.
+// The longest line accepted. Every reply and notification of the methods this client
+// uses is well under 1 KB. Each line is parsed in full on the GUI thread before its
+// meaning is known, so this bounds what one line can cost in memory and in time.
 constexpr qsizetype kMaxLineBytes = qsizetype(1) * 1024 * 1024;
+// While a history is on its way: about 90 bytes per transaction, and servers stop giving
+// one well before this. Long lines are for that, and they are rationed: a server that
+// sends them one after another is keeping the window busy, and is left.
+constexpr qsizetype kMaxHistoryLineBytes = qsizetype(32) * 1024 * 1024;
+constexpr qsizetype kRationedLineBytes = qsizetype(64) * 1024;
+constexpr qint64 kMaxLongLineBytesPerMinute = qint64(128) * 1024 * 1024;
+constexpr int kLongLineWindowMs = 60'000;
 constexpr qsizetype kMaxServerText = 300;
 // Unsolicited lines (notifications, blank lines) a server may send per window:
 // two for every subscription plus the allowance. An honest server notifies when
@@ -53,6 +61,20 @@ constexpr qsizetype kUnsolicitedAllowance = 1'000;
 
 constexpr QLatin1String kScripthashSubscribe("blockchain.scripthash.subscribe");
 constexpr QLatin1String kHeadersSubscribe("blockchain.headers.subscribe");
+constexpr QLatin1String kGetHistory("blockchain.scripthash.get_history");
+
+// What a block header in hex hashes to, as explorers write it. Empty if it is no header.
+QString headerHash(const QString& hex)
+{
+    if (hex.size() != 160)
+        return {};
+    const QByteArray raw = QByteArray::fromHex(hex.toLatin1());
+    if (raw.size() != 80)
+        return {};
+    chain::Bytes hash = chain::dsha256(chain::Bytes(raw.cbegin(), raw.cend()));
+    std::reverse(hash.begin(), hash.end());
+    return QString::fromStdString(chain::toHex(hash));
+}
 
 // Timeouts need a clock that never jumps; the wall clock can (time-zone or
 // NTP corrections).
@@ -114,9 +136,9 @@ bool parseStatus(const QJsonValue& value, QString* status)
     return true;
 }
 
-QString tooLongText()
+QString tooLongText(qsizetype limit)
 {
-    return QStringLiteral("reply longer than %1 MB").arg(kMaxLineBytes / (1024 * 1024));
+    return QStringLiteral("reply longer than %1 MB").arg(limit / (1024 * 1024));
 }
 
 // Text a server sent ends up in the log and the UI: one line, bounded.
@@ -184,29 +206,11 @@ bool ElectrumServer::fromString(const QString& text, ElectrumServer* out)
     return true;
 }
 
-QList<ElectrumServer> defaultElectrumServers()
-{
-    // Preference order; the client rotates through it when a server fails.
-    return {
-        {QStringLiteral("electrum.jhoenicke.de"), 50002},
-        {QStringLiteral("e2.keff.org"), 50002},
-        {QStringLiteral("e.keff.org"), 50002},
-        {QStringLiteral("fulcrum.grey.pw"), 51002},
-        {QStringLiteral("electrum.hodlister.co"), 50002},
-        {QStringLiteral("electrum.blockstream.info"), 50002},
-        {QStringLiteral("blackie.c3-soft.com"), 57002},
-        {QStringLiteral("electrum.diynodes.com"), 50022},
-        {QStringLiteral("blockstream.info"), 700},
-    };
-}
-
 // ------------------------------------------------------------- client ----
 
 ElectrumClient::ElectrumClient(QObject* parent)
     : QObject(parent)
 {
-    servers_ = defaultElectrumServers();
-
     pingTimer_ = new QTimer(this);
     pingTimer_->setInterval(kPingIntervalMs);
     connect(pingTimer_, &QTimer::timeout, this, [this] {
@@ -250,10 +254,10 @@ ElectrumClient::~ElectrumClient()
 
 void ElectrumClient::setServers(const QList<ElectrumServer>& servers)
 {
-    const QList<ElectrumServer> list = servers.isEmpty() ? defaultElectrumServers() : servers;
-    if (sameServers(list, servers_))
+    if (sameServers(servers, servers_))
         return;
-    servers_ = list;
+    servers_ = servers;
+    movesAsked_ = 0;
     serverIndex_ = -1; // the next connection starts at the first server
     goodIndex_ = -1;
     stickyUntilMs_ = 0;
@@ -269,11 +273,10 @@ void ElectrumClient::start()
     if (running_)
         return;
     running_ = true;
+    movesAsked_ = 0;
     backoffMs_ = kFirstBackoffMs;
     stickyUntilMs_ = 0;
     refusalSwitches_ = 0;
-    if (servers_.isEmpty())
-        servers_ = defaultElectrumServers();
     // Begin with the server that last completed a handshake (the first one if
     // none has); failures rotate onwards from there.
     serverIndex_ = goodIndex_ >= 0 ? goodIndex_ - 1 : -1;
@@ -313,7 +316,7 @@ void ElectrumClient::stop()
 
 QString ElectrumClient::serverName() const
 {
-    return socket_ && socket_->isEncrypted() ? current_.toString() : QString();
+    return socket_ && (socket_->isEncrypted() || (plainForTest_ && ready_)) ? current_.toString() : QString();
 }
 
 void ElectrumClient::request(const QString& method, const QJsonArray& params, Reply reply)
@@ -327,11 +330,47 @@ void ElectrumClient::request(const QString& method, const QJsonArray& params, Re
     pump();
 }
 
+void ElectrumClient::unsubscribeScripthash(const QString& scripthash)
+{
+    const QString key = scripthash.toLower();
+    subscriptions_.remove(key);
+    refused_.remove(key);
+    if (!ready_)
+        return; // a new connection starts without it anyway
+    letGo_.insert(key);
+    // Nobody waits for the answer: an old server's "unknown method" changes nothing.
+    request(QStringLiteral("blockchain.scripthash.unsubscribe"), QJsonArray{key}, [](const QJsonValue&, const QString&) {});
+}
+
+void ElectrumClient::forgetScripthash(const QString& scripthash)
+{
+    const QString key = scripthash.toLower();
+    subscriptions_.remove(key);
+    refused_.remove(key);
+}
+
+bool ElectrumClient::tryAnotherServer(const QString& why)
+{
+    if (moving_)
+        return true;
+    if (!ready_ || !socket_ || movesAsked_ >= servers_.size() - 1)
+        return false;
+    ++movesAsked_;
+    moving_ = true;
+    // From the event loop: the caller is in the middle of one of this connection's replies.
+    QTimer::singleShot(0, this, [this, why, gen = generation_] {
+        if (gen == generation_)
+            failConnection(why, Blame::Server);
+    });
+    return true;
+}
+
 void ElectrumClient::subscribeScripthash(const QString& scripthash, Reply firstStatus)
 {
     // One spelling for the list, the request and the notifications, which the
     // servers send in lowercase hex.
     const QString key = scripthash.toLower();
+    letGo_.remove(key);
     // Listed now, not on the reply: if the server refuses it, the next
     // connection tries again.
     if (!subscriptions_.contains(key))
@@ -358,7 +397,7 @@ void ElectrumClient::connectNext()
     if (!running_ || socket_)
         return;
     if (servers_.isEmpty())
-        servers_ = defaultElectrumServers();
+        return; // the scanner sets its network's list before it starts this
     const int count = static_cast<int>(servers_.size());
     // The same server again while the window failConnection() opened after a
     // working session lasts; otherwise the next one in the list.
@@ -381,8 +420,11 @@ void ElectrumClient::connectNext()
     sock->setPeerVerifyMode(QSslSocket::VerifyPeer);
     // `sock == socket_` guards against signals of a socket already replaced.
     connect(sock, &QAbstractSocket::connected, this, [this, sock] {
-        if (sock == socket_)
-            handshakeTimer_->start(kHandshakeTimeoutMs); // TCP is up: TLS gets a budget of its own
+        if (sock != socket_)
+            return;
+        handshakeTimer_->start(kHandshakeTimeoutMs); // TCP is up: TLS gets a budget of its own
+        if (plainForTest_)
+            onEncrypted();
     });
     connect(sock, &QSslSocket::encrypted, this, [this, sock] {
         if (sock == socket_)
@@ -415,7 +457,10 @@ void ElectrumClient::connectNext()
     // fail, inside connectToHostEncrypted(); connected() then restarts this
     // timer, failConnection() stops it.
     handshakeTimer_->start(kConnectTimeoutMs);
-    sock->connectToHostEncrypted(current_.host, current_.port);
+    if (plainForTest_)
+        sock->connectToHost(current_.host, current_.port);
+    else
+        sock->connectToHostEncrypted(current_.host, current_.port);
 }
 
 void ElectrumClient::onEncrypted()
@@ -424,8 +469,9 @@ void ElectrumClient::onEncrypted()
     socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     handshakeTimer_->start(kHandshakeTimeoutMs);
     versionId_ = takeId();
+    // A range: 1.4.2 is where blockchain.scripthash.unsubscribe comes in.
     sendJson(makeRequest(versionId_, QStringLiteral("server.version"),
-                         QJsonArray{QStringLiteral("GitWallet 0.1"), QStringLiteral("1.4")}));
+                         QJsonArray{QStringLiteral("GitWallet 0.2"), QJsonArray{QStringLiteral("1.4"), QStringLiteral("1.4.2")}}));
 }
 
 void ElectrumClient::handleVersionReply(const QJsonValue& result, const QString& error)
@@ -437,6 +483,34 @@ void ElectrumClient::handleVersionReply(const QJsonValue& result, const QString&
     }
     const QJsonArray version = result.toArray(); // [software, protocol]
     serverSoftware_ = version.isEmpty() ? QString() : clipped(version.at(0).toString());
+    if (genesis_.isEmpty()) {
+        askHeaders();
+        return;
+    }
+    // Is this server on our chain at all? Another chain's server (a line in Settings,
+    // testnet or a fork) has a valid certificate too, and would call every address empty.
+    genesisId_ = takeId();
+    sendJson(makeRequest(genesisId_, QStringLiteral("blockchain.block.header"), QJsonArray{0}));
+}
+
+void ElectrumClient::handleGenesisReply(const QJsonValue& result, const QString& error)
+{
+    genesisId_ = 0;
+    if (!error.isEmpty()) {
+        failConnection(QStringLiteral("blockchain.block.header refused: %1").arg(error), Blame::Server);
+        return;
+    }
+    if (headerHash(result.toString()) != genesis_) {
+        const QString server = current_.toString();
+        failConnection(QStringLiteral("it answers for another chain"), Blame::Server);
+        emit wrongChain(server);
+        return;
+    }
+    askHeaders();
+}
+
+void ElectrumClient::askHeaders()
+{
     headersId_ = takeId();
     sendJson(makeRequest(headersId_, QString(kHeadersSubscribe), QJsonArray()));
 }
@@ -460,6 +534,7 @@ void ElectrumClient::becomeReady(int height)
 {
     handshakeTimer_->stop();
     ready_ = true;
+    lastHeardAt_ = QDateTime::currentDateTime();
     // The backoff is not reset here but once the session proves stable
     // (noteStable()): a server that completes the handshake and then drops the
     // session would otherwise get a new connection, and every subscription
@@ -583,11 +658,11 @@ void ElectrumClient::retryRefused()
         else
             ++stuck;
     }
-    // Refused every time: another server may watch it (ElectrumX limits
-    // history size and subscription counts, Blockstream's electrs limits
-    // history length, Fulcrum's limits are higher). Each server in the list
-    // gets one chance, so a scripthash that every server refuses cannot keep
-    // the client hopping.
+    // What it restored by itself, refused every time: another server may watch it
+    // (ElectrumX limits history size and subscription counts, Blockstream's electrs
+    // limits history length, Fulcrum's limits are higher). Each server in the list gets
+    // one chance, so a scripthash that every server refuses cannot keep the client
+    // hopping. What a caller subscribed is the caller's to judge: tryAnotherServer().
     if (stuck > 0 && refusalSwitches_ < servers_.size() - 1) {
         ++refusalSwitches_;
         failConnection(QStringLiteral("refused %1 subscription(s) (%2)").arg(QString::number(stuck), lastRefusal_),
@@ -677,10 +752,15 @@ void ElectrumClient::resetConnectionState()
     buffer_.clear();
     scanFrom_ = 0;
     versionId_ = 0;
+    genesisId_ = 0;
     headersId_ = 0;
     pingId_ = 0;
     serverSoftware_.clear();
     stable_ = false;
+    moving_ = false;
+    letGo_.clear();
+    longLineBytes_ = 0;
+    longLinesSinceMs_ = monotonicMs();
     lastReceivedMs_ = 0;
     unsolicitedSinceMs_ = monotonicMs();
     unsolicitedCount_ = 0;
@@ -797,8 +877,11 @@ void ElectrumClient::checkTimeouts()
 void ElectrumClient::onReadyRead()
 {
     const QByteArray data = socket_->readAll();
-    if (!data.isEmpty())
+    if (!data.isEmpty()) {
         lastReceivedMs_ = monotonicMs();
+        if (ready_)
+            lastHeardAt_ = QDateTime::currentDateTime();
+    }
     buffer_.append(data);
 
     const quint64 gen = generation_;
@@ -807,9 +890,22 @@ void ElectrumClient::onReadyRead()
         const qsizetype newline = buffer_.indexOf('\n', scanFrom_);
         if (newline < 0)
             break;
-        if (newline > kMaxLineBytes) {
-            failConnection(tooLongText(), Blame::Server);
+        const qsizetype limit = newline > kMaxLineBytes ? lineLimit() : kMaxLineBytes;
+        if (newline > limit) {
+            failConnection(tooLongText(limit), Blame::Server);
             return;
+        }
+        if (newline > kRationedLineBytes) {
+            const qint64 now = monotonicMs();
+            if (now - longLinesSinceMs_ >= kLongLineWindowMs) {
+                longLinesSinceMs_ = now;
+                longLineBytes_ = 0;
+            }
+            longLineBytes_ += newline;
+            if (longLineBytes_ > kMaxLongLineBytesPerMinute) {
+                failConnection(QStringLiteral("too many long replies"), Blame::Server);
+                return;
+            }
         }
         // Each line leaves the buffer before it is handled, so whatever its
         // callbacks do, it is never handled twice.
@@ -829,10 +925,22 @@ void ElectrumClient::onReadyRead()
     }
     scanFrom_ = buffer_.size(); // the next search starts at the new data only
     if (buffer_.size() > kMaxLineBytes) {
-        failConnection(tooLongText(), Blame::Server);
-        return;
+        const qsizetype limit = lineLimit();
+        if (buffer_.size() > limit) {
+            failConnection(tooLongText(limit), Blame::Server);
+            return;
+        }
     }
     pump();
+}
+
+qsizetype ElectrumClient::lineLimit() const
+{
+    for (const Pending& p : inFlight_) {
+        if (p.method == kGetHistory)
+            return kMaxHistoryLineBytes;
+    }
+    return kMaxLineBytes;
 }
 
 void ElectrumClient::handleLine(const QByteArray& line)
@@ -904,6 +1012,10 @@ void ElectrumClient::handleMessage(const QJsonObject& message)
         handleVersionReply(result, error);
         return;
     }
+    if (id == genesisId_) {
+        handleGenesisReply(result, error);
+        return;
+    }
     if (id == headersId_) {
         handleHeadersReply(result, error);
         return;
@@ -946,6 +1058,10 @@ void ElectrumClient::handleNotification(const QString& method, const QJsonArray&
         const QString scripthash = params.at(0).toString().toLower();
         const auto it = subscriptions_.find(scripthash);
         if (it == subscriptions_.end()) {
+            // Let go on this connection: a server too old for that goes on telling, and
+            // one that knows the call may have sent this before it read it.
+            if (letGo_.contains(scripthash))
+                return;
             // Never subscribed: a server must not grow the list restored on the next one.
             failConnection(QStringLiteral("notification for a scripthash never subscribed"), Blame::Server);
             return;

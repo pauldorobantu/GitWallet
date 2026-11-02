@@ -2,6 +2,8 @@
 
 #include "chain/Hash.h"
 
+#include <botan/system_rng.h>
+
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QDir>
@@ -38,16 +40,18 @@ namespace wallet {
 
 namespace {
 
-constexpr int kFormatVersion = 2;
-constexpr int kLegacyFormatVersion = 1;   // one wallet: "label" + "accounts" at the top
-constexpr qint64 kMaxFileBytes = 1 << 20; // under 1 KB per wallet, so kMaxWallets fit with room to spare
-constexpr qsizetype kMaxXpubChars = 128;  // a serialized extended key is 111 chars
+constexpr int kFormatVersion = 3;
+constexpr int kLegacyFormatVersion = 1;    // one wallet: "label" + "accounts" at the top
+constexpr qint64 kMaxFileBytes = 16 << 20; // room for the account keys of every network kMaxWallets may hold
+constexpr qsizetype kMaxXpubChars = 128;   // a serialized extended key is 111 chars
+constexpr qsizetype kDatabaseKeyBytes = 32;
 
 // A server list holds a handful of host:port entries or URLs. The caps bound
-// the worst case (2 lists x 100 x 512 chars, at most 6 JSON bytes per char)
-// near 600 KB, well inside kMaxFileBytes.
+// the worst case (32 lists x 100 x 512 chars, at most 6 JSON bytes per char)
+// near 10 MB, inside kMaxFileBytes.
 constexpr qsizetype kMaxListEntries = 100;
 constexpr qsizetype kMaxEntryChars = 512;
+constexpr qsizetype kMaxServerLists = 32;
 
 constexpr size_t kBip39Rounds = 2048; // PBKDF2 iterations fixed by BIP39
 
@@ -57,18 +61,12 @@ constexpr int kMaxGap = 5000;
 constexpr int kMinRefresh = 15;
 constexpr int kMaxRefresh = 3600;
 
-// The accounts an import derives, in the order they are stored and shown.
-constexpr chain::ScriptType kAccountTypes[] = {
-    chain::ScriptType::P2WPKH,
-    chain::ScriptType::P2SH_P2WPKH,
-    chain::ScriptType::P2PKH,
-    chain::ScriptType::EthAccount,
-};
-
 struct StoreData {
     QList<WalletEntry> wallets;
     quint32 nextWalletId = 1;
     ScanSettings settings;
+    QByteArray databaseKey;
+    int format = 0;
 };
 
 QString& dataDirOverride()
@@ -174,24 +172,15 @@ bool unprotect(const QByteArray& blob, QByteArray* plainOut, DWORD* codeOut)
 
 QString typeId(chain::ScriptType t)
 {
-    switch (t) {
-    case chain::ScriptType::P2WPKH:      return QStringLiteral("p2wpkh");
-    case chain::ScriptType::P2SH_P2WPKH: return QStringLiteral("p2sh-p2wpkh");
-    case chain::ScriptType::P2PKH:       return QStringLiteral("p2pkh");
-    case chain::ScriptType::EthAccount:  return QStringLiteral("ethereum");
-    }
-    return QStringLiteral("unknown");
+    return QLatin1String(chain::scriptTypeId(t));
 }
 
-bool typeFromId(const QString& id, chain::ScriptType* out)
+// The network a UTXO type's key is on, or Bitcoin's when the file does not say, wherever
+// the list puts Bitcoin.
+const NetworkInfo* utxoNetwork(const QJsonObject& o)
 {
-    for (const chain::ScriptType t : kAccountTypes) {
-        if (id == typeId(t)) {
-            *out = t;
-            return true;
-        }
-    }
-    return false;
+    const QString id = o.value(QStringLiteral("network")).toString();
+    return findNetwork(id.isEmpty() ? QStringLiteral("bitcoin") : id);
 }
 
 QString versionName(uint32_t version)
@@ -240,7 +229,8 @@ bool checkAccounts(const QList<AccountKey>& accounts, QString* why)
     QSet<QString> seen;
     for (const AccountKey& k : accounts) {
         if (!checkAccount(k, why)) return false;
-        const QString id = typeId(k.type) + QLatin1Char('/') + QString::number(k.account);
+        const QString id = typeId(k.type) + QLatin1Char('/') + QString::number(int(k.network)) + QLatin1Char('/')
+                           + QString::number(k.account);
         if (seen.contains(id))
             return fail(why, QStringLiteral("the %1 account %2 is listed twice")
                                  .arg(QString::fromLatin1(chain::scriptTypeName(k.type)))
@@ -262,13 +252,14 @@ bool checkWallets(const QList<WalletEntry>& wallets, QString* why)
         if (w.id == 0 || ids.contains(w.id))
             return fail(why, QStringLiteral("a wallet has a missing or repeated number"));
         ids.insert(w.id);
-        if (w.accounts.isEmpty())
+        // One whose keys are all of a kind this version does not know is still a wallet.
+        if (w.accounts.isEmpty() && w.keptAccounts.isEmpty())
             return fail(why, QStringLiteral("a wallet has no account keys"));
         if (!checkAccounts(w.accounts, why)) return false;
         for (const AccountKey& k : w.accounts) {
             // With its type: the same text is another set of addresses as a legacy
-            // account and as an Ethereum one.
-            const QString key = typeId(k.type) + QLatin1Char('/') + k.xpub;
+            // account and as an Ethereum one, or on another network.
+            const QString key = typeId(k.type) + QLatin1Char('/') + QString::number(int(k.network)) + QLatin1Char('/') + k.xpub;
             if (keys.contains(key))
                 return fail(why, QStringLiteral("an account key is listed in two wallets"));
             keys.insert(key);
@@ -317,12 +308,17 @@ QStringList cleanList(const QStringList& in)
 
 ScanSettings sanitized(ScanSettings s)
 {
-    s.btcReceiveGap = std::clamp(s.btcReceiveGap, kMinGap, kMaxGap);
-    s.btcChangeGap = std::clamp(s.btcChangeGap, kMinGap, kMaxGap);
-    s.ethGap = std::clamp(s.ethGap, kMinGap, kMaxGap);
-    s.ethRefreshSeconds = std::clamp(s.ethRefreshSeconds, kMinRefresh, kMaxRefresh);
-    s.electrumServers = cleanList(s.electrumServers);
-    s.ethEndpoints = cleanList(s.ethEndpoints);
+    s.utxoReceiveGap = std::clamp(s.utxoReceiveGap, kMinGap, kMaxGap);
+    s.utxoChangeGap = std::clamp(s.utxoChangeGap, kMinGap, kMaxGap);
+    s.evmGap = std::clamp(s.evmGap, kMinGap, kMaxGap);
+    s.evmRefreshSeconds = std::clamp(s.evmRefreshSeconds, kMinRefresh, kMaxRefresh);
+    QMap<QString, QStringList> servers;
+    for (auto it = s.servers.cbegin(); it != s.servers.cend() && servers.size() < kMaxServerLists; ++it) {
+        const QStringList clean = cleanList(it.value());
+        if (!clean.isEmpty() && it.key().size() <= kMaxEntryChars)
+            servers.insert(it.key(), clean);
+    }
+    s.servers = servers;
     return s;
 }
 
@@ -337,6 +333,12 @@ int readInt(const QJsonObject& o, const QString& key, int fallback)
     return static_cast<int>(std::clamp(d, -1.0e9, 1.0e9)); // keeps the conversion defined
 }
 
+// The field under its name, or its name in format 2 and before.
+int readSetting(const QJsonObject& o, const QString& key, const QString& oldKey, int fallback)
+{
+    return readInt(o, key, readInt(o, oldKey, fallback));
+}
+
 QStringList readList(const QJsonObject& o, const QString& key)
 {
     QStringList out;
@@ -348,7 +350,8 @@ QStringList readList(const QJsonObject& o, const QString& key)
 
 // ------------------------------------------------------------ file body ----
 
-QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const ScanSettings& s)
+QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const ScanSettings& s,
+                  const QByteArray& databaseKey)
 {
     QJsonArray entries;
     for (const WalletEntry& w : wallets) {
@@ -356,10 +359,14 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
         for (const AccountKey& k : w.accounts) {
             QJsonObject a;
             a.insert(QStringLiteral("type"), typeId(k.type));
+            if (chain::isUtxo(k.type))
+                a.insert(QStringLiteral("network"), networkInfo(k.network).id);
             a.insert(QStringLiteral("account"), static_cast<qint64>(k.account));
             a.insert(QStringLiteral("xpub"), k.xpub);
             list.append(a);
         }
+        for (const QJsonValue& kept : w.keptAccounts)
+            list.append(kept);
         QJsonObject entry;
         entry.insert(QStringLiteral("id"), static_cast<qint64>(w.id));
         entry.insert(QStringLiteral("label"), labelOrDefault(w.label));
@@ -369,12 +376,14 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
     }
 
     QJsonObject settings;
-    settings.insert(QStringLiteral("btcReceiveGap"), s.btcReceiveGap);
-    settings.insert(QStringLiteral("btcChangeGap"), s.btcChangeGap);
-    settings.insert(QStringLiteral("ethGap"), s.ethGap);
-    settings.insert(QStringLiteral("ethRefreshSeconds"), s.ethRefreshSeconds);
-    settings.insert(QStringLiteral("electrumServers"), QJsonArray::fromStringList(s.electrumServers));
-    settings.insert(QStringLiteral("ethEndpoints"), QJsonArray::fromStringList(s.ethEndpoints));
+    settings.insert(QStringLiteral("utxoReceiveGap"), s.utxoReceiveGap);
+    settings.insert(QStringLiteral("utxoChangeGap"), s.utxoChangeGap);
+    settings.insert(QStringLiteral("evmGap"), s.evmGap);
+    settings.insert(QStringLiteral("evmRefreshSeconds"), s.evmRefreshSeconds);
+    QJsonObject servers;
+    for (auto it = s.servers.cbegin(); it != s.servers.cend(); ++it)
+        servers.insert(it.key(), QJsonArray::fromStringList(it.value()));
+    settings.insert(QStringLiteral("servers"), servers);
 
     QJsonObject root;
     root.insert(QStringLiteral("format"), QStringLiteral("gitwallet"));
@@ -382,12 +391,18 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
     root.insert(QStringLiteral("nextWalletId"), static_cast<qint64>(nextWalletId));
     root.insert(QStringLiteral("wallets"), entries);
     root.insert(QStringLiteral("settings"), settings);
+    if (!databaseKey.isEmpty())
+        root.insert(QStringLiteral("databaseKey"), QString::fromLatin1(databaseKey.toHex()));
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
 }
 
-// An "accounts" array as both formats write it, each key marked as `wallet`'s.
-// False + why when it is not one.
-bool readAccounts(const QJsonValue& value, quint32 wallet, QList<AccountKey>* out, QString* why)
+// An "accounts" array as every format writes it, each key marked as `wallet`'s. A key
+// of a type or network this version does not know goes to `kept`, to stay in the file
+// unread: a newer version wrote it, or a network is gone from the list for now. Before
+// format 3 there were none, so then it means damage. False + why when it is not an
+// account list.
+bool readAccounts(const QJsonValue& value, quint32 wallet, bool keepUnknown, QList<AccountKey>* out, QJsonArray* kept,
+                  QString* why)
 {
     if (!value.isArray()) return fail(why, QStringLiteral("it has no account list"));
     const QJsonArray entries = value.toArray();
@@ -395,8 +410,21 @@ bool readAccounts(const QJsonValue& value, quint32 wallet, QList<AccountKey>* ou
         const QJsonObject o = entry.toObject(); // empty for a non-object: fails below
         AccountKey k;
         k.wallet = wallet;
-        if (!typeFromId(o.value(QStringLiteral("type")).toString(), &k.type))
-            return fail(why, QStringLiteral("an account has an unknown type"));
+        bool known = chain::scriptTypeFromId(o.value(QStringLiteral("type")).toString().toStdString(), &k.type);
+        if (known && chain::isUtxo(k.type)) {
+            const NetworkInfo* network = utxoNetwork(o);
+            known = network && network->family == Family::Utxo;
+            if (known)
+                k.network = network->network;
+        } else if (known && !firstOf(Family::Evm)) {
+            known = false; // a key no scanner here would ever follow
+        }
+        if (!known) {
+            if (!keepUnknown || !o.value(QStringLiteral("type")).isString() || !o.value(QStringLiteral("xpub")).isString())
+                return fail(why, QStringLiteral("an account has an unknown type"));
+            kept->append(o);
+            continue;
+        }
         if (!readAccountIndex(o.value(QStringLiteral("account")), &k.account))
             return fail(why, QStringLiteral("an account has an invalid number"));
         k.xpub = o.value(QStringLiteral("xpub")).toString();
@@ -427,7 +455,9 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
                                           "(format %2). Update GitWallet to open it.")
                                .arg(nativePath(path), QString::number(version.toDouble())));
     const bool legacy = version.isDouble() && version.toDouble() == kLegacyFormatVersion;
-    if (!version.isDouble() || (!legacy && version.toDouble() != kFormatVersion))
+    const bool known = version.isDouble() && version.toDouble() >= kLegacyFormatVersion
+                       && version.toDouble() <= kFormatVersion && version.toDouble() == std::floor(version.toDouble());
+    if (!known)
         return damaged(QStringLiteral("unsupported format version"));
 
     QString why;
@@ -439,7 +469,7 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
         WalletEntry only;
         only.id = 1;
         only.label = labelOrDefault(root.value(QStringLiteral("label")).toString());
-        if (!readAccounts(root.value(QStringLiteral("accounts")), only.id, &only.accounts, &why))
+        if (!readAccounts(root.value(QStringLiteral("accounts")), only.id, false, &only.accounts, &only.keptAccounts, &why))
             return damaged(why);
         if (!only.accounts.isEmpty()) wallets.append(only);
         nextId = 2;
@@ -454,7 +484,8 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
                 return damaged(QStringLiteral("a wallet has an invalid number"));
             w.label = labelOrDefault(o.value(QStringLiteral("label")).toString());
             w.fromKeys = o.value(QStringLiteral("fromKeys")).toBool();
-            if (!readAccounts(o.value(QStringLiteral("accounts")), w.id, &w.accounts, &why))
+            if (!readAccounts(o.value(QStringLiteral("accounts")), w.id, version.toDouble() >= kFormatVersion, &w.accounts,
+                              &w.keptAccounts, &why))
                 return damaged(why);
             nextId = std::max(nextId, w.id + 1);
             wallets.append(w);
@@ -470,16 +501,32 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
     const QJsonObject so = root.value(QStringLiteral("settings")).toObject();
     const ScanSettings defaults;
     ScanSettings s;
-    s.btcReceiveGap = readInt(so, QStringLiteral("btcReceiveGap"), defaults.btcReceiveGap);
-    s.btcChangeGap = readInt(so, QStringLiteral("btcChangeGap"), defaults.btcChangeGap);
-    s.ethGap = readInt(so, QStringLiteral("ethGap"), defaults.ethGap);
-    s.ethRefreshSeconds = readInt(so, QStringLiteral("ethRefreshSeconds"), defaults.ethRefreshSeconds);
-    s.electrumServers = readList(so, QStringLiteral("electrumServers"));
-    s.ethEndpoints = readList(so, QStringLiteral("ethEndpoints"));
+    s.utxoReceiveGap = readSetting(so, QStringLiteral("utxoReceiveGap"), QStringLiteral("btcReceiveGap"), defaults.utxoReceiveGap);
+    s.utxoChangeGap = readSetting(so, QStringLiteral("utxoChangeGap"), QStringLiteral("btcChangeGap"), defaults.utxoChangeGap);
+    s.evmGap = readSetting(so, QStringLiteral("evmGap"), QStringLiteral("ethGap"), defaults.evmGap);
+    s.evmRefreshSeconds =
+        readSetting(so, QStringLiteral("evmRefreshSeconds"), QStringLiteral("ethRefreshSeconds"), defaults.evmRefreshSeconds);
+    const QJsonObject servers = so.value(QStringLiteral("servers")).toObject();
+    for (auto it = servers.constBegin(); it != servers.constEnd(); ++it)
+        s.servers.insert(it.key(), readList(servers, it.key()));
+    // Format 2 and before: one list for each of the two networks there were.
+    const QStringList oldElectrum = readList(so, QStringLiteral("electrumServers"));
+    if (!oldElectrum.isEmpty())
+        s.servers.insert(QStringLiteral("bitcoin"), oldElectrum);
+    const QStringList oldEndpoints = readList(so, QStringLiteral("ethEndpoints"));
+    if (!oldEndpoints.isEmpty())
+        s.servers.insert(QStringLiteral("ethereum"), oldEndpoints);
+
+    // One that cannot be used counts as none: a new one comes with the next save, and
+    // a database under another key is kept aside.
+    const QByteArray databaseKey =
+        QByteArray::fromHex(root.value(QStringLiteral("databaseKey")).toString().toLatin1());
 
     out->wallets = std::move(wallets);
     out->nextWalletId = nextId;
     out->settings = sanitized(s);
+    out->databaseKey = databaseKey.size() == kDatabaseKeyBytes ? databaseKey : QByteArray();
+    out->format = int(version.toDouble());
     return true;
 }
 
@@ -541,6 +588,18 @@ QString WalletStore::filePath()
     return dataDir() + QStringLiteral("/wallet.dat");
 }
 
+QString WalletStore::databasePath()
+{
+    return dataDir() + QStringLiteral("/wallet.db");
+}
+
+QByteArray WalletStore::newDatabaseKey()
+{
+    QByteArray key(kDatabaseKeyBytes, Qt::Uninitialized);
+    Botan::system_rng().randomize(reinterpret_cast<uint8_t*>(key.data()), size_t(key.size()));
+    return key;
+}
+
 bool WalletStore::exists() const
 {
     return QFileInfo(filePath()).isFile();
@@ -581,6 +640,8 @@ bool WalletStore::load(QString* error)
     wallets = std::move(data.wallets);
     nextWalletId_ = data.nextWalletId;
     settings = std::move(data.settings);
+    databaseKey = std::move(data.databaseKey);
+    olderFormat_ = data.format < kFormatVersion ? data.format : 0;
     return true;
 }
 
@@ -595,7 +656,7 @@ bool WalletStore::save(QString* error, QByteArray* digest) const
 
     QByteArray blob;
     {
-        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings));
+        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings), databaseKey);
         const auto wipe = qScopeGuard([&json] { scrub(json); });
         DWORD code = 0;
         if (!protect(json, &blob, &code))
@@ -695,6 +756,8 @@ QByteArray WalletStore::addressSetId(const AccountKey& key)
     const chain::HdPubKey node = key.node();
     QByteArray id;
     id.append(char(static_cast<int>(key.type)));
+    id.append(char(static_cast<int>(key.network) & 0xFF)); // the same key is other addresses on another network
+    id.append(char(static_cast<int>(key.network) >> 8));
     id.append(reinterpret_cast<const char*>(node.publicKey().data()), qsizetype(node.publicKey().size()));
     id.append(reinterpret_cast<const char*>(node.chainCode().data()), qsizetype(node.chainCode().size()));
     return id;
@@ -732,6 +795,11 @@ bool WalletStore::accountsFromPublicKeys(const QStringList& bitcoinKeys, const Q
 
         AccountKey key;
         key.account = node.childNumber() & ~kHardened;
+        const NetworkInfo* utxo = findNetwork(QStringLiteral("bitcoin"));
+        if (ethereum ? !firstOf(Family::Evm) : !utxo)
+            return fail(why, QStringLiteral("%1: this build follows no network for it.").arg(name));
+        if (!ethereum)
+            key.network = utxo->network;
         if (ethereum) {
             if (version != chain::xpubVersion::kXpub)
                 return fail(why, QStringLiteral("%1 must be an xpub: an Ethereum account has no zpub or ypub.").arg(name));
@@ -781,12 +849,15 @@ QList<AccountKey> WalletStore::deriveAccounts(const std::vector<std::string>& wo
     const chain::HdKey master = chain::HdKey::fromSeed(seed);
 
     QList<AccountKey> out;
-    for (const chain::ScriptType t : kAccountTypes) {
-        const chain::HdKey node = master.derivePath(chain::accountRootPath(t, 0));
+    for (const CapturedAccount& captured : capturedAccounts()) {
+        const chain::AddressFormat& format =
+            chain::isUtxo(captured.type) ? networkInfo(captured.network).format : chain::defaultFormat(captured.type);
+        const chain::HdKey node = master.derivePath(chain::accountRootPath(captured.type, 0, format));
         AccountKey key;
-        key.type = t;
+        key.type = captured.type;
+        key.network = captured.network;
         key.account = 0;
-        key.xpub = QString::fromStdString(node.neuter().serialize(chain::xpubVersionFor(t)));
+        key.xpub = QString::fromStdString(node.neuter().serialize(chain::xpubVersionFor(captured.type)));
         out.append(key);
     }
     return out;

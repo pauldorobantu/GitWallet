@@ -9,15 +9,16 @@ namespace chain {
 
 namespace {
 
-// purpose', coin' for each type.
-void coinParams(ScriptType t, uint32_t& purpose, uint32_t& coin)
+// BIP43 purpose of each type.
+uint32_t purposeOf(ScriptType t)
 {
     switch (t) {
-    case ScriptType::P2PKH:       purpose = 44; coin = 0;  break;
-    case ScriptType::P2SH_P2WPKH: purpose = 49; coin = 0;  break;
-    case ScriptType::P2WPKH:      purpose = 84; coin = 0;  break;
-    case ScriptType::EthAccount:  purpose = 44; coin = 60; break;
+    case ScriptType::P2PKH:       return 44;
+    case ScriptType::P2SH_P2WPKH: return 49;
+    case ScriptType::P2WPKH:      return 84;
+    case ScriptType::EthAccount:  return 44;
     }
+    return 44;
 }
 
 std::string reverseHex(const Bytes& b)
@@ -25,6 +26,9 @@ std::string reverseHex(const Bytes& b)
     Bytes r(b.rbegin(), b.rend());
     return toHex(r);
 }
+
+constexpr ScriptType kAllTypes[] = {ScriptType::P2PKH, ScriptType::P2SH_P2WPKH, ScriptType::P2WPKH,
+                                    ScriptType::EthAccount};
 
 } // namespace
 
@@ -39,9 +43,38 @@ const char* scriptTypeName(ScriptType t)
     return "?";
 }
 
-bool isBitcoin(ScriptType t)
+const char* scriptTypeId(ScriptType t)
+{
+    switch (t) {
+    case ScriptType::P2PKH:       return "p2pkh";
+    case ScriptType::P2SH_P2WPKH: return "p2sh-p2wpkh";
+    case ScriptType::P2WPKH:      return "p2wpkh";
+    case ScriptType::EthAccount:  return "ethereum";
+    }
+    return "unknown";
+}
+
+bool scriptTypeFromId(const std::string& id, ScriptType* out)
+{
+    for (const ScriptType t : kAllTypes) {
+        if (id == scriptTypeId(t)) {
+            *out = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isUtxo(ScriptType t)
 {
     return t != ScriptType::EthAccount;
+}
+
+const AddressFormat& defaultFormat(ScriptType t)
+{
+    static const AddressFormat bitcoin;
+    static const AddressFormat ethereum{60, 0, 0, std::string()};
+    return isUtxo(t) ? bitcoin : ethereum;
 }
 
 uint32_t xpubVersionFor(ScriptType t)
@@ -53,17 +86,26 @@ uint32_t xpubVersionFor(ScriptType t)
     }
 }
 
+std::string accountRootPath(ScriptType t, uint32_t account, const AddressFormat& format)
+{
+    return "m/" + std::to_string(purposeOf(t)) + "'/" + std::to_string(format.coinType) + "'/"
+           + std::to_string(account) + "'";
+}
+
 std::string accountRootPath(ScriptType t, uint32_t account)
 {
-    uint32_t purpose = 0, coin = 0;
-    coinParams(t, purpose, coin);
-    return "m/" + std::to_string(purpose) + "'/" + std::to_string(coin) + "'/"
-           + std::to_string(account) + "'";
+    return accountRootPath(t, account, defaultFormat(t));
+}
+
+std::string accountPath(ScriptType t, uint32_t account, uint32_t change, uint32_t index,
+                        const AddressFormat& format)
+{
+    return accountRootPath(t, account, format) + "/" + std::to_string(change) + "/" + std::to_string(index);
 }
 
 std::string accountPath(ScriptType t, uint32_t account, uint32_t change, uint32_t index)
 {
-    return accountRootPath(t, account) + "/" + std::to_string(change) + "/" + std::to_string(index);
+    return accountPath(t, account, change, index, defaultFormat(t));
 }
 
 std::string ethChecksumAddress(const Bytes& addr20)
@@ -82,7 +124,8 @@ std::string ethChecksumAddress(const Bytes& addr20)
     return out;
 }
 
-AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const Bytes& uncompressedPub)
+AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const Bytes& uncompressedPub,
+                                 const AddressFormat& format)
 {
     AddressInfo info;
 
@@ -101,7 +144,7 @@ AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const
     switch (t) {
     case ScriptType::P2PKH: {
         Bytes payload;
-        payload.push_back(0x00); // mainnet P2PKH version
+        payload.push_back(format.p2pkhVersion);
         payload.insert(payload.end(), h160.begin(), h160.end());
         info.address = base58::encodeCheck(payload);
         // OP_DUP OP_HASH160 <20> <h160> OP_EQUALVERIFY OP_CHECKSIG
@@ -117,7 +160,7 @@ AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const
         redeem.insert(redeem.end(), h160.begin(), h160.end());
         const Bytes rh = hash160(redeem);
         Bytes payload;
-        payload.push_back(0x05); // mainnet P2SH version
+        payload.push_back(format.p2shVersion);
         payload.insert(payload.end(), rh.begin(), rh.end());
         info.address = base58::encodeCheck(payload);
         // OP_HASH160 <20> <rh> OP_EQUAL
@@ -127,7 +170,7 @@ AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const
         break;
     }
     case ScriptType::P2WPKH: {
-        info.address = bech32::segwitEncode("bc", 0, h160);
+        info.address = bech32::segwitEncode(format.hrp, 0, h160);
         // OP_0 <20> <h160>
         info.scriptPubKey = {0x00, 0x14};
         info.scriptPubKey.insert(info.scriptPubKey.end(), h160.begin(), h160.end());
@@ -140,6 +183,11 @@ AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const
     // Electrum subscribes by sha256(scriptPubKey), reversed, as hex.
     info.electrumScripthash = reverseHex(sha256(info.scriptPubKey));
     return info;
+}
+
+AddressInfo addressFromPublicKey(ScriptType t, const Bytes& compressedPub, const Bytes& uncompressedPub)
+{
+    return addressFromPublicKey(t, compressedPub, uncompressedPub, defaultFormat(t));
 }
 
 AddressInfo addressAt(const HdKey& master, ScriptType t,
@@ -155,14 +203,21 @@ AddressInfo addressAt(const HdKey& master, ScriptType t,
 }
 
 AddressInfo addressFromChainNode(const HdPubKey& chainNode, ScriptType t,
-                                 uint32_t account, uint32_t change, uint32_t index)
+                                 uint32_t account, uint32_t change, uint32_t index,
+                                 const AddressFormat& format)
 {
     const HdPubKey node = chainNode.deriveChild(index);
     AddressInfo info = (t == ScriptType::EthAccount)
-        ? addressFromPublicKey(t, {}, node.publicKeyUncompressed())
-        : addressFromPublicKey(t, node.publicKey(), {});
-    info.path = accountPath(t, account, change, index);
+        ? addressFromPublicKey(t, {}, node.publicKeyUncompressed(), format)
+        : addressFromPublicKey(t, node.publicKey(), {}, format);
+    info.path = accountPath(t, account, change, index, format);
     return info;
+}
+
+AddressInfo addressFromChainNode(const HdPubKey& chainNode, ScriptType t,
+                                 uint32_t account, uint32_t change, uint32_t index)
+{
+    return addressFromChainNode(chainNode, t, account, change, index, defaultFormat(t));
 }
 
 AddressInfo addressFromAccount(const HdPubKey& accountNode, ScriptType t,

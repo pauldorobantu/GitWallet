@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QMap>
 #include <QStringList>
 #include <QWidget>
 
@@ -58,8 +59,7 @@ private:
         int changeGap = 0;
         int ethGap = 0;
         int refreshSeconds = 0;
-        QStringList electrumServers;
-        QStringList ethEndpoints;
+        QMap<QString, QStringList> servers;
     };
 
     // One reported problem. All of it is GitWallet's own words but `detail`,
@@ -70,6 +70,7 @@ private:
         QString headline; // a few words: the toast
         QString text;     // the sentence in the notice bar
         QString detail;   // what the server wrote, if anything; plain text in the tooltip only
+        QString file;     // the file a notice is about: it goes when that file does
         int severity = 0; // kSeverity* (MainWindow.cpp)
         int depends = 0;  // kDepends*: the settings it is about
         bool settingsFix = false; // Settings can fix it: the bar offers to open them

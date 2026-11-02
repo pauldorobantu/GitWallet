@@ -1,3 +1,4 @@
+#include "app/ScaleTest.h"
 #include "app/StoreTest.h"
 #include "app/WalletController.h"
 #include "app/Walkthrough.h"
@@ -7,6 +8,7 @@
 #include "ui/LanguageManager.h"
 #include "ui/MainWindow.h"
 #include "ui/ThemeManager.h"
+#include "wallet/UtxoScanner.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
@@ -216,28 +218,43 @@ bool writeScanReport(const QString& path, app::WalletController* c, bool timedOu
         const wallet::AddressRow& r = m->at(i);
         QJsonObject o{
             {QStringLiteral("wallet"), qint64(r.wallet)},
-            {QStringLiteral("path"), r.path},
+            {QStringLiteral("network"), wallet::networkInfo(r.network).id},
+            {QStringLiteral("path"), r.path()},
             {QStringLiteral("address"), r.address},
             {QStringLiteral("checked"), r.checked},
             {QStringLiteral("used"), r.used},
         };
-        if (r.isBitcoin()) {
-            o.insert(QStringLiteral("btcConfirmed"), QString::number(r.btcConfirmed));
-            o.insert(QStringLiteral("btcUnconfirmed"), QString::number(r.btcUnconfirmed));
+        if (r.isUtxo()) {
+            o.insert(QStringLiteral("status"), r.status);
+            o.insert(QStringLiteral("confirmed"), QString::number(r.confirmed));
+            o.insert(QStringLiteral("unconfirmed"), QString::number(r.unconfirmed));
         } else {
             o.insert(QStringLiteral("nonce"), QString::number(r.nonce));
-            o.insert(QStringLiteral("ethWei"), QString::fromStdString(r.ethWei.toDecimalString()));
-            for (const wallet::AssetInfo& a : wallet::erc20Assets())
-                o.insert(a.symbol, QString::fromStdString(r.tokens.value(a.asset).toDecimalString()));
+            for (const wallet::Asset asset : wallet::networkInfo(r.network).assets)
+                o.insert(wallet::assetInfo(asset).symbol, QString::fromStdString(r.amount(asset).toDecimalString()));
         }
         rows.append(o);
     }
     QJsonObject totals;
     for (const wallet::AssetInfo& a : wallet::assets())
-        totals.insert(a.symbol, QString::fromStdString(m->total(a.asset).format(a.decimals, a.decimals)));
+        totals.insert(a.key, QString::fromStdString(m->total(a.asset).format(a.decimals, a.decimals)));
     QJsonObject prices;
     for (const wallet::AssetInfo& a : wallet::assets())
-        prices.insert(a.symbol, c->prices()->usd(a.symbol));
+        prices.insert(a.key, c->prices()->usd(a.asset));
+    QJsonArray networks;
+    for (const wallet::NetworkInfo& info : wallet::networks()) {
+        const wallet::NetworkStatus st = c->networkStatus(info.network);
+        networks.append(QJsonObject{{QStringLiteral("id"), info.id},
+                                    {QStringLiteral("server"), st.server},
+                                    {QStringLiteral("rows"), m->rowsOn(info.network)},
+                                    {QStringLiteral("unchecked"), m->uncheckedOn(info.network)},
+                                    {QStringLiteral("scanning"), st.scanning},
+                                    {QStringLiteral("wrongChain"), st.wrongChain},
+                                    {QStringLiteral("failing"), st.failing},
+                                    {QStringLiteral("balancesAt"), st.balancesAt.toString(Qt::ISODate)},
+                                    {QStringLiteral("live"), st.tiers.live},
+                                    {QStringLiteral("rounds"), st.tiers.rounds}});
+    }
     QJsonArray accounts; // public keys only — lets a test compare with Electrum watch-only
     const QList<wallet::AccountKey> keys = c->store().allAccounts();
     for (const wallet::AccountKey& k : keys)
@@ -248,15 +265,11 @@ bool writeScanReport(const QString& path, app::WalletController* c, bool timedOu
     const QJsonObject report{
         {QStringLiteral("accounts"), accounts},
         {QStringLiteral("timedOut"), timedOut},
-        {QStringLiteral("electrumServer"), c->electrumServer()},
-        {QStringLiteral("ethEndpoint"), c->ethEndpoint()},
+        {QStringLiteral("networks"), networks},
         {QStringLiteral("status"), c->statusText()},
         // Whether the figures below are complete and current, as the UI judges it.
         {QStringLiteral("balancesComplete"), c->balancesComplete()},
         {QStringLiteral("addressLimitReached"), c->addressLimitReached()},
-        {QStringLiteral("ethWrongChain"), c->ethWrongChain()},
-        {QStringLiteral("ethRefreshFailing"), c->ethRefreshFailing()},
-        {QStringLiteral("ethBalancesAt"), c->ethBalancesAt().toString(Qt::ISODate)},
         {QStringLiteral("rowCount"), m->size()},
         {QStringLiteral("usedCount"), m->usedCount()},
         {QStringLiteral("fundedCount"), m->fundedCount()},
@@ -285,12 +298,20 @@ int main(int argc, char** argv)
     // trusts an address it produces.
     const chain::SelfTestResult st = chain::runSelfTest();
 
+    // The list of coins, read here while nothing else runs. A file instead of the
+    // built-in list is for tests: refused below without a separate --data-dir.
+    const QString coinsFile = argValue(args, QStringLiteral("--coins-file"));
+    if (!coinsFile.isEmpty()) wallet::useRegistryFile(coinsFile);
+    const QString coinsProblem = wallet::registryProblem();
+
     if (args.contains(QStringLiteral("--selftest"))) {
         attachParentConsole();
         std::fputs(st.report.c_str(), stdout);
         std::fprintf(stdout, "GitWallet self-test: %d/%d passed\n", st.passed, st.total);
+        if (!coinsProblem.isEmpty())
+            std::fprintf(stdout, "The list of coins does not load: %s\n", coinsProblem.toUtf8().constData());
         std::fflush(stdout);
-        return st.ok ? 0 : 1;
+        return st.ok && coinsProblem.isEmpty() ? 0 : 1;
     }
 
     // A separate data folder (tests, screenshots, a second wallet). Trimmed as
@@ -305,7 +326,9 @@ int main(int argc, char** argv)
     // folder WalletStore actually resolved is the real wallet's after all.
     for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--import-test-mnemonic"),
                                 QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
-                                QStringLiteral("--store-test"), QStringLiteral("--demo-wallets")}) {
+                                QStringLiteral("--store-test"), QStringLiteral("--demo-wallets"),
+                                QStringLiteral("--coins-file"), QStringLiteral("--live-places"),
+                                QStringLiteral("--scale-test")}) {
         if (!args.contains(name)) continue;
         if (dataDir.isEmpty() || sameFolder(wallet::WalletStore::dataDir(), realDataDir())) {
             attachParentConsole();
@@ -316,13 +339,17 @@ int main(int argc, char** argv)
     }
     // These two write and delete wallet.dat as part of the test, so a folder that
     // already holds one (--data-dir can be a second wallet) is not theirs to use.
-    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--store-test")}) {
+    for (const QString& name : {QStringLiteral("--walkthrough"), QStringLiteral("--store-test"), QStringLiteral("--scale-test")}) {
         if (args.contains(name) && QFile::exists(wallet::WalletStore::filePath())) {
             attachParentConsole();
             std::fprintf(stderr, "%s needs a --data-dir without a wallet.dat\n", qPrintable(name));
             return 2;
         }
     }
+
+    // --live-places <n>: a whole scan read in rounds, to compare with one followed live.
+    const int livePlaces = argValue(args, QStringLiteral("--live-places")).toInt();
+    if (livePlaces > 0) wallet::UtxoScanner::setLivePlacesForTest(livePlaces);
 
     // --store-test: the wallet file and the address model without a window or a
     // network, on the separate --data-dir checked above.
@@ -341,6 +368,11 @@ int main(int argc, char** argv)
     if (!args.contains(QStringLiteral("--walkthrough")))
         app::ui::LanguageManager::instance()->loadFromSettings();
 
+    if (!coinsProblem.isEmpty()) {
+        QMessageBox::critical(nullptr, QStringLiteral("GitWallet"),
+                              QStringLiteral("The list of coins does not load, so nothing can be shown.\n\n%1").arg(coinsProblem));
+        return 1;
+    }
     if (!st.ok) {
         QMessageBox::critical(
             nullptr, QStringLiteral("GitWallet"),
@@ -366,6 +398,19 @@ int main(int argc, char** argv)
             walkthroughDir);
         walkthrough.start();
         return app.exec();
+    }
+
+    // --scale-test <rows>: the real window with that many made-up rows, offline. Only on
+    // a separate --data-dir without a wallet (checked above).
+    const int scaleRows = argValue(args, QStringLiteral("--scale-test")).toInt();
+    if (scaleRows > 0) {
+        attachParentConsole();
+        app::ui::MainWindow window;
+        window.show();
+        const QString timings = app::runWindowScaleTest(&window, scaleRows);
+        std::fputs(timings.toUtf8().constData(), stdout);
+        std::fflush(stdout);
+        return timings.contains(QLatin1String("FAIL")) ? 1 : 0;
     }
 
     // One window per wallet folder: a second start brings the open one to the

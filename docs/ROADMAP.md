@@ -2,7 +2,8 @@
 
 Written 2026-11-01, from a study of Exodus, Trust Wallet, MetaMask, Ledger Live and
 Electrum (their help pages and code, not hands-on use) and a critical pass over the
-first draft. Limits of outside services change often: treat the figures as dated.
+first draft. Limits of outside services change often: treat the figures as dated. What
+was measured is in [ENDPOINTS.md](ENDPOINTS.md).
 
 ## What it has to become
 
@@ -15,9 +16,10 @@ first draft. Limits of outside services change often: treat the figures as dated
 ## Where it stands
 
 USD at every level and per-address amounts exist, for four assets only: BTC, ETH, USDT,
-USDC. Missing against the known wallets: History, transaction detail, Receive with QR,
-a per-coin screen, address labels, explorer links, app password, Send. Nothing keeps
-transactions today, and every start scans again.
+USDC. Coins and networks are data, what the wallets show is kept in an encrypted database, a
+start shows it at once, and 425,000 addresses fit (stage 1). Missing against the known wallets:
+History, transaction detail, Receive with QR, a per-coin screen, address labels, explorer
+links, app password, Send. Nothing keeps transactions yet.
 
 ## The logic people already know
 
@@ -38,20 +40,25 @@ level. An address opens to every asset in its own coin with USD, then its histor
   more on real need. The big coin counts of other wallets are mostly tokens. Every token
   on every chain on every address is not possible with no server and no key.
 - **Bitcoin family history needs nothing else.** Ethereum-style native transfers cannot be
-  listed by a plain node: they need an indexer, so a free key the owner pastes (never one
-  built into a public app). Token transfers come from logs, within limits still to measure.
+  listed by a plain node: they need an indexer. Blockscout answered without a key, about 6
+  addresses a second, which covers used addresses on a start; a free key the owner pastes
+  (never one built into a public app) goes further. Token transfers come from logs, within
+  limits that run from 10 to 50,000 blocks a call per endpoint.
 - **Only public keys are stored**, which is right and has a price: a chain that uses other
   keys appears for an existing seed only after typing that seed once more. The list of
   chains, accounts and paths to capture is written first, so that happens once.
 - **Solana, TON and similar chains** cannot make new addresses from public keys: a fixed
   batch is derived while the seed is there.
-- **Scale.** 500 wallets at the default gaps are 425,000 addresses. One connection follows
-  40,000 Bitcoin addresses live, so the next unused addresses and anything issued from
-  Receive stay live, and the rest are read in slower passes. Detecting a payment to a fresh
-  address must not get slower than today; the worst delay per chain is shown.
+- **Scale.** 500 wallets at the default gaps are 425,000 addresses, 375,000 of them Bitcoin's.
+  One connection follows 40,000 of those live, the next unused addresses and up to 10,000
+  holding coins (anything issued from Receive joins them in stage 4), and the rest are read in
+  rounds of about 30 minutes at that size. On Ethereum, a pass over 50,000 balances takes about
+  a minute, and the next unused ones go ahead of a longer one. The worst delay per chain is
+  shown.
 - **Public servers see the addresses asked about**, and a key ties them to whoever holds it.
-  Answers are checked (Merkle proofs against headers for Bitcoin, a second endpoint for
-  Ethereum-style chains) before "paid" is believed.
+  They are not yet checked on what they answer: Merkle proofs against headers for Bitcoin and
+  a second endpoint for Ethereum-style chains come with the history, in stages 2 and 3, before
+  "paid" is believed.
 - **Many chains will be view-only for a long time.** Sending beyond Bitcoin and
   Ethereum-style chains is extra work per family, and the app says so per chain.
 
@@ -63,7 +70,7 @@ real UI.
 
 | # | Stage | What the owner gets | Size |
 |---|---|---|---|
-| 1 | **Foundation** | Coins and chains become data, an encrypted local database and one scheduler. Starts instantly from saved balances. Live price source proven, with the time shown beside USD. Real limits of public endpoints measured | 3-5 |
+| 1 | **Foundation** *(done)* | Coins and chains are data, an encrypted local database and one scheduler. Starts instantly from saved balances. Live price source proven, with the time shown beside USD. Real limits of public endpoints measured | 3-5 |
 | 2 | **Bitcoin history** | Every BTC transaction, overall and per address; detail with fee, USD then and now, explorer link; pending, replaced, confirmed; filters, search, CSV, labels and notes. No key needed | 4-6 |
 | 3 | **Ethereum history** | The same for ETH, USDT, USDC, with failed transactions. "Complete back to" shown per chain | 3-5 |
 | 4 | **Familiar screens** | Portfolio, coin pages, clickable path, Receive with QR and next unused address, hide spam and zeros, payment alerts, app password, portable backup | 6-8 |

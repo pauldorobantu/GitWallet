@@ -1,31 +1,30 @@
 #include "wallet/WalletModel.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace wallet {
-
-namespace {
-
-// A row's identity is its position in the HD tree, never its address.
-QString keyOf(quint32 wallet, chain::ScriptType type, quint32 account, quint32 change, quint32 index)
-{
-    return QString::number(wallet) + QLatin1Char('/') + QString::number(static_cast<int>(type))
-           + QLatin1Char('/') + QString::number(account) + QLatin1Char('/') + QString::number(change)
-           + QLatin1Char('/') + QString::number(index);
-}
-
-} // namespace
 
 WalletModel::WalletModel(QObject* parent)
     : QObject(parent)
 {
 }
 
-void WalletModel::clear()
+WalletModel::RowKey WalletModel::keyOf(const AddressRow& row)
 {
-    rows_.clear();
+    RowKey key;
+    key.wallet = row.wallet;
+    key.account = row.account;
+    key.index = row.index;
+    key.network = quint16(row.network);
+    key.type = quint8(row.type);
+    key.change = quint8(row.change);
+    return key;
+}
+
+void WalletModel::resetCounts()
+{
     byScripthash_.clear();
-    byAddress_.clear();
     byKey_.clear();
     totals_.clear();
     walletTotals_.clear();
@@ -33,6 +32,14 @@ void WalletModel::clear()
     fundedCount_ = 0;
     checkedCount_ = 0;
     walletCounts_.clear();
+    rowsOn_.clear();
+    uncheckedOn_.clear();
+}
+
+void WalletModel::clear()
+{
+    rows_.clear();
+    resetCounts();
     emit cleared();
     emit totalsChanged();
 }
@@ -40,25 +47,38 @@ void WalletModel::clear()
 void WalletModel::removeWallet(quint32 wallet)
 {
     const QVector<AddressRow> before = std::exchange(rows_, {});
-    byScripthash_.clear();
-    byAddress_.clear();
-    byKey_.clear();
-    totals_.clear();
-    walletTotals_.clear();
-    usedCount_ = 0;
-    fundedCount_ = 0;
-    checkedCount_ = 0;
-    walletCounts_.clear();
+    resetCounts();
     rows_.reserve(before.size());
     for (const AddressRow& row : before) {
         if (row.wallet == wallet) continue;
         const int i = static_cast<int>(rows_.size());
         rows_.append(row);
-        byKey_.insert(keyOf(row.wallet, row.type, row.account, row.change, row.index), i);
+        byKey_.insert(keyOf(row), i);
         addLookups(row, i);
         countRow(row, +1);
+        addToTotals(row);
     }
     emit cleared();
+    emit totalsChanged();
+}
+
+void WalletModel::dropRows(const std::function<bool(const AddressRow&)>& keep)
+{
+    if (std::all_of(rows_.cbegin(), rows_.cend(), keep))
+        return;
+    const QVector<AddressRow> before = std::exchange(rows_, {});
+    resetCounts();
+    rows_.reserve(before.size());
+    for (const AddressRow& row : before) {
+        if (!keep(row)) continue;
+        const int i = static_cast<int>(rows_.size());
+        rows_.append(row);
+        byKey_.insert(keyOf(row), i);
+        addLookups(row, i);
+        countRow(row, +1);
+        addToTotals(row);
+    }
+    emit rowsDropped();
     emit totalsChanged();
 }
 
@@ -66,7 +86,7 @@ int WalletModel::upsert(const AddressRow& row)
 {
     // Every member is brought up to date before the first signal, so a slot
     // that reads the model (or upserts again) sees a consistent state.
-    const QString key = keyOf(row.wallet, row.type, row.account, row.change, row.index);
+    const RowKey key = keyOf(row);
     const auto found = byKey_.constFind(key);
     if (found == byKey_.cend()) {
         const int i = static_cast<int>(rows_.size());
@@ -75,7 +95,7 @@ int WalletModel::upsert(const AddressRow& row)
         addLookups(row, i);
         countRow(row, +1);
         // A new row moves each total by its own balance (an empty row has none).
-        const bool balanceChanged = dropChangedTotals(AddressRow(), row);
+        const bool balanceChanged = addToTotals(row);
         emit rowsAppended(i, i);
         if (balanceChanged) emit totalsChanged();
         return i;
@@ -90,58 +110,82 @@ int WalletModel::upsert(const AddressRow& row)
     addLookups(now, i);
     countRow(old, -1);
     countRow(now, +1);
-    const bool balanceChanged = dropChangedTotals(old, now);
+    const bool balanceChanged =
+        old.confirmed != now.confirmed || old.unconfirmed != now.unconfirmed || old.balances != now.balances;
+    if (balanceChanged) {
+        takeFromTotals(old);
+        addToTotals(now);
+    }
     emit rowChanged(i);
     if (balanceChanged) emit totalsChanged();
     return i;
 }
 
-int WalletModel::findByScripthash(const QString& scripthash) const
+void WalletModel::addSaved(const QVector<AddressRow>& rows)
 {
+    const int first = static_cast<int>(rows_.size());
+    bool balanceChanged = false;
+    QList<int> filledIn;
+    for (const AddressRow& row : rows) {
+        const RowKey key = keyOf(row);
+        const auto found = byKey_.constFind(key);
+        if (found != byKey_.cend()) {
+            // What a scanner already wrote is newer, unless all it wrote is the address.
+            const int at = found.value();
+            const AddressRow& now = rows_.at(at);
+            if (now.checked || now.used || now.confirmed != 0 || now.unconfirmed != 0 || !now.balances.isEmpty()) continue;
+            dropLookups(now, at);
+            countRow(now, -1);
+            rows_[at] = row;
+            addLookups(row, at);
+            countRow(row, +1);
+            balanceChanged = addToTotals(row) || balanceChanged;
+            filledIn.append(at);
+            continue;
+        }
+        const int i = static_cast<int>(rows_.size());
+        rows_.append(row);
+        byKey_.insert(key, i);
+        addLookups(row, i);
+        countRow(row, +1);
+        balanceChanged = addToTotals(row) || balanceChanged;
+    }
+    const int last = static_cast<int>(rows_.size()) - 1;
+    if (last >= first) emit rowsAppended(first, last);
+    for (const int at : std::as_const(filledIn)) emit rowChanged(at);
+    if (balanceChanged) emit totalsChanged();
+}
+
+int WalletModel::findByScripthash(Network network, const QString& scripthash) const
+{
+    if (scripthash.isEmpty()) return -1;
+    const auto own = byScripthash_.constFind(network);
     // Hex, so lowercasing is harmless and tolerates a server that echoes uppercase.
-    return scripthash.isEmpty() ? -1 : byScripthash_.value(scripthash.toLower(), -1);
+    return own == byScripthash_.cend() ? -1 : own->value(scripthash.toLower(), -1);
 }
 
-int WalletModel::findByAddress(const QString& address) const
-{
-    // Ethereum addresses arrive in EIP-55 mixed case or all lowercase.
-    return address.isEmpty() ? -1 : byAddress_.value(address.toLower(), -1);
-}
-
-int WalletModel::find(quint32 wallet, chain::ScriptType type, quint32 account, quint32 change,
+int WalletModel::find(quint32 wallet, Network network, chain::ScriptType type, quint32 account, quint32 change,
                       quint32 index) const
 {
-    return byKey_.value(keyOf(wallet, type, account, change, index), -1);
+    AddressRow probe;
+    probe.wallet = wallet;
+    probe.network = network;
+    probe.type = type;
+    probe.account = account;
+    probe.change = change;
+    probe.index = index;
+    return byKey_.value(keyOf(probe), -1);
 }
 
 chain::Amount WalletModel::total(Asset a) const
 {
-    const auto cached = totals_.constFind(a);
-    if (cached != totals_.cend()) return cached.value();
-
-    chain::Amount sum;
-    for (const AddressRow& r : rows_) {
-        const chain::Amount v = r.amount(a);
-        if (!v.isZero()) sum += v; // most rows of a long gap scan are empty
-    }
-    totals_.insert(a, sum);
-    return sum;
+    return totals_.value(a);
 }
 
 chain::Amount WalletModel::total(Asset a, quint32 wallet) const
 {
-    QMap<Asset, chain::Amount>& cache = walletTotals_[wallet];
-    const auto cached = cache.constFind(a);
-    if (cached != cache.cend()) return cached.value();
-
-    chain::Amount sum;
-    for (const AddressRow& r : rows_) {
-        if (r.wallet != wallet) continue;
-        const chain::Amount v = r.amount(a);
-        if (!v.isZero()) sum += v;
-    }
-    cache.insert(a, sum);
-    return sum;
+    const auto own = walletTotals_.constFind(wallet);
+    return own == walletTotals_.cend() ? chain::Amount() : own->value(a);
 }
 
 WalletCounts WalletModel::counts(quint32 wallet) const
@@ -164,25 +208,31 @@ int WalletModel::checkedCount() const
     return checkedCount_;
 }
 
+int WalletModel::rowsOn(Network network) const
+{
+    return rowsOn_.value(network);
+}
+
+int WalletModel::uncheckedOn(Network network) const
+{
+    return uncheckedOn_.value(network);
+}
+
 void WalletModel::addLookups(const AddressRow& row, int index)
 {
-    // Ethereum rows have no scripthash; an empty key would make every one of
-    // them collide.
-    if (!row.scripthash.isEmpty()) byScripthash_.insert(row.scripthash.toLower(), index);
-    if (!row.address.isEmpty()) byAddress_.insert(row.address.toLower(), index);
+    // Account rows have no scripthash; an empty key would make every one of them collide.
+    if (!row.scripthash.isEmpty()) byScripthash_[row.network].insert(row.scripthash.toLower(), index);
 }
 
 void WalletModel::dropLookups(const AddressRow& row, int index)
 {
-    // Only remove entries that still point at this row, so a duplicate address
+    // Only remove an entry that still points at this row, so a duplicate address
     // claimed by another row keeps its lookup.
-    const auto drop = [index](QHash<QString, int>& map, const QString& key) {
-        if (key.isEmpty()) return;
-        const auto it = map.find(key.toLower());
-        if (it != map.end() && it.value() == index) map.erase(it);
-    };
-    drop(byScripthash_, row.scripthash);
-    drop(byAddress_, row.address);
+    if (row.scripthash.isEmpty()) return;
+    const auto own = byScripthash_.find(row.network);
+    if (own == byScripthash_.end()) return;
+    const auto it = own->find(row.scripthash.toLower());
+    if (it != own->end() && it.value() == index) own->erase(it);
 }
 
 void WalletModel::countRow(const AddressRow& row, int sign)
@@ -190,6 +240,7 @@ void WalletModel::countRow(const AddressRow& row, int sign)
     const bool funded = row.state() == AddressState::Funded;
     WalletCounts& own = walletCounts_[row.wallet];
     own.rows += sign;
+    rowsOn_[row.network] += sign;
     // A balance implies history even if a scanner left `used` unset.
     if (row.used || funded) {
         usedCount_ += sign;
@@ -202,21 +253,31 @@ void WalletModel::countRow(const AddressRow& row, int sign)
     if (row.checked) {
         checkedCount_ += sign;
         own.checked += sign;
+    } else {
+        uncheckedOn_[row.network] += sign;
     }
 }
 
-bool WalletModel::dropChangedTotals(const AddressRow& before, const AddressRow& after)
+bool WalletModel::addToTotals(const AddressRow& row)
 {
-    bool changed = false;
-    for (const AssetInfo& info : assets()) {
-        if (before.amount(info.asset) != after.amount(info.asset)) {
-            totals_.remove(info.asset);
-            const auto own = walletTotals_.find(after.wallet);
-            if (own != walletTotals_.end()) own->remove(info.asset);
-            changed = true;
-        }
-    }
-    return changed;
+    bool holds = false;
+    row.forEachBalance([&](Asset asset, const chain::Amount& amount) {
+        holds = true;
+        totals_[asset] += amount;
+        walletTotals_[row.wallet][asset] += amount;
+    });
+    return holds;
+}
+
+bool WalletModel::takeFromTotals(const AddressRow& row)
+{
+    bool holds = false;
+    row.forEachBalance([&](Asset asset, const chain::Amount& amount) {
+        holds = true;
+        totals_[asset] -= amount;
+        walletTotals_[row.wallet][asset] -= amount;
+    });
+    return holds;
 }
 
 } // namespace wallet

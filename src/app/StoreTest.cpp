@@ -20,8 +20,15 @@
 
 #include <algorithm>
 #include <exception>
+#include <functional>
+
+#include <cstdio>
 
 namespace app {
+
+void runScanTest(const std::function<void(bool, const QString&)>& check, QString* report, const QList<wallet::AccountKey>& someKeys);
+void runFoundationTest(const std::function<void(bool, const QString&)>& check, QString* report,
+                       const QList<wallet::AccountKey>& someKeys);
 
 namespace {
 
@@ -76,14 +83,42 @@ QByteArray legacyBody(const QList<wallet::AccountKey>& accounts)
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
 }
 
+// A valid phrase from `random`: 16 bytes of entropy and its checksum, as BIP39 builds it.
+std::string randomMnemonic(QRandomGenerator& random)
+{
+    static const QStringList words = [] {
+        QFile file(QStringLiteral(":/bip39/english.txt"));
+        file.open(QIODevice::ReadOnly);
+        return QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    }();
+    QByteArray entropy(16, '\0');
+    for (char& byte : entropy)
+        byte = char(random.bounded(256));
+    const QByteArray hash = QCryptographicHash::hash(entropy, QCryptographicHash::Sha256);
+    QStringList phrase;
+    const auto bitAt = [&](int bit) {
+        const QByteArray& from = bit < 128 ? entropy : hash;
+        const int at = bit < 128 ? bit : bit - 128;
+        return (quint8(from.at(at / 8)) >> (7 - at % 8)) & 1;
+    };
+    for (int word = 0; word < 12; ++word) {
+        int index = 0;
+        for (int bit = 0; bit < 11; ++bit)
+            index = (index << 1) | bitAt(word * 11 + bit);
+        phrase << words.at(index).trimmed();
+    }
+    return phrase.join(QLatin1Char(' ')).toStdString();
+}
+
 wallet::AddressRow rowOf(quint32 id, quint32 index, qint64 sats)
 {
     wallet::AddressRow row;
+    row.network = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
     row.wallet = id;
     row.index = index;
     row.scripthash = QStringLiteral("%1-%2").arg(id).arg(index);
     row.address = QStringLiteral("addr-%1-%2").arg(id).arg(index);
-    row.btcConfirmed = sats;
+    row.confirmed = sats;
     row.used = sats != 0;
     row.checked = true;
     return row;
@@ -98,6 +133,9 @@ StoreTestResult runStoreTest()
         ++result.total;
         if (ok) ++result.passed;
         result.report += (ok ? QStringLiteral("ok    ") : QStringLiteral("FAIL  ")) + what + QLatin1Char('\n');
+        // As it goes, for a test that does not get to the end.
+        std::fprintf(stderr, "%s %s\n", ok ? "ok  " : "FAIL", what.toUtf8().constData());
+        std::fflush(stderr);
     };
     // For a call that reports through `error`: read here, once the call has run.
     QString error;
@@ -119,7 +157,7 @@ StoreTestResult runStoreTest()
         const bool legacyOk = !store.wallets.isEmpty() && store.wallets.first().label == QStringLiteral("Old wallet")
                               && store.wallets.first().accounts.size() == 4 && !store.wallets.first().fromKeys;
         check(legacyOk, QStringLiteral("it keeps its name and its 4 keys"));
-        check(store.settings.btcReceiveGap == 321, QStringLiteral("it keeps its settings"));
+        check(store.settings.utxoReceiveGap == 321, QStringLiteral("it keeps its settings"));
         const QList<wallet::AccountKey> all = store.allAccounts();
         const quint32 firstId = store.wallets.value(0).id;
         check(std::all_of(all.cbegin(), all.cend(), [firstId](const wallet::AccountKey& k) { return k.wallet == firstId; }),
@@ -602,27 +640,31 @@ StoreTestResult runStoreTest()
         check(decoded(QByteArray("abc\0def", 7)) == QStringLiteral("<refused>"), QStringLiteral("and so is what is not text"));
 
         // The address model, per wallet.
+        const wallet::NetworkInfo& bitcoinNet = *wallet::findNetwork(QStringLiteral("bitcoin"));
+        const wallet::NetworkInfo& ethereumNet = *wallet::findNetwork(QStringLiteral("ethereum"));
+        const wallet::Asset btcAsset = bitcoinNet.coin;
         wallet::WalletModel model;
         model.upsert(rowOf(1, 0, 1000));
         model.upsert(rowOf(1, 1, 0));
         model.upsert(rowOf(2, 0, 250));
         model.upsert(rowOf(2, 0, 500)); // the same position again: replaced
-        const auto btc = [&model](quint32 id) {
-            return model.total(wallet::Asset::BTC, id) == chain::Amount::fromU64(id == 1 ? 1000 : 500);
+        const auto btc = [&model, btcAsset](quint32 id) {
+            return model.total(btcAsset, id) == chain::Amount::fromU64(id == 1 ? 1000 : 500);
         };
         check(model.size() == 3, QStringLiteral("a row is identified within its wallet"));
         check(btc(1) && btc(2), QStringLiteral("each wallet has its own total"));
-        check(model.total(wallet::Asset::BTC) == chain::Amount::fromU64(1500), QStringLiteral("the overall total adds them"));
+        check(model.total(btcAsset) == chain::Amount::fromU64(1500), QStringLiteral("the overall total adds them"));
         check(model.counts(1).rows == 2 && model.counts(1).funded == 1 && model.counts(2).rows == 1,
               QStringLiteral("each wallet has its own counts"));
         model.upsert(rowOf(1, 0, 400));
-        check(model.total(wallet::Asset::BTC, 1) == chain::Amount::fromU64(400),
+        check(model.total(btcAsset, 1) == chain::Amount::fromU64(400),
               QStringLiteral("a wallet's total follows a new balance"));
         model.removeWallet(1);
-        check(model.size() == 1 && model.find(2, chain::ScriptType::P2WPKH, 0, 0, 0) == 0
-                  && model.findByScripthash(QStringLiteral("2-0")) == 0 && model.findByScripthash(QStringLiteral("1-0")) < 0,
+        check(model.size() == 1 && model.find(2, bitcoinNet.network, chain::ScriptType::P2WPKH, 0, 0, 0) == 0
+                  && model.findByScripthash(bitcoinNet.network, QStringLiteral("2-0")) == 0
+                  && model.findByScripthash(bitcoinNet.network, QStringLiteral("1-0")) < 0,
               QStringLiteral("removing a wallet keeps the other's row findable"));
-        check(model.total(wallet::Asset::BTC) == chain::Amount::fromU64(500) && model.counts(1).rows == 0
+        check(model.total(btcAsset) == chain::Amount::fromU64(500) && model.counts(1).rows == 0
                   && model.fundedCount() == 1,
               QStringLiteral("and leaves only its totals and counts"));
 
@@ -699,17 +741,18 @@ StoreTestResult runStoreTest()
             lowRow.used = true;
             controller.model()->upsert(lowRow);
             controller.model()->upsert(rowOf(own, 150, 700));
-            settings.btcReceiveGap = 200;
+            settings.utxoReceiveGap = 200;
             check(controller.gapImpact(settings).used == 0, QStringLiteral("a gap of 200 reaches an address at index 150"));
-            settings.btcReceiveGap = 100;
+            settings.utxoReceiveGap = 100;
             const WalletController::GapImpact impact = controller.gapImpact(settings);
             check(impact.used == 1 && impact.funded == 1,
                   QStringLiteral("a gap of 100 leaves it out, with its balance"));
             controller.model()->clear();
 
             // Ethereum's `used` flag outlives what set it, and a fresh scan starts without it.
-            const auto ethRow = [own](quint32 index, bool used, quint64 nonce) {
+            const auto ethRow = [own, &ethereumNet](quint32 index, bool used, quint64 nonce) {
                 wallet::AddressRow row = rowOf(own, index, 0);
+                row.network = ethereumNet.network;
                 row.type = chain::ScriptType::EthAccount;
                 row.used = used;
                 row.nonce = nonce;
@@ -720,7 +763,7 @@ StoreTestResult runStoreTest()
             settings = controller.store().settings;
             check(controller.gapImpact(settings).used == 0,
                   QStringLiteral("with no gap falling the rows stay, so nothing is left out"));
-            settings.btcChangeGap -= 10;
+            settings.utxoChangeGap -= 10;
             check(controller.gapImpact(settings).used == 1,
                   QStringLiteral("any gap falling clears them, and an Ethereum address only marked used keeps nothing in reach"));
             controller.model()->clear();
@@ -765,9 +808,9 @@ StoreTestResult runStoreTest()
                 controller.model()->upsert(row);
             }
             wallet::ScanSettings gapped = controller.store().settings;
-            check(gapped.btcReceiveGap == 200 && gapped.btcChangeGap == 50 && controller.gapImpact(gapped).used == 0,
+            check(gapped.utxoReceiveGap == 200 && gapped.utxoChangeGap == 50 && controller.gapImpact(gapped).used == 0,
                   QStringLiteral("the same gaps leave nothing out"));
-            gapped.btcReceiveGap = 100;
+            gapped.utxoReceiveGap = 100;
             const WalletController::GapImpact run = controller.gapImpact(gapped);
             check(run.atMost && run.used == 2450 && run.funded == 1,
                   QStringLiteral("smaller ones say how many the row limit can cut"));
@@ -776,14 +819,14 @@ StoreTestResult runStoreTest()
             // Already past the limit, a smaller gap still loses what the fresh scan cannot
             // reach: the rows go, whatever the settings in use wanted past it before.
             wallet::ScanSettings wideGaps = controller.store().settings;
-            wideGaps.btcReceiveGap = 5000;
+            wideGaps.utxoReceiveGap = 5000;
             done(controller.applySettings(wideGaps, &error), QStringLiteral("larger gaps save"));
             for (quint32 index = 0; index < 29850; ++index) {
                 wallet::AddressRow row = rowOf(runId, index, 0);
                 row.used = true;
                 controller.model()->upsert(row);
             }
-            wideGaps.btcReceiveGap = 421;
+            wideGaps.utxoReceiveGap = 421;
             const WalletController::GapImpact pastLimit = controller.gapImpact(wideGaps);
             check(pastLimit.atMost && pastLimit.used == 3003, QStringLiteral("past the limit, a smaller gap still says what it loses"));
             controller.model()->clear();
@@ -840,11 +883,25 @@ StoreTestResult runStoreTest()
                                                   numberedRequest(accountsOf(kSecondMnemonic), QStringLiteral("Big"))};
             check(controller.addWallets(&twoSeeds, &error) == 2, QStringLiteral("two seeds"));
             wallet::ScanSettings raised = controller.store().settings;
-            raised.btcReceiveGap = 5000;
-            raised.btcChangeGap = 5000;
+            raised.utxoReceiveGap = 5000;
+            raised.utxoChangeGap = 5000;
+            check(controller.gapImpact(raised).overLimit == 0,
+                  QStringLiteral("raised to 5,000 they want 60,000 addresses: past what is followed live, not past what is read"));
+            done(controller.removeAllWallets(&error), QStringLiteral("and they can be removed"));
+
+            // Enough of them, and the limit on what is watched at all comes into it.
+            QList<wallet::WalletRequest> manySeeds;
+            QRandomGenerator seedRandom(20261102);
+            for (int i = 0; i < 40; ++i) {
+                wallet::WalletRequest request;
+                request.accounts = wallet::WalletStore::deriveAccounts(chain::bip39::split(randomMnemonic(seedRandom)), {});
+                request.label = QStringLiteral("Seed %1").arg(i);
+                manySeeds.append(request);
+            }
+            check(controller.addWallets(&manySeeds, &error) == 40, QStringLiteral("40 seeds"));
             const WalletController::GapImpact raisedImpact = controller.gapImpact(raised);
-            check(raisedImpact.overLimit == 20000 && raisedImpact.used == 0,
-                  QStringLiteral("raised to 5,000 they want 20,000 addresses past what one connection follows"));
+            check(raisedImpact.overLimit == 200000 && raisedImpact.used == 0,
+                  QStringLiteral("raised to 5,000 they want 200,000 addresses past what GitWallet watches"));
             done(controller.removeAllWallets(&error), QStringLiteral("and they can be removed"));
 
             // The same text can be two sets of addresses, in one wallet or two.
@@ -870,6 +927,94 @@ StoreTestResult runStoreTest()
                   QStringLiteral("remove all is refused"));
             check(QFile::exists(filePath), QStringLiteral("and the file stays"));
         }
+        {
+            // A file of an older format: the first rewrite leaves a way back, and what the
+            // scans ask goes nowhere.
+            QJsonArray accounts;
+            for (const wallet::AccountKey& key : first)
+                accounts.append(QJsonObject{{QStringLiteral("type"), QLatin1String(chain::scriptTypeId(key.type))},
+                                            {QStringLiteral("account"), qint64(key.account)},
+                                            {QStringLiteral("xpub"), key.xpub}});
+            const QJsonObject older{{QStringLiteral("format"), QStringLiteral("gitwallet")},
+                                    {QStringLiteral("version"), 2},
+                                    {QStringLiteral("nextWalletId"), 2},
+                                    {QStringLiteral("wallets"), QJsonArray{QJsonObject{{QStringLiteral("id"), 1},
+                                                                                        {QStringLiteral("label"), QStringLiteral("Older")},
+                                                                                        {QStringLiteral("fromKeys"), false},
+                                                                                        {QStringLiteral("accounts"), accounts}}}},
+                                    {QStringLiteral("settings"), QJsonObject{{QStringLiteral("electrumServers"), QJsonArray{QStringLiteral("127.0.0.1:1")}},
+                                                                             {QStringLiteral("ethEndpoints"), QJsonArray{QStringLiteral("https://127.0.0.1:1/")}}}}};
+            check(wallet::WalletStore::writeRawForTest(QJsonDocument(older).toJson(QJsonDocument::Compact), &error), QStringLiteral("a file of an older format is in place"));
+            const QByteArray before = [] { QFile file(wallet::WalletStore::filePath()); file.open(QIODevice::ReadOnly); return file.readAll(); }();
+            const auto copies = [] { return QDir(wallet::WalletStore::dataDir()).entryList({QStringLiteral("wallet.dat.format*")}, QDir::Files); };
+            {
+                WalletController controller;
+                done(controller.loadExisting(&error), QStringLiteral("it loads"));
+                const QStringList made = copies();
+                check(made.size() == 1 && made.first().startsWith(QStringLiteral("wallet.dat.format2-")), QStringLiteral("and the first rewrite leaves a copy under the format's name"));
+                QFile copy(wallet::WalletStore::dataDir() + QLatin1Char('/') + made.value(0));
+                check(copy.open(QIODevice::ReadOnly) && copy.readAll() == before, QStringLiteral("byte for byte"));
+                copy.close();
+                check(controller.walletFilesKeptAside() == 1, QStringLiteral("remove all counts it"));
+                done(controller.removeAllWallets(&error), QStringLiteral("and removes it"));
+                check(copies().isEmpty(), QStringLiteral("it is gone with the wallets"));
+            }
+        }
+        {
+            // Settings that could not be written, saved again: that is what tries again.
+            QJsonArray accounts;
+            for (const wallet::AccountKey& key : first)
+                accounts.append(QJsonObject{{QStringLiteral("type"), QLatin1String(chain::scriptTypeId(key.type))},
+                                            {QStringLiteral("account"), qint64(key.account)},
+                                            {QStringLiteral("xpub"), key.xpub}});
+            const QJsonObject file{{QStringLiteral("format"), QStringLiteral("gitwallet")},
+                                   {QStringLiteral("version"), 3},
+                                   {QStringLiteral("nextWalletId"), 2},
+                                   {QStringLiteral("wallets"), QJsonArray{QJsonObject{{QStringLiteral("id"), 1},
+                                                                                       {QStringLiteral("label"), QStringLiteral("One")},
+                                                                                       {QStringLiteral("fromKeys"), false},
+                                                                                       {QStringLiteral("accounts"), accounts}}}},
+                                   {QStringLiteral("settings"), QJsonObject{{QStringLiteral("servers"), QJsonObject{{QStringLiteral("bitcoin"), QJsonArray{QStringLiteral("127.0.0.1:1")}},
+                                                                                                                    {QStringLiteral("ethereum"), QJsonArray{QStringLiteral("https://127.0.0.1:1/")}}}}}}};
+            check(wallet::WalletStore::writeRawForTest(QJsonDocument(file).toJson(QJsonDocument::Compact), &error), QStringLiteral("a wallet is in place"));
+            WalletController controller;
+            done(controller.loadExisting(&error), QStringLiteral("it loads"));
+            wallet::ScanSettings same = controller.store().settings;
+            check(controller.applySettings(same, &error), QStringLiteral("saving with nothing changed is nothing to do"));
+            const QByteArray written = [] { QFile f(wallet::WalletStore::filePath()); f.open(QIODevice::ReadOnly); return f.readAll(); }();
+            check(wallet::WalletStore::writeRawForTest(QJsonDocument(file).toJson(QJsonDocument::Compact), &error), QStringLiteral("another window writes the file"));
+            wallet::ScanSettings changed = same;
+            changed.evmRefreshSeconds = same.evmRefreshSeconds + 30;
+            check(!controller.applySettings(changed, &error) && error.contains(QStringLiteral("this session only")),
+                  QStringLiteral("a change it cannot write applies for this session only"));
+            error.clear();
+            check(!controller.applySettings(changed, &error) && error.contains(QStringLiteral("this session only")),
+                  QStringLiteral("saved again, it says so again, not that it was saved"));
+            Q_UNUSED(written);
+            done(wallet::WalletStore::writeRawForTest(QJsonDocument(file).toJson(QJsonDocument::Compact), &error), QStringLiteral("the file stays as it is"));
+            QFile::remove(wallet::WalletStore::filePath());
+        }
+        {
+            // All of a wallet's keys are of a kind this version does not know.
+            const QJsonObject kept{{QStringLiteral("format"), QStringLiteral("gitwallet")},
+                                   {QStringLiteral("version"), 3},
+                                   {QStringLiteral("nextWalletId"), 2},
+                                   {QStringLiteral("wallets"),
+                                    QJsonArray{QJsonObject{{QStringLiteral("id"), 1},
+                                                           {QStringLiteral("label"), QStringLiteral("From the future")},
+                                                           {QStringLiteral("fromKeys"), true},
+                                                           {QStringLiteral("accounts"), QJsonArray{QJsonObject{{QStringLiteral("type"), QStringLiteral("p2tr")},
+                                                                                                               {QStringLiteral("account"), 0},
+                                                                                                               {QStringLiteral("xpub"), QStringLiteral("something new")}}}}}}},
+                                   {QStringLiteral("settings"), QJsonObject{}}};
+            check(wallet::WalletStore::writeRawForTest(QJsonDocument(kept).toJson(QJsonDocument::Compact), &error), QStringLiteral("a wallet with only keys this version does not know is in place"));
+            wallet::WalletStore store;
+            check(store.load(&error) && store.wallets.size() == 1 && store.wallets.first().keptAccounts.size() == 1, QStringLiteral("it does not make the whole file read as damaged"));
+            check(store.save(&error), QStringLiteral("and it saves as it was"));
+            QFile::remove(wallet::WalletStore::filePath());
+        }
+        runFoundationTest(check, &result.report, first);
+        runScanTest(check, &result.report, first);
     } catch (const std::exception& e) {
         check(false, QStringLiteral("threw: ") + QString::fromUtf8(e.what()));
     }

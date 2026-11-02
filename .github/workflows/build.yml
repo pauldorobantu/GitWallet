@@ -40,10 +40,20 @@ jobs:
           set "QT_DIR=%QT_ROOT_DIR%"
           call build.bat
 
-      # Right after the build, not at the end of the job: a failed test must not
-      # cost the next run half an hour of compiling Botan again.
+      # Right after the build, not at the end of the job: a failed test, or a compile error
+      # in the app after the libraries were done, must not cost the next run an hour of
+      # compiling them again.
+      - name: Are the libraries whole
+        id: whole
+        if: always() && steps.libraries.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $include = 'C:/gw-vcpkg-installed/x64-windows-release-only/include'
+          $whole = (Test-Path "$include/sqlcipher/sqlite3.h") -and (Test-Path "$include/botan/version.h") -and (Test-Path "$include/secp256k1.h") -and (Test-Path "$include/zlib.h")
+          "whole=$($whole.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
       - name: Save the built libraries
-        if: steps.libraries.outputs.cache-hit != 'true'
+        if: always() && steps.whole.outputs.whole == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: C:/gw-vcpkg-installed
@@ -80,6 +90,16 @@ jobs:
           Get-Content storetest.txt
           exit $code
 
+      # The most the plan counts on, in the real window: what would freeze it fails here.
+      - name: Window at scale
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          ./.github/start-gitwallet.ps1 -Arguments '--data-dir', "$env:RUNNER_TEMP\gw-scale", '--scale-test', '425000' -StdOut scale.txt
+          $code = $LASTEXITCODE
+          Get-Content scale.txt
+          exit $code
+
       - name: UI walkthrough
         shell: pwsh
         timeout-minutes: 30
@@ -96,6 +116,13 @@ jobs:
           }
           "failures: $($summary.failures), exit code: $code"
           exit $code
+
+      # Against the live public servers: a scan read in rounds must read the same as one
+      # followed live, and one more network must take a line in a file and no code.
+      - name: Compare scans
+        shell: pwsh
+        timeout-minutes: 45
+        run: ./.github/compare-scans.ps1 -Report scans
 
       - name: Keep the walkthrough's screenshots
         if: always()

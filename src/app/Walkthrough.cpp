@@ -346,6 +346,7 @@ void Walkthrough::buildSteps()
              const QByteArray raw = f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
              expect(!raw.contains("abandon") && !raw.contains("zpub"),
                     QStringLiteral("wallet.dat holds neither the words nor readable xpubs"));
+             expect(!controller()->store().databaseKey.isEmpty(), QStringLiteral("a key for its database came along"));
          },
          nullptr},
         // scanFinished() says both initial scans are through; the status is
@@ -361,9 +362,9 @@ void Walkthrough::buildSteps()
              const QString status = controller()->statusText();
              expect(controller()->balancesComplete() && status.startsWith(QStringLiteral("Up to date")),
                     QStringLiteral("status: ") + status);
-             expect(controller()->ethBalancesAt().isValid(),
-                    QStringLiteral("the Ethereum balances are dated: %1")
-                        .arg(controller()->ethBalancesAt().toString(QStringLiteral("HH:mm:ss"))));
+             const QDateTime ethAt = controller()->networkStatus(wallet::firstOf(wallet::Family::Evm)->network).balancesAt;
+             expect(ethAt.isValid(),
+                    QStringLiteral("the Ethereum balances are dated: %1").arg(ethAt.toString(QStringLiteral("HH:mm:ss"))));
          },
          nullptr},
         {QStringLiteral("second-dialog"), openAddDialog, [importDialog] { return importDialog() != nullptr; }, 5000,
@@ -630,7 +631,7 @@ void Walkthrough::buildSteps()
              const wallet::WalletModel* m = controller()->model();
              for (int i = 0; i < m->size(); ++i)
                  if (m->at(i).address.contains(QStringLiteral("bc1q"), Qt::CaseInsensitive)
-                     || m->at(i).path.contains(QStringLiteral("bc1q"), Qt::CaseInsensitive))
+                     || m->at(i).path().contains(QStringLiteral("bc1q"), Qt::CaseInsensitive))
                      ++expected;
              expect(tableRows() == expected,
                     QStringLiteral("search \"bc1q\": %1 rows, expected %2").arg(tableRows()).arg(expected));
@@ -681,7 +682,7 @@ void Walkthrough::buildSteps()
          [this, confirmBox, controller] {
              expect(confirmBox() && confirmBox()->text().contains(QStringLiteral("leave out")),
                     QStringLiteral("a smaller gap that leaves used addresses out asks first"));
-             expect(controller()->store().settings.btcReceiveGap == 200, QStringLiteral("and has changed nothing yet"));
+             expect(controller()->store().settings.utxoReceiveGap == 200, QStringLiteral("and has changed nothing yet"));
          },
          [confirmBox]() -> QWidget* { return confirmBox(); }},
         {QStringLiteral("settings-saved"),
@@ -692,15 +693,15 @@ void Walkthrough::buildSteps()
                      if (b->text() == QStringLiteral("Save anyway")) b->click();
          },
          [this, controller] {
-             return controller()->store().settings.btcReceiveGap == 100 && scanFinished_
+             return controller()->store().settings.utxoReceiveGap == 100 && scanFinished_
                     && controller()->balancesComplete();
          },
          300000,
          [this, controller] {
-             expect(controller()->store().settings.btcReceiveGap == 100,
+             expect(controller()->store().settings.utxoReceiveGap == 100,
                     QStringLiteral("Bitcoin receive gap saved as 100"));
              const quint32 second = controller()->store().wallets.value(1).id;
-             expect(controller()->model()->find(second, chain::ScriptType::P2PKH, 0, 0, 150) < 0,
+             expect(controller()->model()->find(second, wallet::firstOf(wallet::Family::Utxo)->network, chain::ScriptType::P2PKH, 0, 0, 150) < 0,
                     QStringLiteral("the address it leaves out is gone at once, not at the next start"));
              expect(controller()->balancesComplete(), QStringLiteral("status: ") + controller()->statusText());
          },
@@ -717,18 +718,49 @@ void Walkthrough::buildSteps()
              connect(window_->controller(), &WalletController::scanFinished, this,
                      [this] { scanFinished_ = true; });
          },
-         // The totals are compared once the reopened window's are final too.
+         // What the database kept is there before any server can have answered.
+         [controller] { return controller()->showingSaved() && controller()->model()->size() > 0; }, 5000,
+         [this, controller] {
+             const wallet::WalletModel* m = controller()->model();
+             const QString shown = visibleText(window_);
+             expect(controller()->showingSaved(), QStringLiteral("reopened: the figures say they are the saved ones"));
+             expect(m->usedCount() == rowsBeforeReopen_,
+                    QStringLiteral("reopened: at once, the used addresses are there (%1 vs %2)").arg(m->usedCount()).arg(rowsBeforeReopen_));
+             expect(totalsText(controller()) == totalsBeforeReopen_,
+                    QStringLiteral("reopened: at once, the totals are there (%1)").arg(totalsText(controller())));
+             expect(controller()->statusText().contains(QStringLiteral("saved"), Qt::CaseInsensitive),
+                    QStringLiteral("reopened: the status says so: ") + controller()->statusText());
+             expect(shown.contains(QStringLiteral("Saved balances")), QStringLiteral("reopened: the Overview says so"));
+             expect(shown.contains(QStringLiteral("Prices: ")) && !shown.contains(QStringLiteral("not loaded")),
+                    QStringLiteral("reopened: the prices are there, with their time"));
+             // Read after it closed: everything it wrote.
+             QByteArray raw;
+             for (const QString& name : {wallet::WalletStore::databasePath(), wallet::WalletStore::databasePath() + QStringLiteral("-wal")}) {
+                 QFile f(name);
+                 if (f.open(QIODevice::ReadOnly))
+                     raw += f.readAll();
+             }
+             const QString anAddress = m->size() > 0 ? m->at(0).address : QString();
+             expect(raw.size() > 0 && !anAddress.isEmpty() && !raw.contains(anAddress.toLatin1()) && !raw.contains("SQLite format"),
+                    QStringLiteral("the database on disk shows nothing without its key"));
+         },
+         nullptr},
+        // The totals are compared once the reopened window's are final too.
+        {QStringLiteral("reopened-checked"), nullptr,
          [this, controller] {
              return scanFinished_ && controller()->hasWallet() && controller()->balancesComplete();
          },
          300000,
          [this, controller, storeHas] {
+             expect(!controller()->showingSaved(), QStringLiteral("reopened: once checked, they no longer say saved"));
+             expect(controller()->networkStatus(wallet::firstOf(wallet::Family::Evm)->network).noncesAt.isValid(),
+                    QStringLiteral("reopened: when every nonce was read last is known"));
              expect(controller()->store().wallets.size() == 3 && storeHas(kFirstName) && storeHas(kSecondNewName)
                         && storeHas(kKeysName),
                     QStringLiteral("reopened: all 3 wallets loaded from wallet.dat, with their names, without a seed"));
              expect(controller()->balancesComplete(),
                     QStringLiteral("reopened: status ") + controller()->statusText());
-             expect(controller()->store().settings.btcReceiveGap == 100,
+             expect(controller()->store().settings.utxoReceiveGap == 100,
                     QStringLiteral("reopened: the saved gap (100) persisted"));
              expect(controller()->model()->usedCount() == rowsBeforeReopen_,
                     QStringLiteral("reopened: same used addresses (%1 vs %2)")

@@ -2,7 +2,6 @@
 
 #include "app/WalletController.h"
 #include "net/ElectrumClient.h"
-#include "net/EthRpc.h"
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
 #include "ui/LanguageManager.h"
@@ -94,14 +93,6 @@ QWidget* withCaption(QWidget* parent, QWidget* field, QLabel* caption)
     return host;
 }
 
-QStringList electrumDefaults()
-{
-    QStringList out;
-    for (const net::ElectrumServer& server : net::defaultElectrumServers())
-        out << server.toString();
-    return out;
-}
-
 // The trimmed, non-empty lines of a list field, each passed through `accept`
 // (which may normalise it), without duplicates. Stops at the first line
 // `accept` refuses and reports its 0-based number.
@@ -168,10 +159,8 @@ struct SettingsPage::Ui : QObject
     QSpinBox* changeGap = nullptr;
     QSpinBox* ethGap = nullptr;
     QSpinBox* ethRefresh = nullptr;
-    QPlainTextEdit* electrum = nullptr;
-    QPlainTextEdit* ethRpc = nullptr;
-    QLabel* electrumInUse = nullptr;
-    QLabel* ethInUse = nullptr;
+    QList<QPlainTextEdit*> servers; // one per wallet::networks() entry, in that order
+    QList<QLabel*> inUse;
     QLabel* walletCount = nullptr;
     QWidget* removeRow = nullptr;
     QPushButton* remove = nullptr;
@@ -180,12 +169,13 @@ struct SettingsPage::Ui : QObject
     void fill(const wallet::ScanSettings& s)
     {
         filled = s;
-        receiveGap->setValue(s.btcReceiveGap);
-        changeGap->setValue(s.btcChangeGap);
-        ethGap->setValue(s.ethGap);
-        ethRefresh->setValue(s.ethRefreshSeconds);
-        electrum->setPlainText(s.electrumServers.join(QLatin1Char('\n')));
-        ethRpc->setPlainText(s.ethEndpoints.join(QLatin1Char('\n')));
+        receiveGap->setValue(s.utxoReceiveGap);
+        changeGap->setValue(s.utxoChangeGap);
+        ethGap->setValue(s.evmGap);
+        ethRefresh->setValue(s.evmRefreshSeconds);
+        const QList<wallet::NetworkInfo>& list = wallet::networks();
+        for (qsizetype i = 0; i < list.size(); ++i)
+            servers.at(i)->setPlainText(s.servers.value(list.at(i).id).join(QLatin1Char('\n')));
     }
 };
 
@@ -220,7 +210,9 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     ui_->ethGap = makeSpin(scan.card, kGapMin, kGapMax, 10, QStringLiteral(" addresses"),
                            QStringLiteral("Unused Ethereum addresses checked past the last used one"));
     ui_->ethRefresh = makeSpin(scan.card, kRefreshMinSeconds, kRefreshMaxSeconds, 15, QStringLiteral(" s"),
-                               QStringLiteral("How often every known Ethereum address is read again"));
+                               QStringLiteral("How soon a new Ethereum balance shows. A wallet too large to read "
+                                              "whole in this time reads its unused next addresses and those holding "
+                                              "a balance this often, and the rest as fast as the endpoints allow."));
     ui_->scanForm->addRow(QStringLiteral("Bitcoin receive gap"), ui_->receiveGap);
     ui_->scanForm->addRow(QStringLiteral("Bitcoin change gap"), ui_->changeGap);
     ui_->scanForm->addRow(QStringLiteral("Ethereum gap"), ui_->ethGap);
@@ -232,16 +224,19 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
         QStringLiteral("One per line; an empty list uses the built-in servers. Every connection uses "
                        "TLS and checks the server's certificate."));
     ui_->networkForm = page::addSectionForm(network);
-    ui_->electrum = makeListEdit(network.card, QStringLiteral("Built-in servers (host:port):"),
-                                 electrumDefaults());
-    ui_->electrumInUse = makeCaption(network.card);
-    ui_->networkForm->addRow(QStringLiteral("Electrum servers"),
-                             withCaption(network.card, ui_->electrum, ui_->electrumInUse));
-    ui_->ethRpc = makeListEdit(network.card, QStringLiteral("Built-in endpoints (https:// URLs):"),
-                               net::defaultEthEndpoints());
-    ui_->ethInUse = makeCaption(network.card);
-    ui_->networkForm->addRow(QStringLiteral("Ethereum RPC URLs"),
-                             withCaption(network.card, ui_->ethRpc, ui_->ethInUse));
+    for (const wallet::NetworkInfo& info : wallet::networks()) {
+        const bool utxo = info.family == wallet::Family::Utxo;
+        auto* edit = makeListEdit(network.card,
+                                  utxo ? QStringLiteral("Built-in servers (host:port):")
+                                       : QStringLiteral("Built-in endpoints (https:// URLs):"),
+                                  info.servers);
+        auto* caption = makeCaption(network.card);
+        ui_->servers.append(edit);
+        ui_->inUse.append(caption);
+        ui_->networkForm->addRow(utxo ? QStringLiteral("%1 Electrum servers").arg(info.name)
+                                      : QStringLiteral("%1 RPC URLs").arg(info.name),
+                                 withCaption(network.card, edit, caption));
+    }
     column->addWidget(network.card);
 
     const page::Section walletSection = page::makeSection(
@@ -288,12 +283,8 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
         // the stored settings themselves changed (a file loaded, everything removed).
         connect(controller_, &WalletController::walletChanged, this, [this] {
             const wallet::ScanSettings& s = controller_->store().settings;
-            const wallet::ScanSettings& f = ui_->filled;
-            if (s.btcReceiveGap != f.btcReceiveGap || s.btcChangeGap != f.btcChangeGap || s.ethGap != f.ethGap
-                || s.ethRefreshSeconds != f.ethRefreshSeconds || s.electrumServers != f.electrumServers
-                || s.ethEndpoints != f.ethEndpoints) {
+            if (!(s == ui_->filled))
                 ui_->fill(s);
-            }
             rebuildWallet();
             updateInUse();
         });
@@ -318,7 +309,8 @@ void SettingsPage::rebuildWallet()
                               : wallets == 1
                                   ? trText(QStringLiteral("1 wallet on this PC."))
                                   : trText(QStringLiteral("%1 wallets on this PC.")).arg(wallets));
-    ui_->removeRow->setVisible(wallets > 0);
+    // Older files beside wallet.dat hold keys too, with or without a wallet left.
+    ui_->removeRow->setVisible(wallets > 0 || (controller_ && controller_->walletFilesKeptAside() > 0));
     // Labels of every card share one column.
     page::finishForms({ui_->scanForm, ui_->networkForm});
 }
@@ -326,12 +318,12 @@ void SettingsPage::rebuildWallet()
 void SettingsPage::updateInUse()
 {
     const bool active = controller_ && controller_->hasWallet();
-    const QString server = active ? controller_->electrumServer() : QString();
-    const QString endpoint = active ? controller_->ethEndpoint() : QString();
-    ui_->electrumInUse->setText(server.isEmpty() ? trText(QStringLiteral("No server connected"))
-                                                 : trText(QStringLiteral("In use: %1")).arg(server));
-    ui_->ethInUse->setText(endpoint.isEmpty() ? trText(QStringLiteral("No endpoint in use"))
-                                              : trText(QStringLiteral("In use: %1")).arg(endpoint));
+    const QList<wallet::NetworkInfo>& list = wallet::networks();
+    for (qsizetype i = 0; i < list.size(); ++i) {
+        const QString server = active ? controller_->networkStatus(list.at(i).network).server : QString();
+        ui_->inUse.at(i)->setText(server.isEmpty() ? trText(QStringLiteral("No server in use"))
+                                                   : trText(QStringLiteral("In use: %1")).arg(server));
+    }
 }
 
 void SettingsPage::resetToDefaults()
@@ -347,31 +339,38 @@ void SettingsPage::save()
 {
     if (!controller_)
         return;
-    QStringList servers;
-    QStringList endpoints;
-    int bad = -1;
-    if (!readLines(ui_->electrum, acceptElectrum, &servers, &bad)) {
-        selectLine(ui_->electrum, bad);
-        Feedback::show(this, Feedback::Type::Error,
-                       trText(QStringLiteral("Electrum servers, line %1: use host:port")).arg(bad + 1));
-        return;
-    }
-    if (!readLines(ui_->ethRpc, acceptRpc, &endpoints, &bad)) {
-        selectLine(ui_->ethRpc, bad);
-        Feedback::show(this, Feedback::Type::Error,
-                       trText(QStringLiteral("Ethereum RPC URLs, line %1: use an https:// URL"))
-                           .arg(bad + 1));
-        return;
+    QMap<QString, QStringList> servers;
+    const QList<wallet::NetworkInfo>& list = wallet::networks();
+    for (qsizetype i = 0; i < list.size(); ++i) {
+        const wallet::NetworkInfo& info = list.at(i);
+        const bool utxo = info.family == wallet::Family::Utxo;
+        QStringList lines;
+        int bad = -1;
+        const bool read = utxo ? readLines(ui_->servers.at(i), acceptElectrum, &lines, &bad)
+                               : readLines(ui_->servers.at(i), acceptRpc, &lines, &bad);
+        if (!read) {
+            selectLine(ui_->servers.at(i), bad);
+            Feedback::show(this, Feedback::Type::Error,
+                           (utxo ? trText(QStringLiteral("%1 Electrum servers, line %2: use host:port"))
+                                 : trText(QStringLiteral("%1 RPC URLs, line %2: use an https:// URL")))
+                               .arg(info.name)
+                               .arg(bad + 1));
+            return;
+        }
+        if (!lines.isEmpty())
+            servers.insert(info.id, lines);
     }
 
     // Start from the stored settings so fields this page does not show survive.
     wallet::ScanSettings settings = controller_->store().settings;
-    settings.btcReceiveGap = ui_->receiveGap->value();
-    settings.btcChangeGap = ui_->changeGap->value();
-    settings.ethGap = ui_->ethGap->value();
-    settings.ethRefreshSeconds = ui_->ethRefresh->value();
-    settings.electrumServers = servers;
-    settings.ethEndpoints = endpoints;
+    settings.utxoReceiveGap = ui_->receiveGap->value();
+    settings.utxoChangeGap = ui_->changeGap->value();
+    settings.evmGap = ui_->ethGap->value();
+    settings.evmRefreshSeconds = ui_->ethRefresh->value();
+    for (const wallet::NetworkInfo& info : wallet::networks())
+        settings.servers.remove(info.id);
+    for (auto it = servers.cbegin(); it != servers.cend(); ++it)
+        settings.servers.insert(it.key(), it.value());
 
     askThenApply(settings, -1);
 }
@@ -450,12 +449,13 @@ void SettingsPage::apply(const wallet::ScanSettings& settings)
 
 void SettingsPage::confirmRemove()
 {
-    if (!controller_ || !controller_->hasWallet())
+    if (!controller_ || (!controller_->hasWallet() && controller_->walletFilesKeptAside() == 0))
         return;
     auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Remove all wallets"),
                                 QStringLiteral("Remove every wallet from this PC?"), QMessageBox::NoButton,
                                 this);
-    QString detail = QStringLiteral("GitWallet deletes wallet.dat (the saved xpubs and settings) and stops scanning. "
+    QString detail = QStringLiteral("GitWallet deletes wallet.dat (the saved xpubs and settings) and its database of "
+                                    "balances, and stops scanning. "
                                     "Seeds were never stored, so nothing changes on the blockchain: adding a seed "
                                     "again shows the same addresses.");
     const QList<wallet::WalletEntry>& wallets = controller_->store().wallets;

@@ -25,6 +25,8 @@ public:
 
     Amount& operator+=(const Amount& other);
     friend Amount operator+(Amount a, const Amount& b) { a += b; return a; }
+    // Stops at zero: an amount is never negative.
+    Amount& operator-=(const Amount& other);
 
     bool isZero() const { return be_.empty(); }
     int compare(const Amount& other) const; // -1, 0, 1

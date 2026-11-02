@@ -15,14 +15,17 @@
 #include "wallet/WalletStore.h"
 
 #include <QComboBox>
+#include <QDateTime>
 #include <QFileDialog>
 #include <QFontMetrics>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QScrollBar>
 #include <QSignalBlocker>
@@ -31,6 +34,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <exception>
 
 #ifdef Q_OS_WIN
@@ -41,13 +45,17 @@ namespace app::ui {
 
 namespace {
 
-// Combo indices of the two filters.
-enum ChainFilter { ChainAll, ChainBitcoin, ChainEthereum };
+// What the chain filter holds when it shows every network.
+constexpr int kAllChains = -1;
+// Combo indices of the state filter.
 enum StateFilter { StateAll, StateFunded, StateUsed };
 
 // Refresh calls CoinGecko and the public RPC endpoints, which rate-limit;
 // the same pause as the Overview page's button.
 constexpr int kRefreshCooldownMs = 3000;
+// Past this many rows a change of filter rebuilds the list and search waits for the
+// typing to stop: each costs too much to do row by row or key by key.
+constexpr int kRebuildAbove = 50000;
 
 // Narrows the table to rows whose address or path contains the search text,
 // on one chain, in one state. Sorting is the base class's, on the model's
@@ -59,8 +67,13 @@ public:
 
     void setQuery(const QString& query)
     {
-        if (query != query_)
-            change([&] { query_ = query; });
+        if (query == query_)
+            return;
+        change([&] {
+            query_ = query;
+            static const QRegularExpression pathLike(QStringLiteral("^[mM0-9'/]*$"));
+            pathQuery_ = pathLike.match(query).hasMatch();
+        });
     }
     void setChain(int chain)
     {
@@ -78,9 +91,10 @@ public:
             change([&] { wallet_ = wallet; });
     }
     // A combo narrows the list (the search text is reported separately).
-    bool filtered() const { return wallet_ != 0 || chain_ != ChainAll || state_ != StateAll; }
+    bool filtered() const { return wallet_ != 0 || chain_ != kAllChains || state_ != StateAll; }
     // The search text or a combo hides rows; otherwise every row passes.
     bool narrowed() const { return filtered() || !query_.isEmpty(); }
+    bool accepts(int sourceRow) const { return filterAcceptsRow(sourceRow, QModelIndex()); }
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const override
@@ -91,8 +105,7 @@ protected:
         const QModelIndex first = source->index(sourceRow, 0, sourceParent);
         if (wallet_ != 0 && first.data(AddressTableModel::WalletRole).toUInt() != wallet_)
             return false;
-        if (chain_ != ChainAll
-            && first.data(AddressTableModel::IsBitcoinRole).toBool() != (chain_ == ChainBitcoin))
+        if (chain_ != kAllChains && first.data(AddressTableModel::NetworkRole).toInt() != chain_)
             return false;
         if (state_ != StateAll) {
             const auto state =
@@ -104,24 +117,35 @@ protected:
         }
         if (query_.isEmpty())
             return true;
-        const QString address = first.data(AddressTableModel::AddressRole).toString();
-        const QString path =
-            source->index(sourceRow, AddressTableModel::ColPath, sourceParent).data().toString();
-        return address.contains(query_, Qt::CaseInsensitive) || path.contains(query_, Qt::CaseInsensitive);
+        if (first.data(AddressTableModel::AddressRole).toString().contains(query_, Qt::CaseInsensitive))
+            return true;
+        // A path only has so many kinds of character, and building one costs more than the search.
+        return pathQuery_
+               && source->index(sourceRow, AddressTableModel::ColPath, sourceParent).data().toString().contains(query_, Qt::CaseInsensitive);
     }
 
 private:
     template <typename Apply>
     void change(Apply apply)
     {
+        // Row by row the filter pays for every stretch of rows it keeps or drops, each
+        // as long as the rows after it: tens of seconds for a query that keeps every third
+        // of a large wallet's rows. Thrown away, it reads them all once and sorts once.
+        const QAbstractItemModel* source = sourceModel();
+        if (source && source->rowCount() > kRebuildAbove) {
+            apply();
+            invalidate();
+            return;
+        }
         beginFilterChange();
         apply();
         endFilterChange(Direction::Rows);
     }
 
+    bool pathQuery_ = true;
     QString query_;
     quint32 wallet_ = 0; // 0: every wallet
-    int chain_ = ChainAll;
+    int chain_ = kAllChains;
     int state_ = StateAll;
 };
 
@@ -169,15 +193,25 @@ QString csvNumber(QString plain, const CsvFormat& format)
 }
 
 // The row's amount of `info` in whole units, every digit kept; empty for an asset
-// of the other chain, and for a zero that may only mean "no answer yet".
+// of another network, and for a zero that may only mean "no answer yet".
 QString csvAmount(const wallet::AddressRow& row, const wallet::AssetInfo& info, const CsvFormat& format)
 {
-    if ((info.asset == wallet::Asset::BTC) != row.isBitcoin())
+    if (info.network != row.network)
         return QString();
     const chain::Amount amount = row.amount(info.asset);
     if (amount.isZero() && !row.checked)
         return QString();
     return csvNumber(QString::fromStdString(amount.format(info.decimals, info.decimals)), format);
+}
+
+// A column of the export: the symbol, with its network where two networks share it.
+QString csvTitle(const wallet::AssetInfo& info)
+{
+    const QList<wallet::AssetInfo>& all = wallet::assets();
+    const auto same = std::count_if(all.cbegin(), all.cend(), [&info](const wallet::AssetInfo& other) {
+        return other.symbol == info.symbol;
+    });
+    return same > 1 ? QStringLiteral("%1 %2").arg(info.symbol, wallet::networkInfo(info.network).name) : info.symbol;
 }
 
 // "500 addresses · 3 funded", or "12 of 500 addresses · 1 funded" while a
@@ -216,6 +250,9 @@ QIcon refreshIcon()
 
 } // namespace
 
+// How long search waits for the next key, on a list this large.
+constexpr int kSearchPauseMs = 250;
+
 struct AddressesPage::Ui : QObject
 {
     using QObject::QObject;
@@ -234,6 +271,7 @@ struct AddressesPage::Ui : QObject
     QWidget* waiting = nullptr;  // a wallet whose first addresses are not derived yet
     QWidget* noResults = nullptr;
     QTimer* update = nullptr;    // batches recounts while a scan streams rows in
+    QTimer* searchPause = nullptr; // on a large list, the query waits for the typing to stop
     QTimer* cooldown = nullptr;  // Refresh stays disabled while it runs
 };
 
@@ -260,9 +298,9 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     view->setTextElideMode(Qt::ElideMiddle); // a cut address keeps both ends
     view->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
     QHeaderView* header = view->horizontalHeader();
-    // configureTable() makes headers inert; this list sorts on a header click
-    // (a third click returns to the scan order). Path order by default: each
-    // chain's addresses together, by index.
+    // configureTable() makes headers inert; this list sorts on a header click (a third
+    // click returns to the order the rows came in). Path order by default: each chain's
+    // addresses together, by index.
     header->setSectionsClickable(true);
     header->setSortIndicatorClearable(true);
     header->setHighlightSections(false);
@@ -289,9 +327,12 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->wallet->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->wallet->setMaximumWidth(page::kFieldMaxW / 2); // a long name is cut, not the toolbar
     ui_->chain = new QComboBox(bar.widget);
-    ui_->chain->addItems({QStringLiteral("All chains"), QStringLiteral("Bitcoin"), QStringLiteral("Ethereum")});
+    ui_->chain->addItem(QStringLiteral("All chains"), kAllChains);
+    for (const wallet::NetworkInfo& network : wallet::networks())
+        ui_->chain->addItem(network.name, int(network.network));
     ui_->chain->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->state = new QComboBox(bar.widget);
+    ui_->state->setObjectName(QStringLiteral("stateFilter"));
     ui_->state->addItems({QStringLiteral("All states"), QStringLiteral("Funded"), QStringLiteral("Used")});
     ui_->state->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->state->setToolTip(QStringLiteral("Funded: holds a balance now. Used: has transactions or a balance."));
@@ -307,7 +348,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
                                               "anyone who reads it sees these addresses and balances."));
     bar.right->addWidget(ui_->exportCsv);
     ui_->refresh = new QPushButton(QStringLiteral("Refresh"), bar.widget);
-    ui_->refresh->setToolTip(QStringLiteral("Fetch prices and Ethereum balances now (Bitcoin updates live)"));
+    ui_->refresh->setToolTip(QStringLiteral("Fetch prices and read the balances that are not followed live, now"));
     page::setLabeledIcon(ui_->refresh, refreshIcon());
     bar.right->addWidget(ui_->refresh);
     root->addWidget(bar.widget);
@@ -321,7 +362,19 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->cooldown->setInterval(kRefreshCooldownMs);
     connect(ui_->cooldown, &QTimer::timeout, this, &AddressesPage::updateState);
 
+    ui_->searchPause = new QTimer(this);
+    ui_->searchPause->setSingleShot(true);
+    ui_->searchPause->setInterval(kSearchPauseMs);
+    connect(ui_->searchPause, &QTimer::timeout, this, [this] {
+        ui_->filter->setQuery(ui_->search->text().trimmed());
+        updateState();
+    });
     connect(ui_->search, &QLineEdit::textChanged, this, [this](const QString& text) {
+        if (ui_->model->rowCount() > kRebuildAbove) {
+            ui_->searchPause->start();
+            return;
+        }
+        ui_->searchPause->stop();
         ui_->filter->setQuery(text.trimmed());
         updateState();
     });
@@ -329,8 +382,8 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
         updateState();
     });
-    connect(ui_->chain, &QComboBox::currentIndexChanged, this, [this](int index) {
-        ui_->filter->setChain(index);
+    connect(ui_->chain, &QComboBox::currentIndexChanged, this, [this](int) {
+        ui_->filter->setChain(ui_->chain->currentData().toInt());
         updateState();
     });
     connect(ui_->state, &QComboBox::currentIndexChanged, this, [this](int index) {
@@ -342,7 +395,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
             return;
         controller_->refresh();
         Feedback::show(ui_->refresh, Feedback::Type::Info,
-                       trText(QStringLiteral("Refreshing prices and Ethereum balances")));
+                       trText(QStringLiteral("Refreshing prices and balances")));
         ui_->cooldown->start();
         ui_->refresh->setEnabled(false);
     });
@@ -372,6 +425,8 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
             rebuildWalletFilter();
             updateState();
         });
+        // The count says when the figures are saved ones, and export waits for the load.
+        connect(controller_, &WalletController::statusChanged, this, &AddressesPage::scheduleUpdate);
     }
     rebuildWalletFilter();
     updateState();
@@ -414,7 +469,10 @@ void AddressesPage::chooseExportFile()
         return;
     QString error;
     if (exportCsv(path, &error))
-        Feedback::show(ui_->exportCsv, Feedback::Type::Success, trText(QStringLiteral("Addresses exported")));
+        Feedback::show(ui_->exportCsv, Feedback::Type::Success,
+                       controller_ && controller_->showingSaved()
+                           ? trText(QStringLiteral("Addresses exported, with saved balances still being checked"))
+                           : trText(QStringLiteral("Addresses exported")));
     else
         Feedback::show(this, Feedback::Type::Error, error);
 }
@@ -425,11 +483,21 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
     const net::PriceFeed* prices = controller_ ? controller_->prices() : nullptr;
     const CsvFormat format = csvFormat();
     QStringList lines;
-    lines << QStringList{QStringLiteral("wallet"), QStringLiteral("chain"), QStringLiteral("type"),
-                         QStringLiteral("path"), QStringLiteral("address"), QStringLiteral("state"),
-                         QStringLiteral("BTC"), QStringLiteral("ETH"), QStringLiteral("USDT"),
-                         QStringLiteral("USDC"), QStringLiteral("USD")}
-                 .join(format.separator);
+    QStringList titles{QStringLiteral("wallet"), QStringLiteral("chain"), QStringLiteral("type"),
+                       QStringLiteral("path"), QStringLiteral("address"), QStringLiteral("state")};
+    for (const wallet::AssetInfo& info : wallet::assets())
+        titles << csvTitle(info);
+    titles << QStringLiteral("USD") << QStringLiteral("balances as of") << QStringLiteral("prices as of");
+    lines << titles.join(format.separator);
+    // When each network's figures are from, and whether this run has checked them at all.
+    QHash<wallet::Network, QString> asOf;
+    for (const wallet::NetworkInfo& network : wallet::networks()) {
+        const wallet::NetworkStatus status = controller_ ? controller_->networkStatus(network.network) : wallet::NetworkStatus();
+        QString text = status.balancesAt.isValid() ? status.balancesAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")) : QString();
+        if (controller_ && controller_->showingSaved() && !status.answered)
+            text = (QStringLiteral("saved ") + text).trimmed();
+        asOf.insert(network.network, text);
+    }
     for (int row = 0; model && row < ui_->filter->rowCount(); ++row) {
         const QModelIndex first = ui_->filter->mapToSource(ui_->filter->index(row, 0));
         if (first.row() >= model->size())
@@ -440,20 +508,22 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
         fields << csvField(cell(AddressTableModel::ColWallet), format)
                << csvField(cell(AddressTableModel::ColChain), format)
                << csvField(cell(AddressTableModel::ColType), format)
-               << csvField(r.path, format)
+               << csvField(r.path(), format)
                << csvField(r.address, format)
                << csvField(cell(AddressTableModel::ColState), format);
         double usd = 0.0;
         // Only once every balance of the row has answered: a sum of this column
         // must not silently leave out an amount still unknown.
         bool priced = r.checked;
+        QList<wallet::Asset> held;
         try {
             for (const wallet::AssetInfo& info : wallet::assets()) {
                 fields << csvAmount(r, info, format);
                 const chain::Amount amount = r.amount(info.asset);
                 if (amount.isZero())
                     continue;
-                const double price = prices ? prices->usd(info.symbol) : 0.0;
+                held.append(info.asset);
+                const double price = prices ? prices->usd(info.asset) : 0.0;
                 priced = priced && price > 0.0;
                 usd += amount.toDouble(info.decimals) * price;
             }
@@ -462,6 +532,9 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
             return false;
         }
         fields << (priced ? csvNumber(QString::number(usd, 'f', 2), format) : QString());
+        fields << csvField(asOf.value(r.network), format);
+        const QDateTime pricedAt = prices && !held.isEmpty() ? prices->oldest(held) : QDateTime();
+        fields << (pricedAt.isValid() ? csvField(pricedAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")), format) : QString());
         lines << fields.join(format.separator);
     }
 
@@ -504,9 +577,9 @@ void AddressesPage::applyColumnWidths()
         header->resizeSection(column, width);
     };
     fit(AddressTableModel::ColWallet, {QStringLiteral("A wallet name")}, 0);
-    fit(AddressTableModel::ColChain, {QStringLiteral("BTC"), QStringLiteral("ETH")}, 0);
+    fit(AddressTableModel::ColChain, {QStringLiteral("Bitcoin"), QStringLiteral("Ethereum")}, 0);
     fit(AddressTableModel::ColType,
-        {QStringLiteral("Native SegWit"), QStringLiteral("Nested SegWit"), QStringLiteral("Ethereum")}, 0);
+        {QStringLiteral("Native SegWit"), QStringLiteral("Nested SegWit"), QStringLiteral("Account")}, 0);
     fit(AddressTableModel::ColPath,
         {QStringLiteral("m/84'/0'/0'/1/00000"), QStringLiteral("m/44'/60'/0'/0/00000")}, 0);
     // Addresses differ in glyph widths: the two public test vectors plus slack.
@@ -559,21 +632,25 @@ void AddressesPage::updateState()
     ui_->refresh->setEnabled(hasWallet && !ui_->cooldown->isActive());
 
     const int shown = ui_->filter->rowCount();
-    ui_->exportCsv->setEnabled(shown > 0);
+    // Not part of what the database kept, with nothing to say so.
+    ui_->exportCsv->setEnabled(shown > 0 && !(controller_ && controller_->loadingSaved()));
     const int total = ui_->model->rowCount();
     int funded = 0;
     if (!ui_->filter->narrowed()) {
         // Every row shows: the model counts them, so a scan streaming in
         // thousands of rows costs no recount per burst.
         funded = fundedAmong(controller_ ? controller_->model() : nullptr, total);
-    } else {
-        for (int row = 0; row < shown; ++row) {
-            const QVariant state = ui_->filter->index(row, 0).data(AddressTableModel::StateRole);
-            if (state.toInt() == int(wallet::AddressState::Funded))
+    } else if (const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr) {
+        // Few rows hold anything: the filter is only asked about those.
+        for (int row = 0; row < total && row < model->size(); ++row) {
+            if (model->at(row).state() == wallet::AddressState::Funded && ui_->filter->accepts(row))
                 ++funded;
         }
     }
-    ui_->count->setText(hasWallet ? countText(shown, total, funded) : QString());
+    QString countLine = hasWallet ? countText(shown, total, funded) : QString();
+    if (hasWallet && controller_->showingSaved())
+        countLine += QLatin1String(" · ") + trText(QStringLiteral("saved, being checked"));
+    ui_->count->setText(countLine);
     ui_->count->setVisible(hasWallet);
 
     // Without a wallet a leftover search or filter must not turn the

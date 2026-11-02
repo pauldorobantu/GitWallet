@@ -22,7 +22,7 @@ namespace {
 QString accountPath(const wallet::AccountKey& key)
 {
     try {
-        return QString::fromStdString(chain::accountRootPath(key.type, key.account));
+        return QString::fromStdString(chain::accountRootPath(key.type, key.account, key.format()));
     } catch (const std::exception&) {
         return QString();
     }

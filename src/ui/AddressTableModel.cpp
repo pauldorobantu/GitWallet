@@ -24,21 +24,15 @@ namespace {
 // its 18 (truncated, never rounded up). The tooltip shows every digit.
 constexpr int kShownFraction = 8;
 
-// BTC lives on Bitcoin rows; ETH and the ERC-20 tokens on Ethereum rows.
-bool onChain(const wallet::AddressRow& row, const wallet::AssetInfo& info)
-{
-    return (info.asset == wallet::Asset::BTC) == row.isBitcoin();
-}
-
 const wallet::AssetInfo& coinOf(const wallet::AddressRow& row)
 {
-    return wallet::assetInfo(row.isBitcoin() ? wallet::Asset::BTC : wallet::Asset::ETH);
+    return wallet::assetInfo(wallet::networkInfo(row.network).coin);
 }
 
 double priceOf(const WalletController* controller, const wallet::AssetInfo& info)
 {
     const net::PriceFeed* feed = controller ? controller->prices() : nullptr;
-    return feed ? feed->usd(info.symbol) : 0.0;
+    return feed ? feed->usd(info.asset) : 0.0;
 }
 
 QList<double> currentPrices(const WalletController* controller)
@@ -70,15 +64,14 @@ QString amountText(const chain::Amount& value, const wallet::AssetInfo& info, in
     return groupThousands(plain) + QLatin1Char(' ') + info.symbol;
 }
 
-// A signed satoshi amount (an unconfirmed delta): "+0.0012 BTC", "-0.0012 BTC".
-QString signedBtcText(qint64 sats)
+// A signed amount in smallest units (an unconfirmed delta): "+0.0012 BTC", "-0.0012 BTC".
+QString signedCoinText(qint64 units, const wallet::AssetInfo& coin)
 {
-    const wallet::AssetInfo& btc = wallet::assetInfo(wallet::Asset::BTC);
     // Unsigned negation is defined for every value, qAbs(INT64_MIN) is not.
-    const quint64 magnitude = sats < 0 ? 0 - quint64(sats) : quint64(sats);
+    const quint64 magnitude = units < 0 ? 0 - quint64(units) : quint64(units);
     const QString digits =
-        QString::fromStdString(chain::Amount::fromU64(magnitude).format(btc.decimals, btc.decimals));
-    return QLatin1Char(sats < 0 ? '-' : '+') + groupThousands(digits) + QLatin1Char(' ') + btc.symbol;
+        QString::fromStdString(chain::Amount::fromU64(magnitude).format(coin.decimals, coin.decimals));
+    return QLatin1Char(units < 0 ? '-' : '+') + groupThousands(digits) + QLatin1Char(' ') + coin.symbol;
 }
 
 QString usdText(double value)
@@ -123,19 +116,15 @@ RowValue valueOf(const WalletController* controller, const wallet::AddressRow& r
 {
     RowValue v;
     v.priced = true;
-    for (const wallet::AssetInfo& info : wallet::assets()) {
-        if (!onChain(row, info))
-            continue;
-        const chain::Amount amount = row.amount(info.asset);
-        if (amount.isZero())
-            continue;
+    row.forEachBalance([&](wallet::Asset asset, const chain::Amount& amount) {
+        const wallet::AssetInfo& info = wallet::assetInfo(asset);
         v.holds = true;
         const double price = priceOf(controller, info);
         if (price > 0.0)
             v.usd += amount.toDouble(info.decimals) * price;
         else
             v.priced = false;
-    }
+    });
     if (!v.holds)
         v.priced = priceOf(controller, coinOf(row)) > 0.0;
     return v;
@@ -157,17 +146,14 @@ double sortValue(const WalletController* controller, const wallet::AddressRow& r
 QString balanceText(const wallet::AddressRow& row)
 {
     QStringList parts;
-    for (const wallet::AssetInfo& info : wallet::assets()) {
-        if (!onChain(row, info))
-            continue;
-        const chain::Amount amount = row.amount(info.asset);
-        if (!amount.isZero())
-            parts << amountText(amount, info, qMin(info.decimals, kShownFraction));
-    }
+    row.forEachBalance([&](wallet::Asset asset, const chain::Amount& amount) {
+        const wallet::AssetInfo& info = wallet::assetInfo(asset);
+        parts << amountText(amount, info, qMin(info.decimals, kShownFraction));
+    });
     return parts.isEmpty() ? QStringLiteral("0") : parts.join(QStringLiteral(" · "));
 }
 
-// Every asset of the row's chain at full precision, zeros included. A row that
+// Every asset of the row's network at full precision, zeros included. A row that
 // is not fully checked lists only what has answered (a zero there may be a
 // failed call) and says the rest is pending.
 QString balanceTip(const wallet::AddressRow& row)
@@ -175,16 +161,15 @@ QString balanceTip(const wallet::AddressRow& row)
     if (row.state() == wallet::AddressState::Unknown)
         return pendingTip(row);
     QStringList lines;
-    for (const wallet::AssetInfo& info : wallet::assets()) {
-        if (!onChain(row, info))
-            continue;
-        const chain::Amount amount = row.amount(info.asset);
+    for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
+        const wallet::AssetInfo& info = wallet::assetInfo(asset);
+        const chain::Amount amount = row.amount(asset);
         if (row.checked || !amount.isZero())
             lines << amountText(amount, info, info.decimals);
     }
-    if (row.isBitcoin() && row.btcUnconfirmed != 0)
-        lines << trText(QStringLiteral("Unconfirmed: %1")).arg(signedBtcText(row.btcUnconfirmed));
-    if (!row.isBitcoin() && (row.checked || row.nonce > 0))
+    if (row.isUtxo() && row.unconfirmed != 0)
+        lines << trText(QStringLiteral("Unconfirmed: %1")).arg(signedCoinText(row.unconfirmed, coinOf(row)));
+    if (!row.isUtxo() && (row.checked || row.nonce > 0))
         lines << trText(QStringLiteral("Transactions sent: %1")).arg(row.nonce);
     if (!row.checked)
         lines << pendingTip(row);
@@ -196,13 +181,14 @@ QString balanceTip(const wallet::AddressRow& row)
 QString usdTip(const WalletController* controller, const wallet::AddressRow& row)
 {
     QStringList lines;
-    for (const wallet::AssetInfo& info : wallet::assets()) {
-        if (!onChain(row, info))
-            continue;
+    for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
+        const wallet::AssetInfo& info = wallet::assetInfo(asset);
         const double price = priceOf(controller, info);
         lines << (price > 0.0 ? QStringLiteral("1 %1 = %2").arg(info.symbol, usdText(price))
                               : trText(QStringLiteral("1 %1: no price yet")).arg(info.symbol));
     }
+    if (controller)
+        lines << controller->pricesLine();
     if (!row.checked)
         lines << pendingTip(row);
     return lines.join(QLatin1Char('\n'));
@@ -218,7 +204,7 @@ QString typeLabel(chain::ScriptType type)
     case chain::ScriptType::P2PKH:
         return trText(QStringLiteral("Legacy"));
     case chain::ScriptType::EthAccount:
-        return trText(QStringLiteral("Ethereum"));
+        return trText(QStringLiteral("Account"));
     }
     return QString();
 }
@@ -240,14 +226,17 @@ int typeRank(chain::ScriptType type)
     return 4;
 }
 
-// Paths sort numerically: wallet, type, account, change, index — so ".../0/10"
-// follows ".../0/9" and each wallet's chains stay together.
+// Paths sort numerically: wallet, network, type, account, change, index — so ".../0/10"
+// follows ".../0/9", and each wallet's chains stay together, as an Evm address is on
+// several networks by the same path.
 qint64 pathKey(const wallet::AddressRow& row)
 {
-    const qint64 wallet = qMin<qint64>(row.wallet, 0x7FFFF); // 19 bits
-    const qint64 account = qMin<qint64>(row.account, 0xFF);  // 8 bits
-    return (wallet << 44) | (qint64(typeRank(row.type)) << 41) | (account << 33)
-           | (qint64(row.change & 1u) << 32) | qint64(row.index);
+    const qint64 wallet = qMin<qint64>(row.wallet, 0xFFFFF);        // 20 bits
+    const qint64 network = qMin<qint64>(qint64(row.network), 0x3F); // 6 bits
+    const qint64 account = qMin<qint64>(row.account, 0xFF);         // 8 bits
+    const qint64 index = qMin<qint64>(row.index, 0x1FFFFFF);        // 25 bits
+    return (wallet << 43) | (network << 37) | (qint64(typeRank(row.type)) << 34) | (account << 26)
+           | (qint64(row.change & 1u) << 25) | index;
 }
 
 QString stateLabel(wallet::AddressState state)
@@ -297,6 +286,8 @@ int stateRank(wallet::AddressState state)
     return 0;
 }
 
+constexpr int kManyFunded = 300;
+
 QVariant rightAligned()
 {
     return QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
@@ -318,6 +309,7 @@ AddressTableModel::AddressTableModel(WalletController* controller, QObject* pare
         connect(model, &wallet::WalletModel::rowsAppended, this, &AddressTableModel::appendRows);
         connect(model, &wallet::WalletModel::rowChanged, this, &AddressTableModel::changeRow);
         connect(model, &wallet::WalletModel::cleared, this, &AddressTableModel::resetRows);
+        connect(model, &wallet::WalletModel::rowsDropped, this, &AddressTableModel::resetRows);
     }
     if (net::PriceFeed* feed = controller_->prices())
         connect(feed, &net::PriceFeed::updated, this, &AddressTableModel::refreshPrices);
@@ -361,11 +353,11 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             case ColWallet:
                 return labels_.value(row.wallet);
             case ColChain:
-                return coinOf(row).symbol;
+                return wallet::networkInfo(row.network).name;
             case ColType:
                 return typeLabel(row.type);
             case ColPath:
-                return row.path;
+                return row.path();
             case ColAddress:
                 return row.address;
             case ColBalance:
@@ -385,7 +377,7 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
             case ColWallet:
                 return labels_.value(row.wallet);
             case ColChain:
-                return row.isBitcoin() ? 0 : 1;
+                return int(row.network);
             case ColType:
                 return typeRank(row.type);
             case ColPath:
@@ -399,8 +391,8 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
                 return stateRank(row.state());
             }
             break;
-        case IsBitcoinRole:
-            return row.isBitcoin();
+        case NetworkRole:
+            return int(row.network);
         case StateRole:
             return int(row.state());
         case AddressRole:
@@ -456,6 +448,8 @@ QVariant AddressTableModel::headerData(int section, Qt::Orientation orientation,
         return QAbstractTableModel::headerData(section, orientation, role);
     if (role == Qt::TextAlignmentRole)
         return (section == ColBalance || section == ColUsd) ? rightAligned() : QVariant();
+    if (role == Qt::ToolTipRole && section == ColUsd && controller_)
+        return controller_->pricesLine();
     if (role != Qt::DisplayRole)
         return {};
     switch (section) {
@@ -502,9 +496,9 @@ void AddressTableModel::appendRows()
 
 void AddressTableModel::announceRows()
 {
-    // The wallet model only appends. Rows below rows_ never move, so every
-    // index a view holds stays valid; the views learn about the new rows here,
-    // inside begin/endInsertRows.
+    // The wallet model only appends, or says it dropped rows (a reset). Rows below rows_
+    // never move otherwise, so every index a view holds stays valid; the views learn about
+    // the new rows here, inside begin/endInsertRows.
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
     const int size = model ? model->size() : 0;
     if (size <= rows_)
@@ -541,8 +535,21 @@ void AddressTableModel::refreshPrices()
     if (now == prices_)
         return;
     prices_ = std::move(now);
-    if (rows_ > 0)
+    if (rows_ == 0)
+        return;
+    // Only a row that holds something has a figure to move. Telling the rows apart saves
+    // the sorted filter from looking at all of them again; a list sorted by value pays about
+    // a millisecond for each that moves, so past some hundred once costs less.
+    const wallet::WalletModel* model = controller_->model();
+    if (!model || model->fundedCount() > kManyFunded) {
         emit dataChanged(index(0, ColBalance), index(rows_ - 1, ColUsd));
+        return;
+    }
+    const int rows = qMin(rows_, model->size());
+    for (int row = 0; row < rows; ++row) {
+        if (model->at(row).state() == wallet::AddressState::Funded)
+            emit dataChanged(index(row, ColBalance), index(row, ColUsd));
+    }
 }
 
 void AddressTableModel::refreshLabels()

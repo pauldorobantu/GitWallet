@@ -13,20 +13,19 @@
 #include <memory>
 
 class QNetworkAccessManager;
+class QTimer;
 
 namespace net {
 
-// Public JSON-RPC endpoints that accepted batch requests and eth_call to
-// Multicall3 in a probe on 2026-10-31 (no API key needed).
-QStringList defaultEthEndpoints();
+class BudgetPool;
 
-// Ethereum JSON-RPC over HTTPS. A batch is posted as one JSON array per
-// kMaxBatch calls. The same request is retried on the next endpoint (each
+// Ethereum-style JSON-RPC over HTTPS, for one network. A batch is posted as one
+// JSON array per kMaxBatch calls. The same request is retried on the next endpoint (each
 // endpoint at most once per request) on a transport error, HTTP error, rate
 // limit (429), a malformed reply, a reply in which any call came back without
 // a result (rate limits and quotas reported in-band, disabled methods), or,
-// when the request carries eth_chainId, an answer for a chain other than
-// Ethereum mainnet: that endpoint is then skipped until setEndpoints(). One the
+// when the request carries eth_chainId, an answer for a chain other than this
+// network: that endpoint is then skipped until setEndpoints(). One the
 // caller rejects, for answers only it can judge, is tried last for a while
 // instead (see rejectEndpoint()). Every HTTP request is
 // abandoned after a fixed deadline, however slowly its server answers, so
@@ -44,28 +43,37 @@ public:
     // empty on success.
     using BatchReply = std::function<void(const QList<QJsonValue>& results, const QStringList& errors,
                                           const QStringList& endpoints)>;
-    static constexpr int kMaxBatch = 50; // larger batches are split transparently
+    static constexpr int kMaxBatch = 250; // larger batches are split transparently
 
-    explicit EthRpc(QObject* parent = nullptr);
+    // `name` is for the log; `chainId` what eth_chainId must answer; `builtIn` the
+    // endpoints used when Settings lists none, `pace` the calls a second each of those
+    // keeps answering. `budgets`, if given, paces requests per provider, shared with the
+    // other networks' clients: a request goes to the first endpoint with room for it.
+    EthRpc(const QString& name, quint64 chainId, const QStringList& builtIn, const QHash<QString, int>& pace,
+           BudgetPool* budgets, QObject* parent = nullptr);
 
-    // Empty = defaultEthEndpoints(). Starts over: requests still pending are
+    // Empty = the built-in list. Starts over: requests still pending are
     // cancelled (their replies report an error), so no answer obtained under
     // the old list arrives after this.
     void setEndpoints(const QStringList& urls);
     QString currentEndpoint() const;
+    // Ends what is pending or waiting its turn: nothing more goes out for it.
+    void cancelAll();
+    // http://127.0.0.1 too, for a test's server on this PC. Everything else stays https.
+    void allowLocalHttpForTest() { localForTest_ = true; }
 
     void call(const QString& method, const QJsonArray& params, Reply reply);
     void batch(const QList<QPair<QString, QJsonArray>>& calls, BatchReply reply);
 
     // For an endpoint whose answer the caller found unusable although nothing
-    // here could tell (an eth_call that shows no mainnet state behind a chain
-    // id of 1): requests move on from it, and for a while it is only tried
+    // here could tell (an eth_call that shows no state of this network behind the
+    // right chain id): requests move on from it, and for a while it is only tried
     // when no other endpoint is left, so one glitch never benches a healthy
     // endpoint for good. `url` as a reply named it; one not in the current
     // list is ignored.
     void rejectEndpoint(const QString& url);
 
-    // True if `url` answered eth_chainId for a chain other than mainnet since
+    // True if `url` answered eth_chainId for a chain other than this network since
     // the list was set: its replies carry that error instead of answers.
     bool isOffChain(const QString& url) const;
 
@@ -86,13 +94,24 @@ private:
     void deliver(Chunk& chunk);
     int cancelPending(const QString& why);
     QString nextEndpoint(const Chunk& chunk) const;
+    int takeBudget(const QString& url, int cost); // ms to wait; 0: it may go, and it counts
     QString moveCurrentPast(const QString& url);
     bool isDoubted(const QString& url) const;
+    bool isAvoided(const QString& url) const; // doubted, or it just failed: last in line
+    bool usableUrl(const QString& url) const;
 
+    QString name_;
+    quint64 chainId_ = 0;
+    QStringList builtIn_;
+    QHash<QString, int> pace_; // by provider (providerOf())
+    BudgetPool* budgets_ = nullptr;
+    QTimer* pumpTimer_ = nullptr; // a chunk waits for its host's budget
     QNetworkAccessManager* nam_ = nullptr;
     QStringList endpoints_;
     QStringList offChain_;                   // answered eth_chainId for another chain: skipped until setEndpoints()
     QHash<QString, QDeadlineTimer> doubted_; // rejected by the caller: tried last until the timer expires
+    QHash<QString, QDeadlineTimer> cooling_; // failed an attempt just now: the same, for a shorter time
+    bool localForTest_ = false;
     int current_ = 0;
     int nextId_ = 1;
     QList<std::shared_ptr<Chunk>> queue_; // chunks waiting for a free request slot

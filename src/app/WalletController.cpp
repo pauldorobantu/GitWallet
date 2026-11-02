@@ -2,12 +2,12 @@
 
 #include "chain/Bip39.h"
 #include "chain/Hash.h"
-#include "net/ElectrumClient.h"
-#include "net/EthRpc.h"
 #include "net/PriceFeed.h"
-#include "wallet/BtcScanner.h"
+#include "store/Ledger.h"
+#include "ui/LanguageManager.h"
 #include "wallet/BulkImport.h"
-#include "wallet/EthScanner.h"
+#include "wallet/EvmScanner.h"
+#include "wallet/UtxoScanner.h"
 #include "wallet/WalletModel.h"
 
 #include <QCryptographicHash>
@@ -36,8 +36,7 @@ namespace app {
 
 namespace {
 
-// Server rotation, endpoint failover and price refresh failures. Never carries
-// a seed or a key: only server names, addresses and counts reach it.
+// Price refresh failures. Never carries a seed or a key.
 Q_STATIC_LOGGING_CATEGORY(lcNet, "gitwallet.net")
 
 constexpr int kMinGap = 20;
@@ -48,13 +47,21 @@ constexpr int kMaxRefreshSeconds = 3600;
 // writes wallet.dat); in practice a list holds a handful of entries.
 constexpr qsizetype kMaxListEntries = 100;
 constexpr qsizetype kMaxEntryChars = 512;
-constexpr std::chrono::minutes kPriceInterval{5};
+// DefiLlama answered calls seconds apart, each for what its cache held; there is no
+// reason to ask more often than prices move on screen.
+constexpr std::chrono::minutes kPriceInterval{2};
+constexpr std::chrono::seconds kTimesInterval{30};
+// The window before this one is usually only finishing: closing can take a moment at scale.
+constexpr std::chrono::seconds kLedgerRetryInterval{5};
+constexpr int kLedgerRetriesBeforeSaying = 6;
+// A price older than this says it did not move on its own.
+constexpr qint64 kPricesOldSeconds = 3600;
 // Scanners report progress once per address (thousands in a row on a shop
 // seed); the title chip needs only a few updates a second.
 constexpr std::chrono::milliseconds kStatusThrottle{150};
-// Far above any wallet.dat GitWallet writes (WalletStore stops at 1 MiB): a
+// Far above any wallet.dat GitWallet writes (WalletStore stops at 16 MiB): a
 // larger file is not one this session loaded or wrote, and is not hashed.
-constexpr qint64 kMaxDigestBytes = qint64(16) << 20;
+constexpr qint64 kMaxDigestBytes = qint64(64) << 20;
 
 // Beside wallet.dat, so every --data-dir folder locks on its own.
 QString lockFilePath()
@@ -100,10 +107,12 @@ QString nextFreeName(const QString& base, const QSet<QString>& taken, const QSet
     }
 }
 
-// Older files an add moved aside because they could not be read, by file name.
+// Older files beside wallet.dat, by file name: what an add moved aside because it could
+// not be read, and the copy of a file of an older format from before its first rewrite.
 QStringList keptAsideFiles()
 {
-    return QDir(wallet::WalletStore::dataDir()).entryList({QStringLiteral("wallet.dat.unread-*")}, QDir::Files);
+    return QDir(wallet::WalletStore::dataDir())
+        .entryList({QStringLiteral("wallet.dat.unread-*"), QStringLiteral("wallet.dat.format*")}, QDir::Files);
 }
 
 // Why a write is refused in a second GitWallet on the same data folder.
@@ -128,13 +137,6 @@ QString withReason(const QString& what, const QString& why)
 QString storeMessage(const QString& why, const QString& fallback)
 {
     return why.trimmed().isEmpty() ? fallback : why;
-}
-
-bool hasAccounts(const QList<wallet::AccountKey>& accounts, bool bitcoin)
-{
-    return std::any_of(accounts.cbegin(), accounts.cend(), [bitcoin](const wallet::AccountKey& a) {
-        return chain::isBitcoin(a.type) == bitcoin;
-    });
 }
 
 // Server lists cleaned the way WalletStore cleans them before writing: each
@@ -166,12 +168,17 @@ QStringList cleanLines(const QStringList& lines)
 // version can never hand the scanners a gap of 0 or a million.
 wallet::ScanSettings sanitized(wallet::ScanSettings s)
 {
-    s.btcReceiveGap = std::clamp(s.btcReceiveGap, kMinGap, kMaxGap);
-    s.btcChangeGap = std::clamp(s.btcChangeGap, kMinGap, kMaxGap);
-    s.ethGap = std::clamp(s.ethGap, kMinGap, kMaxGap);
-    s.ethRefreshSeconds = std::clamp(s.ethRefreshSeconds, kMinRefreshSeconds, kMaxRefreshSeconds);
-    s.electrumServers = cleanLines(s.electrumServers);
-    s.ethEndpoints = cleanLines(s.ethEndpoints);
+    s.utxoReceiveGap = std::clamp(s.utxoReceiveGap, kMinGap, kMaxGap);
+    s.utxoChangeGap = std::clamp(s.utxoChangeGap, kMinGap, kMaxGap);
+    s.evmGap = std::clamp(s.evmGap, kMinGap, kMaxGap);
+    s.evmRefreshSeconds = std::clamp(s.evmRefreshSeconds, kMinRefreshSeconds, kMaxRefreshSeconds);
+    QMap<QString, QStringList> servers;
+    for (auto it = s.servers.cbegin(); it != s.servers.cend(); ++it) {
+        const QStringList clean = cleanLines(it.value());
+        if (!clean.isEmpty())
+            servers.insert(it.key(), clean);
+    }
+    s.servers = servers;
     return s;
 }
 
@@ -228,19 +235,24 @@ QString mnemonicProblem(const std::vector<std::string>& words, const std::string
 
 WalletController::WalletController(QObject* parent) : QObject(parent)
 {
-    // QObject deletes children in creation order. The clients go first, so a
-    // client that fails its pending requests while being destroyed still finds
-    // the scanners, and the model they write to, alive.
-    electrum_ = new net::ElectrumClient(this);
-    eth_ = new net::EthRpc(this);
     prices_ = new net::PriceFeed(this);
     model_ = new wallet::WalletModel(this);
-    btcScanner_ = new wallet::BtcScanner(electrum_, model_, this);
-    ethScanner_ = new wallet::EthScanner(eth_, model_, this);
+    scheduler_ = new wallet::Scheduler(model_, this);
+    ledger_ = new store::Ledger(model_, this);
 
     priceTimer_ = new QTimer(this);
     priceTimer_->setInterval(kPriceInterval);
     connect(priceTimer_, &QTimer::timeout, prices_, &net::PriceFeed::refresh);
+
+    timesTimer_ = new QTimer(this);
+    timesTimer_->setInterval(kTimesInterval);
+    connect(timesTimer_, &QTimer::timeout, this, &WalletController::saveTimes);
+    // Figures age with nothing else happening: what the title says goes by the time too.
+    connect(timesTimer_, &QTimer::timeout, this, &WalletController::queueStatus);
+
+    ledgerRetry_ = new QTimer(this);
+    ledgerRetry_->setInterval(kLedgerRetryInterval);
+    connect(ledgerRetry_, &QTimer::timeout, this, &WalletController::tryLedgerAgain);
 
     statusTimer_ = new QTimer(this);
     statusTimer_->setSingleShot(true);
@@ -253,33 +265,36 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     // some total, so balance changes queue a status update as well.
     connect(model_, &wallet::WalletModel::totalsChanged, this, &WalletController::queueStatus);
     connect(prices_, &net::PriceFeed::updated, this, &WalletController::totalsChanged);
-    connect(prices_, &net::PriceFeed::failed, this, [](const QString& reason) {
-        qCInfo(lcNet).noquote() << "price refresh failed, keeping the last prices:" << reason;
+    connect(prices_, &net::PriceFeed::updated, this, &WalletController::savePrices);
+    connect(prices_, &net::PriceFeed::failed, this, [this](const QString& reason) {
+        qCInfo(lcNet).noquote() << "a price source failed, keeping the last prices:" << reason;
+        emit totalsChanged(); // the prices line says so
     });
 
-    // The Settings page shows the server / endpoint in use, so a switch counts
-    // as a status change too.
-    connect(electrum_, &net::ElectrumClient::ready, this, &WalletController::statusChanged);
-    connect(electrum_, &net::ElectrumClient::connectionLost, this, &WalletController::statusChanged);
-    connect(eth_, &net::EthRpc::endpointChanged, this, &WalletController::statusChanged);
-    // Nobody else can reach the clients, so their diagnostics end up here.
-    connect(electrum_, &net::ElectrumClient::log, this,
-            [](const QString& line) { qCDebug(lcNet).noquote() << "[electrum]" << line; });
-    connect(eth_, &net::EthRpc::log, this,
-            [](const QString& line) { qCDebug(lcNet).noquote() << "[eth]" << line; });
+    // The Settings page shows the server in use, so a switch counts as a status change too.
+    connect(scheduler_, &wallet::Scheduler::serverChanged, this, &WalletController::statusChanged);
+    connect(scheduler_, &wallet::Scheduler::progress, this, &WalletController::onScanProgress);
+    connect(scheduler_, &wallet::Scheduler::scanFinished, this, &WalletController::onScanFinished);
+    connect(scheduler_, &wallet::Scheduler::problem, this, &WalletController::onScannerProblem);
 
-    // Progress is also the cue for the scanners' other states: EthScanner
-    // sends it when a pass gives up on addresses, BtcScanner when a failure
-    // makes it busy again.
-    connect(btcScanner_, &wallet::BtcScanner::progress, this, &WalletController::queueStatus);
-    connect(ethScanner_, &wallet::EthScanner::progress, this, &WalletController::queueStatus);
-    connect(btcScanner_, &wallet::BtcScanner::scanFinished, this, [this] { onScanFinished(&btcDone_); });
-    connect(ethScanner_, &wallet::EthScanner::scanFinished, this, [this] { onScanFinished(&ethDone_); });
-    // The only signal of a refresh pass that changed no row, failed or not:
-    // ethBalancesAt() and ethRefreshFailing() move then.
-    connect(ethScanner_, &wallet::EthScanner::passFinished, this, &WalletController::queueStatus);
-    connect(btcScanner_, &wallet::BtcScanner::problem, this, &WalletController::onScannerProblem);
-    connect(ethScanner_, &wallet::EthScanner::problem, this, &WalletController::onScannerProblem);
+    connect(ledger_, &store::Ledger::loaded, this, &WalletController::onLedgerLoaded);
+    connect(ledger_, &store::Ledger::problem, this, [this](const QString& message) {
+        emit errorOccurred(wallet::Problem::SavedData, message, QString());
+    });
+    connect(ledger_, &store::Ledger::setAside, this, [this](const QString& file) {
+        emit errorOccurred(wallet::Problem::SavedDataAside,
+                           QStringLiteral("The saved balances could not be read, so they were kept as %1 and are being "
+                                          "read again.")
+                               .arg(QDir::toNativeSeparators(file)),
+                           QString());
+    });
+    // The rows they describe are gone.
+    connect(model_, &wallet::WalletModel::cleared, this, [this] {
+        if (model_->size() == 0 && !waitingForLedger_) {
+            showingSaved_ = false;
+            savedAt_ = QDateTime();
+        }
+    });
 }
 
 WalletController::~WalletController()
@@ -291,6 +306,7 @@ WalletController::~WalletController()
     // destroyed().
     blockSignals(true);
     stopServices();
+    ledger_->close();
 }
 
 bool WalletController::hasWallet() const
@@ -327,8 +343,9 @@ bool WalletController::loadExisting(QString* error)
 
     // Nothing runs yet at startup; a second call starts again from a clean slate.
     stopServices();
+    ledger_->close();
     model_->clear();
-    startServices();
+    openLedger();
     emit walletChanged();
     emit statusChanged();
     // Settings saved before the first import make a file without accounts:
@@ -494,12 +511,18 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
     }
 
     // Save before touching anything else: on failure the wallets shown so far
-    // keep running as they were.
+    // keep running as they were. The first save of a wallet.dat brings the key of its
+    // database along.
     const qsizetype before = store_.wallets.size();
     store_.wallets.append(entries);
+    const bool newKey = store_.databaseKey.isEmpty();
+    if (newKey)
+        store_.databaseKey = wallet::WalletStore::newDatabaseKey();
     QString saveError;
     if (!saveStore(&saveError)) {
         store_.wallets.remove(before, entries.size());
+        if (newKey)
+            store_.databaseKey.clear();
         // The file moved aside goes back, so the next start warns about it again.
         if (!movedTo.isEmpty())
             QFile::rename(movedTo, wallet::WalletStore::filePath());
@@ -507,7 +530,10 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
         return 0;
     }
 
-    restartServices();
+    if (ledger_->isOpen())
+        restartServices();
+    else
+        openLedger();
     emit walletChanged();
     emit statusChanged();
     if (!movedTo.isEmpty()) {
@@ -547,6 +573,7 @@ bool WalletController::removeWallet(quint32 id, QString* error)
     }
 
     stopServices();
+    ledger_->forgetWallet(id);
     model_->removeWallet(id);
     startServices();
     emit walletChanged();
@@ -613,6 +640,7 @@ bool WalletController::removeAllWallets(QString* error)
 
     QString why;
     if (!store_.remove(&why)) {
+        // WalletStore::remove() resets the store only once the file is gone.
         setError(error, storeMessage(why, QStringLiteral("The wallet file could not be deleted.")));
         if (hasWallet()) {
             // Still on disk and still loaded: keep showing and watching it.
@@ -630,14 +658,28 @@ bool WalletController::removeAllWallets(QString* error)
     }
 
     fileDigest_.clear(); // no file any more
-    // "Every wallet": the unread files an add kept aside hold wallets too.
+    // "Every wallet": the unread files an add kept aside hold wallets too, and the
+    // database holds their addresses.
     const QDir folder(wallet::WalletStore::dataDir());
     const QStringList aside = keptAsideFiles();
-    for (const QString& name : aside)
-        QFile::remove(folder.filePath(name));
+    QStringList left;
+    for (const QString& name : aside) {
+        if (!QFile::remove(folder.filePath(name)))
+            left.append(QDir::toNativeSeparators(folder.filePath(name)));
+    }
+    for (const QString& file : ledger_->destroy(wallet::WalletStore::databasePath()))
+        left.append(QDir::toNativeSeparators(file));
+    showingSaved_ = false;
+    savedAt_ = QDateTime();
     model_->clear();
     emit walletChanged();
     emit statusChanged();
+    if (!left.isEmpty())
+        emit errorOccurred(wallet::Problem::FilesLeft,
+                           QStringLiteral("The wallets were removed, but these files could not be deleted, and hold "
+                                          "their public keys or addresses: %1. Delete them when no program holds them.")
+                               .arg(left.join(QStringLiteral(", "))),
+                           QString());
     return true;
 }
 
@@ -662,7 +704,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         quint32 index;
         bool funded;
         bool found; // a fresh scan reads it as used, which is what moves its window
-        bool bitcoin;
+        wallet::Network network;
         bool pastGap = false; // beyond what its chain's gap alone reaches from index 0
     };
     struct Chain {
@@ -678,22 +720,21 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         const bool funded = r.state() == wallet::AddressState::Funded;
         if (!r.used && !funded)
             continue;
-        const QString key = QStringLiteral("%1/%2/%3/%4").arg(r.wallet).arg(int(r.type)).arg(r.account).arg(r.change);
-        // Ethereum's `used` is sticky and a fresh scan starts without it: an address
-        // that gave its tokens away by signature reads as unused again.
-        const bool found = funded || (r.isBitcoin() ? r.used : r.nonce > 0);
+        const QString key = QStringLiteral("%1/%2/%3/%4/%5").arg(r.wallet).arg(int(r.network)).arg(int(r.type)).arg(r.account).arg(r.change);
+        // What moves an account's window is what its row shows: an address that gave its
+        // tokens away by signature reads as unused again.
+        const bool found = funded || (r.isUtxo() ? r.used : r.nonce > 0);
         Chain& chain = chains[key];
-        chain.rows.append({r.index, funded, found, r.isBitcoin()});
-        chain.gapNow = !r.isBitcoin() ? s.ethGap : r.change == 0 ? s.btcReceiveGap : s.btcChangeGap;
-        chain.gapBefore = !r.isBitcoin() ? before.ethGap : r.change == 0 ? before.btcReceiveGap : before.btcChangeGap;
+        chain.rows.append({r.index, funded, found, r.network});
+        chain.gapNow = !r.isUtxo() ? s.evmGap : r.change == 0 ? s.utxoReceiveGap : s.utxoChangeGap;
+        chain.gapBefore = !r.isUtxo() ? before.evmGap : r.change == 0 ? before.utxoReceiveGap : before.utxoChangeGap;
     }
 
     // A fresh scan walks each chain from index 0, up to where the gap ends. What it
-    // reaches, and how far that takes the windows past their gaps.
+    // reaches, and how far that takes the windows past their gaps, per network.
     struct Reach {
         QList<Row> rows;
-        qint64 btcGrown = 0;
-        qint64 ethGrown = 0;
+        QHash<wallet::Network, qint64> grown;
     };
     GapImpact impact;
     const bool cleared = gapsFall(before, s); // otherwise the rows stay as they are
@@ -718,7 +759,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
                         ++leftOut->funded;
                 }
             }
-            (it->rows.constFirst().bitcoin ? reach.btcGrown : reach.ethGrown) += last + 1;
+            reach.grown[it->rows.constFirst().network] += last + 1;
         }
         return reach;
     };
@@ -726,47 +767,44 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
     const Reach reachBefore = walk(false, nullptr);
 
     // A run of used addresses has no hole for the walk to find, but a scan also stops
-    // at a limit over all accounts, which the Bitcoin one falls with the gaps. What
+    // at a limit over all accounts, which a UTXO network's falls with the gaps. What
     // these settings want past the limit: all of it if the rows go, as nothing they
     // hold then stays; else beyond what the settings in use want already.
-    qint64 btcGapsNow = 0;
-    qint64 btcGapsBefore = 0;
-    qint64 ethAccounts = 0;
     const QList<wallet::AccountKey> accounts = store_.allAccounts();
-    for (const wallet::AccountKey& key : accounts) {
-        if (chain::isBitcoin(key.type)) {
-            btcGapsNow += qint64(s.btcReceiveGap) + s.btcChangeGap;
-            btcGapsBefore += qint64(before.btcReceiveGap) + before.btcChangeGap;
-        } else {
-            ++ethAccounts;
-        }
-    }
     const auto overBy = [](qint64 wanted, qint64 limit) { return qMax(qint64(0), wanted - limit); };
-    const qint64 btcLimit = wallet::BtcScanner::rowLimitFor(btcGapsNow);
-    const qint64 ethLimit = wallet::EthScanner::kMaxFollowedRows;
-    const qint64 btcWanted = overBy(btcGapsNow + reachNow.btcGrown, btcLimit);
-    const qint64 ethWanted = overBy(ethAccounts * s.ethGap + reachNow.ethGrown, ethLimit);
-    const qint64 btcOver =
-        cleared ? btcWanted
-                : qMax(qint64(0), btcWanted - overBy(btcGapsBefore + reachBefore.btcGrown, wallet::BtcScanner::rowLimitFor(btcGapsBefore)));
-    const qint64 ethOver =
-        cleared ? ethWanted : qMax(qint64(0), ethWanted - overBy(ethAccounts * before.ethGap + reachBefore.ethGrown, ethLimit));
-    impact.overLimit = btcOver + ethOver;
+    QHash<wallet::Network, qint64> over;
+    QHash<wallet::Network, bool> noGrowth; // the gaps alone fill the limit
+    for (const wallet::NetworkInfo& network : wallet::networks()) {
+        qint64 gapsNow = 0;
+        qint64 gapsBefore = 0;
+        for (const wallet::AccountKey& key : accounts) {
+            if (!key.serves(network.network))
+                continue;
+            const bool utxo = network.family == wallet::Family::Utxo;
+            gapsNow += utxo ? qint64(s.utxoReceiveGap) + s.utxoChangeGap : s.evmGap;
+            gapsBefore += utxo ? qint64(before.utxoReceiveGap) + before.utxoChangeGap : before.evmGap;
+        }
+        const bool utxo = network.family == wallet::Family::Utxo;
+        const qint64 limitNow = utxo ? wallet::UtxoScanner::rowLimitFor(gapsNow) : wallet::EvmScanner::kMaxFollowedRows;
+        const qint64 limitBefore = utxo ? wallet::UtxoScanner::rowLimitFor(gapsBefore) : wallet::EvmScanner::kMaxFollowedRows;
+        const qint64 wanted = overBy(gapsNow + reachNow.grown.value(network.network), limitNow);
+        const qint64 wantedBefore = overBy(gapsBefore + reachBefore.grown.value(network.network), limitBefore);
+        over.insert(network.network, cleared ? wanted : qMax(qint64(0), wanted - wantedBefore));
+        noGrowth.insert(network.network, gapsNow >= limitNow);
+        impact.overLimit += over.value(network.network);
+    }
     if (impact.overLimit > 0) {
         // When the gaps alone fill the limit no window grows at all, so every address past
         // its gap goes. Otherwise which ones depends on the order the chains grow in: the
         // furthest out, at most this many, since the ends of the windows go first.
-        const bool btcNoGrowth = btcGapsNow >= btcLimit;
-        const bool ethNoGrowth = ethAccounts * s.ethGap >= ethLimit;
         std::sort(reachNow.rows.begin(), reachNow.rows.end(), [](const Row& a, const Row& b) { return a.index > b.index; });
-        qint64 btcLeft = btcOver;
-        qint64 ethLeft = ethOver;
+        QHash<wallet::Network, qint64> left = over;
         for (const Row& row : std::as_const(reachNow.rows)) {
-            qint64& left = row.bitcoin ? btcLeft : ethLeft;
-            const bool noGrowth = cleared && (row.bitcoin ? btcNoGrowth : ethNoGrowth);
-            if (noGrowth ? !row.pastGap : left <= 0)
+            qint64& leftHere = left[row.network];
+            const bool nothingGrows = cleared && noGrowth.value(row.network);
+            if (nothingGrows ? !row.pastGap : leftHere <= 0)
                 continue;
-            --left;
+            --leftHere;
             ++impact.used;
             if (row.funded)
                 ++impact.funded;
@@ -778,12 +816,16 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
 
 bool WalletController::gapsFall(const wallet::ScanSettings& from, const wallet::ScanSettings& to)
 {
-    return to.btcReceiveGap < from.btcReceiveGap || to.btcChangeGap < from.btcChangeGap || to.ethGap < from.ethGap;
+    return to.utxoReceiveGap < from.utxoReceiveGap || to.utxoChangeGap < from.utxoChangeGap || to.evmGap < from.evmGap;
 }
 
 bool WalletController::applySettings(const wallet::ScanSettings& settings, QString* error)
 {
     setError(error, QString());
+    // Nothing changed: no reason to drop a connection and ask a large wallet everything
+    // again. Unless what is in use could not be written: then this is what tries again.
+    if (!settingsOnlyHere_ && sanitized(settings) == store_.settings)
+        return true;
     const wallet::ScanSettings previous = store_.settings;
     store_.settings = sanitized(settings);
 
@@ -804,7 +846,9 @@ bool WalletController::applySettings(const wallet::ScanSettings& settings, QStri
             return false;
         }
         saved = true;
+        settingsOnlyHere_ = false;
     } else {
+        settingsOnlyHere_ = true;
         // In memory only, used by a wallet added in this session. Shown in a
         // toast that elides long text, so the outcome comes first.
         setError(error, QStringLiteral("Applied for this session only: ") + blocker);
@@ -814,7 +858,7 @@ bool WalletController::applySettings(const wallet::ScanSettings& settings, QStri
     // deriving them again, and their last known state stays on screen
     // meanwhile; the Bitcoin scanner still checks every status again from
     // index 0. Not after a smaller gap: rows past the new windows would stay on
-    // screen unfollowed until the next start drops them, so they go now.
+    // screen unfollowed until the scan has found those windows, so they go now.
     const bool gapsDown = gapsFall(previous, store_.settings);
     stopServices();
     if (gapsDown)
@@ -829,48 +873,44 @@ void WalletController::refresh()
     prices_->refresh();
     if (priceTimer_->isActive())
         priceTimer_->start(); // the next automatic refresh is a full interval away
-    if (running_)
-        ethScanner_->refreshNow();
+    scheduler_->refreshNow();
 }
 
 bool WalletController::isScanning() const
 {
-    return btcScanning() || ethScanning();
-}
-
-bool WalletController::btcScanning() const
-{
-    return btcScanner_->isScanning();
-}
-
-bool WalletController::ethScanning() const
-{
-    return ethScanner_->isScanning();
+    return scheduler_->isScanning();
 }
 
 bool WalletController::addressLimitReached() const
 {
-    return btcScanner_->limitReached() || ethScanner_->limitReached();
+    return scheduler_->limitReached();
 }
 
-bool WalletController::ethWrongChain() const
+wallet::NetworkStatus WalletController::networkStatus(wallet::Network network) const
 {
-    return ethScanner_->wrongChain();
-}
-
-QDateTime WalletController::ethBalancesAt() const
-{
-    return ethScanner_->balancesAt();
-}
-
-bool WalletController::ethRefreshFailing() const
-{
-    return ethScanner_->refreshFailing();
+    return scheduler_->status(network);
 }
 
 bool WalletController::balancesComplete() const
 {
     return status() == Status::UpToDate;
+}
+
+bool WalletController::figuresCurrent() const
+{
+    const Status now = status();
+    return now == Status::UpToDate || (now == Status::Unscanned && hasUnreadKeys());
+}
+
+bool WalletController::keepingSaved() const
+{
+    return ledger_->isOpen();
+}
+
+bool WalletController::hasUnreadKeys() const
+{
+    return std::any_of(store_.wallets.cbegin(), store_.wallets.cend(),
+                       [](const wallet::WalletEntry& w) { return !w.keptAccounts.isEmpty(); });
 }
 
 QString WalletController::statusText() const
@@ -879,21 +919,38 @@ QString WalletController::statusText() const
     switch (status()) {
     case Status::NoWallet:
         return QStringLiteral("No wallet");
+    case Status::Loading:
+        return QStringLiteral("Loading saved balances · %1").arg(rows);
     case Status::Connecting:
-        return QStringLiteral("Connecting…");
+        return showingSaved_ ? QStringLiteral("Saved balances · connecting…") : QStringLiteral("Connecting…");
     case Status::Limit:
         return QStringLiteral("Address limit reached · %1").arg(rows);
-    case Status::WrongChain:
-        return QStringLiteral("Ethereum endpoint not on mainnet · %1").arg(rows);
-    case Status::EthStale: {
-        // Before the first pass that answered every address there is no time
-        // to date the figures by.
-        const QDateTime at = ethBalancesAt();
-        return at.isValid() ? QStringLiteral("ETH balances from %1 · %2").arg(clockTime(at), rows)
-                            : QStringLiteral("ETH lookups failing · %1").arg(rows);
+    case Status::WrongChain: {
+        const QList<wallet::NetworkStatus> all = scheduler_->statuses();
+        for (const wallet::NetworkStatus& one : all) {
+            if (one.wrongChain)
+                return QStringLiteral("%1 endpoint answers for another network · %2")
+                    .arg(wallet::networkInfo(one.network).name, rows);
+        }
+        break;
+    }
+    case Status::Stale: {
+        const QList<wallet::NetworkStatus> all = scheduler_->statuses();
+        for (const wallet::NetworkStatus& one : all) {
+            if (!one.failing)
+                continue;
+            // Before the first pass that answered every address there is no time
+            // to date the figures by.
+            const wallet::NetworkInfo& info = wallet::networkInfo(one.network);
+            return one.balancesAt.isValid()
+                       ? QStringLiteral("%1 balances from %2 · %3").arg(wallet::assetInfo(info.coin).symbol, clockTime(one.balancesAt), rows)
+                       : QStringLiteral("%1 lookups failing · %2").arg(wallet::assetInfo(info.coin).symbol, rows);
+        }
+        break;
     }
     case Status::Scanning:
-        return QStringLiteral("Scanning · %1").arg(rows);
+        return showingSaved_ ? QStringLiteral("Checking saved balances · %1").arg(rows)
+                             : QStringLiteral("Scanning · %1").arg(rows);
     case Status::Unchecked:
         return QStringLiteral("Balances incomplete · %1 · %2 not checked")
             .arg(rows, grouped(model_->size() - model_->checkedCount()));
@@ -905,22 +962,51 @@ QString WalletController::statusText() const
     return QStringLiteral("Up to date · %1 · %2 funded").arg(rows, grouped(model_->fundedCount()));
 }
 
-QString WalletController::electrumServer() const
+QString WalletController::pricesLine() const
 {
-    return electrum_->serverName();
-}
-
-QString WalletController::ethEndpoint() const
-{
-    // Host only: a configured endpoint may carry an API key in its path, query
-    // or user info, and this name is shown on screen and written to reports.
-    return QUrl(eth_->currentEndpoint()).host();
+    // What the figures on screen go by: what the wallets hold, or, while they hold
+    // nothing, what there is.
+    QList<wallet::Asset> shown;
+    QStringList unpriced;
+    for (const wallet::AssetInfo& info : wallet::assets()) {
+        if (model_->total(info.asset).isZero())
+            continue;
+        shown.append(info.asset);
+        if (prices_->usd(info.asset) <= 0.0)
+            unpriced.append(info.symbol);
+    }
+    if (shown.isEmpty()) {
+        for (const wallet::AssetInfo& info : wallet::assets())
+            shown.append(info.asset);
+    }
+    const QDateTime oldest = prices_->oldest(shown);
+    QStringList parts;
+    if (oldest.isValid()) {
+        parts << ui::trText(QStringLiteral("Prices: %1 · %2")).arg(prices_->sources(shown), clockTime(oldest));
+        if (oldest.secsTo(QDateTime::currentDateTimeUtc()) > kPricesOldSeconds)
+            parts << ui::trText(QStringLiteral("not updated since"));
+        else if (prices_->lastRefreshFailed())
+            parts << ui::trText(QStringLiteral("refresh failing"));
+    } else {
+        parts << (prices_->lastRefreshFailed() ? ui::trText(QStringLiteral("Prices: could not be loaded"))
+                                               : ui::trText(QStringLiteral("Prices: not loaded yet")));
+    }
+    if (!unpriced.isEmpty() && oldest.isValid())
+        parts << ui::trText(QStringLiteral("no price for %1")).arg(unpriced.join(QStringLiteral(", ")));
+    QStringList doubted;
+    for (const wallet::AssetInfo& info : wallet::assets()) {
+        if (shown.contains(info.asset) && prices_->inDoubt(info.asset))
+            doubted.append(info.symbol);
+    }
+    if (!doubted.isEmpty())
+        parts << ui::trText(QStringLiteral("sources disagree on %1")).arg(doubted.join(QStringLiteral(", ")));
+    return parts.join(QLatin1String(" · "));
 }
 
 double WalletController::usdValue(wallet::Asset asset) const
 {
     const wallet::AssetInfo& info = wallet::assetInfo(asset);
-    return model_->total(asset).toDouble(info.decimals) * prices_->usd(info.symbol);
+    return model_->total(asset).toDouble(info.decimals) * prices_->usd(asset);
 }
 
 double WalletController::totalUsd() const
@@ -935,7 +1021,7 @@ double WalletController::totalUsd(quint32 wallet) const
 {
     double sum = 0.0;
     for (const wallet::AssetInfo& info : wallet::assets())
-        sum += model_->total(info.asset, wallet).toDouble(info.decimals) * prices_->usd(info.symbol);
+        sum += model_->total(info.asset, wallet).toDouble(info.decimals) * prices_->usd(info.asset);
     return sum;
 }
 
@@ -949,77 +1035,164 @@ void WalletController::restartServices()
 
 void WalletController::startServices()
 {
-    const QList<wallet::AccountKey> accounts = store_.allAccounts();
-    const bool hasBtc = hasAccounts(accounts, true);
-    const bool hasEth = hasAccounts(accounts, false);
-    // Set before any scanner starts, in case one finishes synchronously. A
-    // chain without accounts has nothing to scan and counts as finished.
-    btcDone_ = !hasBtc;
-    ethDone_ = !hasEth;
-    scanFinishedSent_ = false;
-    if (!hasBtc && !hasEth)
-        return; // no wallet: no connections at all
-
-    running_ = true;
+    // What the database kept comes first; onLedgerLoaded() is back for this.
+    if (waitingForLedger_)
+        return;
     // A copy: signals emitted below may re-enter the controller.
     const wallet::ScanSettings settings = store_.settings;
-
-    btcScanner_->setAccounts(accounts);
-    btcScanner_->setGaps(settings.btcReceiveGap, settings.btcChangeGap);
-    bool noValidServer = false;
-    if (hasBtc) {
-        QList<net::ElectrumServer> servers;
-        int lines = 0;
-        for (const QString& line : settings.electrumServers) {
-            const QString text = line.trimmed();
-            if (text.isEmpty())
-                continue;
-            ++lines;
-            net::ElectrumServer server;
-            if (net::ElectrumServer::fromString(text, &server))
-                servers.append(server);
-            else
-                qCInfo(lcNet).noquote() << "ignoring Electrum server" << text << "(expected host:port)";
-        }
-        noValidServer = lines > 0 && servers.isEmpty();
-        electrum_->setServers(servers); // empty = net::defaultElectrumServers()
-        // The scanner is set up first so it is listening when ready() arrives.
-        btcScanner_->start();
-        electrum_->start();
+    scheduler_->configure(store_.allAccounts(), settings);
+    if (!scheduler_->hasWork()) {
+        running_ = false;
+        return; // no wallet: no connections at all
     }
-
-    eth_->setEndpoints(settings.ethEndpoints); // empty = net::defaultEthEndpoints()
-    ethScanner_->setAccounts(accounts);
-    ethScanner_->setGap(settings.ethGap);
-    ethScanner_->setRefreshSeconds(settings.ethRefreshSeconds);
-    if (hasEth)
-        ethScanner_->start();
-
+    running_ = true;
+    scheduler_->start();
     prices_->refresh();
     priceTimer_->start();
-
-    if (noValidServer) {
-        // Posted, so it lands after the caller's own feedback ("Settings saved")
-        // instead of being replaced by it.
-        QTimer::singleShot(0, this, [this] {
-            if (running_)
-                emit errorOccurred(wallet::Problem::BuiltInServers,
-                                   QStringLiteral("None of the Electrum servers in Settings is "
-                                                  "valid (host:port); using the built-in list."),
-                                   QString());
-        });
-    }
+    timesTimer_->start();
 }
 
 void WalletController::stopServices()
 {
+    saveTimes();
     running_ = false;
-    // Scanners first: when the client then fails its pending requests with
-    // "stopped", nobody acts on those replies any more.
-    btcScanner_->stop();
-    ethScanner_->stop();
-    electrum_->stop();
+    scheduler_->stop();
     priceTimer_->stop();
+    timesTimer_->stop();
+}
+
+void WalletController::openLedger()
+{
+    // The window that holds the lock is the one that writes; another shows the
+    // wallet and reads what the servers say, and asks again: it may be the last
+    // window, still closing.
+    if (!hasWallet()) {
+        startServices();
+        return;
+    }
+    if (!lockDataDir()) {
+        startServices();
+        ledgerRetries_ = 0;
+        ledgerRetry_->start();
+        return;
+    }
+    if (store_.databaseKey.isEmpty()) {
+        // A wallet.dat from before the database: the key joins it, if it may be written.
+        const QString blocker = settingsSaveBlocker();
+        QString why = blocker;
+        if (blocker.isEmpty()) {
+            store_.databaseKey = wallet::WalletStore::newDatabaseKey();
+            if (!saveStore(&why))
+                store_.databaseKey.clear();
+        }
+        if (store_.databaseKey.isEmpty()) {
+            // Every start is then a whole scan, and at scale that takes a while.
+            emit errorOccurred(wallet::Problem::SavedData,
+                               QStringLiteral("Saved balances are not being kept: %1").arg(why), QString());
+            startServices();
+            return;
+        }
+    }
+    QSet<quint32> ids;
+    for (const wallet::WalletEntry& w : std::as_const(store_.wallets))
+        ids.insert(w.id);
+    waitingForLedger_ = true;
+    // Rows a scan brought have answered; what comes is only what it did not reach.
+    rowsBeforeLedger_ = model_->checkedCount();
+    showingSaved_ = rowsBeforeLedger_ == 0; // part of what it kept, as it arrives
+    savedAt_ = QDateTime();
+    ledger_->open(wallet::WalletStore::databasePath(), store_.databaseKey, ids);
+}
+
+void WalletController::tryLedgerAgain()
+{
+    if (ledger_->isOpen() || waitingForLedger_ || !hasWallet()) {
+        ledgerRetry_->stop();
+        return;
+    }
+    if (lockDataDir()) {
+        ledgerRetry_->stop();
+        stopServices();
+        openLedger();
+        return;
+    }
+    if (++ledgerRetries_ == kLedgerRetriesBeforeSaying) {
+        emit errorOccurred(wallet::Problem::FolderHeld,
+                           QStringLiteral("Saved balances are not being kept: another GitWallet window holds this folder."),
+                           QString());
+    }
+}
+
+void WalletController::onLedgerLoaded(const QList<store::SavedPrice>& prices, const QList<store::SavedTime>& times)
+{
+    QList<net::PriceQuote> quotes;
+    for (const store::SavedPrice& saved : prices) {
+        if (const wallet::AssetInfo* asset = wallet::findAsset(saved.asset)) {
+            net::PriceQuote quote;
+            quote.asset = asset->asset;
+            quote.usd = saved.usd;
+            quote.at = saved.at;
+            quote.source = saved.source;
+            quotes.append(quote);
+        }
+    }
+    prices_->restore(quotes);
+
+    for (const store::SavedTime& time : times) {
+        if (const wallet::NetworkInfo* network = wallet::findNetwork(time.network))
+            scheduler_->restoreTimes(network->network, time.at, time.noncesAt, time.sweep);
+    }
+
+    // The oldest of what the rows on screen come from.
+    showingSaved_ = model_->checkedCount() > rowsBeforeLedger_;
+    savedAt_ = QDateTime();
+    if (showingSaved_) {
+        bool whole = true;
+        for (const wallet::NetworkInfo& network : wallet::networks()) {
+            if (model_->rowsOn(network.network) == 0)
+                continue;
+            const auto found = std::find_if(times.cbegin(), times.cend(),
+                                            [&network](const store::SavedTime& t) { return t.network == network.id; });
+            if (found == times.cend() || !found->at.isValid()) {
+                whole = false;
+            } else if (!savedAt_.isValid() || found->at < savedAt_) {
+                savedAt_ = found->at;
+            }
+        }
+        if (!whole)
+            savedAt_ = QDateTime();
+    }
+
+    waitingForLedger_ = false;
+    startServices();
+    emit statusChanged();
+    emit totalsChanged();
+}
+
+void WalletController::saveTimes()
+{
+    if (!running_)
+        return;
+    QList<store::SavedTime> times;
+    const QList<wallet::NetworkStatus> all = scheduler_->statuses();
+    for (const wallet::NetworkStatus& one : all) {
+        // Past what a saved figure can say: the database keeps the rows, not the promise. A
+        // sweep of nonces under way counts too: a first scan cut short goes on where it stopped.
+        if (one.watched && (one.balancesAt.isValid() || one.sweep.from.isValid()))
+            times.append({wallet::networkInfo(one.network).id, one.balancesAt, one.noncesAt, one.sweep});
+    }
+    if (!times.isEmpty())
+        ledger_->saveTimes(times);
+}
+
+void WalletController::savePrices()
+{
+    QList<store::SavedPrice> saved;
+    const QList<net::PriceQuote> quotes = prices_->quotes();
+    for (const net::PriceQuote& quote : quotes)
+        saved.append({wallet::assetInfo(quote.asset).key, quote.usd, quote.at, quote.source});
+    if (!saved.isEmpty())
+        ledger_->savePrices(saved);
 }
 
 void WalletController::queueStatus()
@@ -1029,16 +1202,25 @@ void WalletController::queueStatus()
         statusTimer_->start();
 }
 
-void WalletController::onScanFinished(bool* chainDone)
+void WalletController::onScanProgress()
+{
+    // A window cut at the limit keeps a scan from finishing, and everything it does
+    // follow has answered all the same.
+    if (showingSaved_ && running_ && scheduler_->allAnswered()) {
+        showingSaved_ = false;
+        saveTimes();
+    }
+    queueStatus();
+}
+
+void WalletController::onScanFinished()
 {
     if (!running_)
         return; // a late signal from a run that stopServices() ended
-    *chainDone = true;
+    showingSaved_ = false;
+    saveTimes();
     emit statusChanged();
-    if (btcDone_ && ethDone_ && !scanFinishedSent_) {
-        scanFinishedSent_ = true; // before emitting: a listener may restart the services
-        emit scanFinished();
-    }
+    emit scanFinished();
 }
 
 void WalletController::onScannerProblem(wallet::Problem kind, const QString& message,
@@ -1050,7 +1232,7 @@ void WalletController::onScannerProblem(wallet::Problem kind, const QString& mes
         return;
     emit errorOccurred(kind, message, serverDetail);
     // The scan state may have moved with the report (a window cut at the
-    // limit, an endpoint off mainnet) while no progress() says so.
+    // limit, an endpoint on another chain) while no progress() says so.
     queueStatus();
 }
 
@@ -1058,22 +1240,24 @@ WalletController::Status WalletController::status() const
 {
     if (!hasWallet())
         return Status::NoWallet;
-    if (hasAccounts(store_.allAccounts(), true) && !electrum_->isReady())
+    if (waitingForLedger_)
+        return Status::Loading;
+    if (scheduler_->anyConnecting())
         return Status::Connecting;
     // A balance kept missing or stale by something no scan cures comes before
-    // "Scanning": a window cut at the limit keeps the Bitcoin scan unfinished
-    // for good, and an endpoint off mainnet, or failing, leaves Ethereum
-    // addresses unanswered pass after pass.
+    // "Scanning": a window cut at the limit keeps a scan unfinished
+    // for good, and a server on another chain, or failing, leaves addresses
+    // unanswered round after round.
     if (addressLimitReached())
         return Status::Limit;
-    if (ethWrongChain())
+    const QList<wallet::NetworkStatus> all = scheduler_->statuses();
+    if (std::any_of(all.cbegin(), all.cend(), [](const wallet::NetworkStatus& s) { return s.wrongChain; }))
         return Status::WrongChain;
-    if (ethRefreshFailing())
-        return Status::EthStale;
+    if (std::any_of(all.cbegin(), all.cend(), [](const wallet::NetworkStatus& s) { return s.failing; }))
+        return Status::Stale;
     if (isScanning())
         return Status::Scanning;
-    // Nothing is scanning, yet a row has no answer (one no scan follows any
-    // more, left from before a server or gap change): its balance is unknown.
+    // Nothing is scanning, yet a row has no answer: its balance is unknown.
     if (model_->checkedCount() < model_->size())
         return Status::Unchecked;
     if (accountUnscanned())
@@ -1088,6 +1272,9 @@ bool WalletController::accountUnscanned() const
     // (problem(), Skipped) and finish without it. Asked only once nothing is
     // scanning, when every chain that can be scanned has its first rows.
     // Index 1 counts as well, for an index 0 that BIP32 skips for having no key.
+    // A key this version does not know is not read at all.
+    if (hasUnreadKeys())
+        return true;
     const QList<wallet::AccountKey> accounts = store_.allAccounts();
     return std::any_of(accounts.cbegin(), accounts.cend(),
                        [this](const wallet::AccountKey& a) { return !accountHasRows(a); });
@@ -1095,26 +1282,45 @@ bool WalletController::accountUnscanned() const
 
 bool WalletController::accountHasRows(const wallet::AccountKey& a) const
 {
-    const auto hasRows = [this, &a](quint32 change) {
-        return model_->find(a.wallet, a.type, a.account, change, 0) >= 0
-               || model_->find(a.wallet, a.type, a.account, change, 1) >= 0;
-    };
-    return hasRows(0) && (!chain::isBitcoin(a.type) || hasRows(1));
+    for (const wallet::NetworkInfo& network : wallet::networks()) {
+        if (!a.serves(network.network))
+            continue;
+        const auto hasRows = [&](quint32 change) {
+            return model_->find(a.wallet, network.network, a.type, a.account, change, 0) >= 0
+                   || model_->find(a.wallet, network.network, a.type, a.account, change, 1) >= 0;
+        };
+        if (!hasRows(0) || (chain::isUtxo(a.type) && !hasRows(1)))
+            return false;
+    }
+    return true;
 }
 
 bool WalletController::walletHasAllRows(const wallet::WalletEntry& entry) const
 {
-    return std::all_of(entry.accounts.cbegin(), entry.accounts.cend(),
+    return entry.keptAccounts.isEmpty() && std::all_of(entry.accounts.cbegin(), entry.accounts.cend(),
                        [this](const wallet::AccountKey& a) { return accountHasRows(a); });
 }
 
 bool WalletController::saveStore(QString* why)
 {
+    // The build that wrote an older file cannot read what comes next: the way back stays,
+    // or it is not written. The time in its name: a user who went back and came forward
+    // again has another file to keep.
+    if (const int older = store_.olderFormat(); older > 0 && !olderCopied_) {
+        const QString path = wallet::WalletStore::filePath();
+        const QString copy = path + QStringLiteral(".format%1-%2").arg(older).arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")));
+        if (QFile::exists(path) && !QFile::copy(path, copy)) {
+            setError(why, QStringLiteral("wallet.dat is from an older version, and a copy of it could not be made, so it was not rewritten."));
+            return false;
+        }
+        olderCopied_ = true;
+    }
     // What was written, not a read of the file afterwards: a program holding the
     // file for a moment must not make every later save look like a foreign change.
     QByteArray digest;
     if (!store_.save(why, &digest))
         return false;
+    store_.forgetOlderFormat();
     fileDigest_ = digest;
     return true;
 }

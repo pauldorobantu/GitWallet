@@ -1,5 +1,7 @@
 #include "net/EthRpc.h"
 
+#include "net/Budget.h"
+
 #include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -30,17 +32,28 @@ constexpr int kRequestDeadlineMs = 45000;
 // neither trips a public endpoint's rate limit nor queues inside Qt's per-host
 // connection limit, where its transfer timeout would already be running.
 constexpr int kMaxInFlight = 4;
+// Calls per second an endpoint nobody measured gets: one of the user's own may well take
+// more, a public one rarely (docs/ENDPOINTS.md).
+constexpr int kDefaultCallsPerSecond = 50;
+// An eth_call to Multicall3 reads hundreds of balances, and costs an endpoint far less than
+// that many plain calls, but more than one: public endpoints that stop answering plain
+// calls at tens a second keep answering these two a second.
+constexpr int kCostOfACall = 10;
 constexpr qsizetype kMaxServerText = 200; // server-supplied text is clipped (one line) for logs and UI
 // A reply is buffered whole until it finishes, and the transfer timeout only
 // fires when no data moves, so without a cap a server that streams fast could
-// fill memory long before the deadline. The largest legitimate answer, an
-// aggregate3 of 150 sub-calls, is about 50 KB; even kMaxBatch of those stay
-// well below this.
-constexpr qint64 kMaxReplyBytes = 8 * 1024 * 1024;
+// fill memory long before the deadline. The largest answers, a batch of kMaxBatch
+// calls or an aggregate3 of 1,800 sub-calls, are about 600 KB; this leaves room for
+// a chunk of logs as well.
+constexpr qint64 kMaxReplyBytes = 16 * 1024 * 1024;
 // How long an endpoint the caller rejected is tried last. A healthy endpoint
 // behind a load balancer can return one bad answer (a lagging backend), so the
 // doubt expires; a broken one is simply rejected again by its next answer.
 constexpr int kDoubtMs = 10 * 60 * 1000;
+// How long an endpoint that failed an attempt gets no new work while another is left. One
+// that hangs has a full budget, and would otherwise take every chunk the others have no
+// room for.
+constexpr int kCoolingMs = 30 * 1000;
 
 QString clip(const QString& text)
 {
@@ -152,18 +165,26 @@ int idOf(const QJsonValue& id)
     return 0;
 }
 
-// Whether an eth_chainId result names Ethereum mainnet: the quantity 1 ("0x1",
-// leading zeros tolerated).
-bool isMainnet(const QJsonValue& chainId)
+// Who runs an endpoint, as far as its name says: what its limits go by, whichever
+// network's host it is.
+QString providerOf(const QString& url)
+{
+    const QStringList labels = QUrl(url).host().split(QLatin1Char('.'));
+    return labels.size() < 2 ? labels.join(QLatin1Char('.')) : labels.mid(labels.size() - 2).join(QLatin1Char('.'));
+}
+
+// Whether an eth_chainId result names `expected`: a hex quantity, leading zeros
+// tolerated.
+bool namesChain(const QJsonValue& chainId, quint64 expected)
 {
     if (!chainId.isString()) return false;
     const QString text = chainId.toString();
     if (text.size() < 3 || text.at(0) != QLatin1Char('0')
         || (text.at(1) != QLatin1Char('x') && text.at(1) != QLatin1Char('X')))
         return false;
-    for (qsizetype i = 2; i + 1 < text.size(); ++i)
-        if (text.at(i) != QLatin1Char('0')) return false;
-    return text.back() == QLatin1Char('1');
+    bool ok = false;
+    const quint64 value = text.mid(2).toULongLong(&ok, 16);
+    return ok && value == expected;
 }
 
 } // namespace
@@ -190,6 +211,7 @@ struct EthRpc::Chunk : std::enable_shared_from_this<EthRpc::Chunk> {
     QList<qsizetype> chainIdCalls;  // positions of its eth_chainId calls
     QByteArray body;                // the JSON array, built once and re-sent on failover
     QStringList tried;              // endpoints this chunk has already been sent to
+    int cost = 0;                   // what it counts for in a host's budget
     QNetworkReply* reply = nullptr; // the attempt on the wire, if any (a child of nam_)
     bool lastResort = false;        // that attempt went to an endpoint found on another chain (nextEndpoint())
     // What it delivers: the first attempt that answers every call, else the
@@ -200,19 +222,25 @@ struct EthRpc::Chunk : std::enable_shared_from_this<EthRpc::Chunk> {
     int counted = -1;   // results of that attempt that count; -1 before the first attempt
 };
 
-QStringList defaultEthEndpoints()
+EthRpc::EthRpc(const QString& name, quint64 chainId, const QStringList& builtIn, const QHash<QString, int>& pace,
+               BudgetPool* budgets, QObject* parent)
+    : QObject(parent)
+    , name_(name)
+    , chainId_(chainId)
+    , builtIn_(builtIn)
+    , budgets_(budgets)
+    , pumpTimer_(new QTimer(this))
+    , nam_(new QNetworkAccessManager(this))
+    , endpoints_(builtIn)
 {
-    return {
-        QStringLiteral("https://ethereum-rpc.publicnode.com"),
-        QStringLiteral("https://eth-mainnet.public.blastapi.io"),
-        QStringLiteral("https://rpc.mevblocker.io"),
-        QStringLiteral("https://1rpc.io/eth"),
-    };
-}
-
-EthRpc::EthRpc(QObject* parent)
-    : QObject(parent), nam_(new QNetworkAccessManager(this)), endpoints_(defaultEthEndpoints())
-{
+    // By who runs them: a line in Settings that spells the address otherwise is the same provider.
+    for (auto it = pace.cbegin(); it != pace.cend(); ++it) {
+        const QString provider = providerOf(it.key());
+        const auto known = pace_.constFind(provider);
+        pace_.insert(provider, known == pace_.cend() ? it.value() : qMin(*known, it.value()));
+    }
+    pumpTimer_->setSingleShot(true);
+    connect(pumpTimer_, &QTimer::timeout, this, &EthRpc::pump);
 }
 
 void EthRpc::setEndpoints(const QStringList& urls)
@@ -223,14 +251,15 @@ void EthRpc::setEndpoints(const QStringList& urls)
     for (const QString& entry : urls) {
         const QString url = entry.trimmed();
         if (url.isEmpty() || usable.contains(url)) continue;
-        if (!isHttpsUrl(url)) {
+        if (!usableUrl(url)) {
             ignored.append(hostOf(url));
             continue;
         }
         usable.append(url);
     }
-    if (usable.isEmpty()) usable = defaultEthEndpoints();
+    if (usable.isEmpty()) usable = builtIn_;
 
+    pumpTimer_->stop();
     // A new list starts over. Whatever is still pending belongs to the old one
     // and ends here, with an error and without failover: a request stuck on an
     // endpoint (or on one just removed) cannot keep its slot, and nothing it
@@ -241,20 +270,35 @@ void EthRpc::setEndpoints(const QStringList& urls)
     endpoints_ = usable;
     offChain_.clear();
     doubted_.clear();
+    cooling_.clear();
     current_ = 0;
 
     // Signals last: a slot may already start requests on the new list.
     for (const QString& host : std::as_const(ignored))
-        emit log(QStringLiteral("Ethereum RPC: ignored endpoint %1 (not an https URL)").arg(host));
+        emit log(QStringLiteral("%1 RPC: ignored endpoint %2 (not an https URL)").arg(name_, host));
     if (cancelled > 0)
-        emit log(QStringLiteral("Ethereum RPC: endpoint list changed; %1 pending request(s) cancelled")
-                     .arg(cancelled));
+        emit log(QStringLiteral("%1 RPC: endpoint list changed; %2 pending request(s) cancelled")
+                     .arg(name_).arg(cancelled));
     if (endpoints_.first() != before) emit endpointChanged(endpoints_.first());
 }
 
 QString EthRpc::currentEndpoint() const
 {
     return endpoints_.value(current_);
+}
+
+void EthRpc::cancelAll()
+{
+    pumpTimer_->stop();
+    cancelPending(QStringLiteral("stopped"));
+}
+
+bool EthRpc::usableUrl(const QString& url) const
+{
+    if (isHttpsUrl(url)) return true;
+    if (!localForTest_) return false;
+    const QUrl u(url, QUrl::StrictMode);
+    return u.isValid() && u.scheme() == QLatin1String("http") && u.host() == QLatin1String("127.0.0.1");
 }
 
 void EthRpc::call(const QString& method, const QJsonArray& params, Reply reply)
@@ -292,6 +336,7 @@ void EthRpc::batch(const QList<QPair<QString, QJsonArray>>& calls, BatchReply re
             const int id = nextId_;
             nextId_ = nextId_ == std::numeric_limits<int>::max() ? 1 : nextId_ + 1;
             chunk->ids.append(id);
+            chunk->cost += calls.at(i).first == QLatin1String("eth_call") ? kCostOfACall : 1;
             if (calls.at(i).first == QLatin1String("eth_chainId")) chunk->chainIdCalls.append(i - first);
             requests.append(QJsonObject{
                 {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
@@ -310,12 +355,48 @@ void EthRpc::batch(const QList<QPair<QString, QJsonArray>>& calls, BatchReply re
 void EthRpc::pump()
 {
     while (wire_.size() < kMaxInFlight && !queue_.isEmpty()) {
+        const std::shared_ptr<Chunk> first = queue_.constFirst();
+        // Picks its endpoint only now: by then an earlier failover may have
+        // moved current_. If that one is at its pace, the next with room takes it: spread
+        // over them, each sees part of the addresses, and none is asked past what it answers.
+        QString url = nextEndpoint(*first);
+        if (url.isEmpty()) {
+            // Back in line after a failure, and the endpoints it had left have gone since.
+            queue_.removeFirst();
+            deliver(*first);
+            continue;
+        }
+        int wait = takeBudget(url, first->cost);
+        const int n = int(endpoints_.size());
+        for (int k = 1; wait > 0 && k < n; ++k) {
+            const QString& other = endpoints_.at((current_ + k) % n);
+            if (other == url || first->tried.contains(other) || offChain_.contains(other) || isAvoided(other))
+                continue;
+            const int waitThere = takeBudget(other, first->cost);
+            if (waitThere == 0) {
+                url = other;
+                wait = 0;
+            } else {
+                wait = qMin(wait, waitThere);
+            }
+        }
+        if (wait > 0) {
+            if (!pumpTimer_->isActive())
+                pumpTimer_->start(wait);
+            return;
+        }
         const std::shared_ptr<Chunk> chunk = queue_.takeFirst();
         wire_.append(chunk);
-        // Picks its endpoint only now: by then an earlier failover may have
-        // moved current_.
-        send(*chunk, nextEndpoint(*chunk));
+        send(*chunk, url);
     }
+}
+
+int EthRpc::takeBudget(const QString& url, int cost)
+{
+    if (!budgets_)
+        return 0;
+    const QString provider = providerOf(url);
+    return budgets_->forHost(provider, pace_.value(provider, kDefaultCallsPerSecond)).take(cost);
 }
 
 QString EthRpc::nextEndpoint(const Chunk& chunk) const
@@ -329,7 +410,7 @@ QString EthRpc::nextEndpoint(const Chunk& chunk) const
         for (int k = 0; k < n; ++k) {
             const QString& url = endpoints_.at((current_ + k) % n);
             if (chunk.tried.contains(url) || offChain_.contains(url)) continue;
-            if (lastTry || !isDoubted(url)) return url;
+            if (lastTry || !isAvoided(url)) return url;
         }
     }
     // Every endpoint is on another chain: a fresh chunk still goes to one
@@ -341,6 +422,13 @@ bool EthRpc::isDoubted(const QString& url) const
 {
     const auto it = doubted_.constFind(url);
     return it != doubted_.cend() && !it->hasExpired();
+}
+
+bool EthRpc::isAvoided(const QString& url) const
+{
+    if (isDoubted(url)) return true;
+    const auto it = cooling_.constFind(url);
+    return it != cooling_.cend() && !it->hasExpired();
 }
 
 bool EthRpc::isOffChain(const QString& url) const
@@ -454,14 +542,14 @@ void EthRpc::handleReply(Chunk& chunk, const QString& url, const QString& failur
         }
     }
 
-    // Ethereum mainnet only. Settings accept any https URL, and an L2 or testnet
+    // This network only. Settings accept any https URL, and an L2 or testnet
     // endpoint answers every call as if nothing were wrong: where the request
-    // asks eth_chainId, only chain id 1 settles it. Another chain's answers are
+    // asks eth_chainId, only this network's id settles it. Another chain's answers are
     // not delivered at all, and its endpoint is skipped until the list changes.
     for (const qsizetype i : std::as_const(chunk.chainIdCalls)) {
         if (!errors.at(i).isEmpty()) continue; // moves on already
         const QJsonValue chainId = results.at(i);
-        if (isMainnet(chainId)) {
+        if (namesChain(chainId, chainId_)) {
             // Reached as the last resort, and its chain is fine now; a caller
             // that still finds its answers unusable rejects it again. An
             // answer to a request sent before the rejection lifts nothing.
@@ -469,9 +557,8 @@ void EthRpc::handleReply(Chunk& chunk, const QString& url, const QString& failur
             continue;
         }
         const QString why = chainId.isString()
-                                ? QStringLiteral("endpoint is not on Ethereum mainnet (eth_chainId %1)")
-                                      .arg(clip(chainId.toString()))
-                                : QStringLiteral("endpoint is not on Ethereum mainnet (no valid eth_chainId answer)");
+                                ? QStringLiteral("endpoint is not on %1 (eth_chainId %2)").arg(name_, clip(chainId.toString()))
+                                : QStringLiteral("endpoint is not on %1 (no valid eth_chainId answer)").arg(name_);
         results = QList<QJsonValue>(n);
         errors.fill(why);
         answered = 0;
@@ -488,15 +575,18 @@ void EthRpc::handleReply(Chunk& chunk, const QString& url, const QString& failur
         chunk.answeredBy = url;
         chunk.counted = answered;
     }
-    if (reason.isEmpty())
+    if (reason.isEmpty()) {
+        cooling_.remove(url);
         finish(chunk);
-    else
+    } else {
+        cooling_.insert(url, QDeadlineTimer(kCoolingMs));
         retry(chunk, url, reason);
+    }
 }
 
 // Moves the shared starting point past `url` if it is still the current
 // endpoint (an earlier failure, or setEndpoints(), may have moved it already),
-// to the next one on mainnet, preferring one the caller does not doubt. Later
+// to the next one on this network, preferring one the caller does not doubt. Later
 // requests then begin at an endpoint that works instead of trying a dead one
 // first. Returns the endpoint it moved to, or an empty string if it stayed.
 QString EthRpc::moveCurrentPast(const QString& url)
@@ -507,7 +597,7 @@ QString EthRpc::moveCurrentPast(const QString& url)
         for (int k = 1; k < n; ++k) {
             const int i = (current_ + k) % n;
             const QString& next = endpoints_.at(i);
-            if (offChain_.contains(next) || (!lastTry && isDoubted(next))) continue;
+            if (offChain_.contains(next) || (!lastTry && isAvoided(next))) continue;
             current_ = i;
             return next;
         }
@@ -524,8 +614,8 @@ void EthRpc::rejectEndpoint(const QString& url)
 
     if (!switchedTo.isEmpty()) emit endpointChanged(switchedTo);
     if (added)
-        emit log(QStringLiteral("Ethereum RPC: %1 rejected, its answers are unusable; tried last for %2 min%3")
-                     .arg(hostOf(url), QString::number(kDoubtMs / 60000),
+        emit log(QStringLiteral("%1 RPC: %2 rejected, its answers are unusable; tried last for %3 min%4")
+                     .arg(name_, hostOf(url), QString::number(kDoubtMs / 60000),
                           switchedTo.isEmpty() ? QString() : QStringLiteral("; now using ") + hostOf(switchedTo)));
 }
 
@@ -534,20 +624,25 @@ void EthRpc::retry(Chunk& chunk, const QString& failedUrl, const QString& reason
     const QString switchedTo = moveCurrentPast(failedUrl);
 
     const QString next = nextEndpoint(chunk);
-    if (next.isEmpty())
+    if (next.isEmpty()) {
         finish(chunk); // with the most complete answer a single endpoint gave
-    else
+    } else if (takeBudget(next, chunk.cost) == 0) {
         send(chunk, next);
+    } else {
+        // That one is at its pace: first in line for whichever has room next.
+        const std::shared_ptr<Chunk> waiting = chunk.shared_from_this();
+        wire_.removeIf([&chunk](const std::shared_ptr<Chunk>& c) { return c.get() == &chunk; });
+        queue_.prepend(waiting);
+        pump();
+    }
 
     // Signals only now that the chunk is on the wire again, or done: a slot
     // may start requests or even call setEndpoints().
     if (!switchedTo.isEmpty()) emit endpointChanged(switchedTo);
     if (next.isEmpty())
-        emit log(QStringLiteral("Ethereum RPC: %1 failed (%2); no endpoint left to try")
-                     .arg(hostOf(failedUrl), reason));
+        emit log(QStringLiteral("%1 RPC: %2 failed (%3); no endpoint left to try").arg(name_, hostOf(failedUrl), reason));
     else
-        emit log(QStringLiteral("Ethereum RPC: %1 failed (%2); retrying on %3")
-                     .arg(hostOf(failedUrl), reason, hostOf(next)));
+        emit log(QStringLiteral("%1 RPC: %2 failed (%3); retrying on %4").arg(name_, hostOf(failedUrl), reason, hostOf(next)));
 }
 
 void EthRpc::finish(Chunk& chunk)

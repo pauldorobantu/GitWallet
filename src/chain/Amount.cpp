@@ -78,6 +78,19 @@ Amount& Amount::operator+=(const Amount& other)
     return *this;
 }
 
+Amount& Amount::operator-=(const Amount& other)
+{
+    Botan::BigInt left = toBig(be_);
+    const Botan::BigInt right = toBig(other.be_);
+    if (left <= right) {
+        be_.clear();
+        return *this;
+    }
+    left -= right;
+    be_ = fromBig(left);
+    return *this;
+}
+
 int Amount::compare(const Amount& other) const
 {
     const int32_t c = toBig(be_).cmp(toBig(other.be_));

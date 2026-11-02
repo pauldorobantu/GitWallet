@@ -5,28 +5,6 @@
 
 namespace app::ui::figures {
 
-namespace {
-
-// Fraction digits shown per asset: satoshis for BTC, the wei tail cut at
-// micro-ether, cents for the dollar tokens.
-int shownDecimals(wallet::Asset asset)
-{
-    switch (asset) {
-    case wallet::Asset::BTC: return 8;
-    case wallet::Asset::ETH: return 6;
-    case wallet::Asset::USDT:
-    case wallet::Asset::USDC: return 2;
-    }
-    return 2;
-}
-
-bool isDollarToken(wallet::Asset asset)
-{
-    return asset == wallet::Asset::USDT || asset == wallet::Asset::USDC;
-}
-
-} // namespace
-
 QString dash()
 {
     return QStringLiteral("—");
@@ -34,7 +12,7 @@ QString dash()
 
 QString formatAmount(const chain::Amount& amount, const wallet::AssetInfo& info)
 {
-    const int shown = shownDecimals(info.asset);
+    const int shown = info.shownDecimals;
     const QString plain = QString::fromStdString(amount.format(info.decimals, shown));
     // Dust that truncates to zero reads "<0.000001", as on the Addresses page:
     // a bare "0" next to "3 funded addresses" would look like a bug.
@@ -43,7 +21,7 @@ QString formatAmount(const chain::Amount& amount, const wallet::AssetInfo& info)
     const qsizetype dot = plain.indexOf(QLatin1Char('.'));
     QString whole = dot < 0 ? plain : plain.left(dot);
     QString fraction = dot < 0 ? QString() : plain.mid(dot + 1);
-    if (isDollarToken(info.asset))
+    if (info.dollar)
         fraction = fraction.leftJustified(2, QLatin1Char('0'));
     for (qsizetype i = whole.size() - 3; i > 0; i -= 3)
         whole.insert(i, QLatin1Char(','));

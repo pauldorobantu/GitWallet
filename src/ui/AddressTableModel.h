@@ -20,7 +20,7 @@ public:
     enum Column { ColWallet, ColChain, ColType, ColPath, ColAddress, ColBalance, ColUsd, ColState, ColumnCount };
     enum Role {
         SortRole = Qt::UserRole + 1, // numeric value for balance / USD / path index columns
-        IsBitcoinRole,               // bool
+        NetworkRole,                 // int(wallet::Network)
         StateRole,                   // int(wallet::AddressState)
         AddressRole,                 // the full address (copy)
         WalletRole,                  // wallet::AddressRow::wallet

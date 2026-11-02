@@ -1,16 +1,19 @@
-#include "wallet/EthScanner.h"
+#include "wallet/EvmScanner.h"
 
 #include "chain/Hash.h"
 #include "net/EthRpc.h"
 #include "net/Multicall.h"
 #include "wallet/WalletModel.h"
 
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QLocale>
+#include <QLoggingCategory>
 #include <QPointer>
 #include <QTimer>
+#include <QUrl>
 
 #include <cstdint>
 #include <exception>
@@ -22,19 +25,47 @@ namespace wallet {
 
 namespace {
 
-// 49 addresses per attempt. (a) is one JSON-RPC batch of 50 calls, eth_chainId
-// and then the nonces: EthRpc posts up to kMaxBatch calls as a single HTTP
-// request and fails over with the whole of it, so one endpoint answers every
-// call of the batch. (b) is one eth_call with 148 Multicall3 sub-calls (~1M
-// gas): the chain-id proof, then three balances per address.
-constexpr int kChunk = 49;
-static_assert(kChunk + 1 <= net::EthRpc::kMaxBatch,
+// Endpoint failover and rate limits. Never carries a seed or a key: only server names,
+// addresses and counts reach it.
+Q_STATIC_LOGGING_CATEGORY(lcEvm, "gitwallet.net.rpc")
+
+// What one attempt asks at most. (a) is one JSON-RPC batch, eth_chainId and then the
+// nonces wanted, at most kMaxNonces: EthRpc posts up to kMaxBatch calls as a single HTTP
+// request and fails over with the whole of it, so one endpoint answers every call of the
+// batch. (b) is one eth_call with the chain-id proof, then one balance per address and
+// asset, at most kMaxSubCalls. Public endpoints answered 500 calls a batch and 2,000
+// sub-calls an eth_call without complaint, but limit plain calls to tens a second
+// (docs/ENDPOINTS.md); others cap a batch at 3 or 10, so an attempt that fails halves
+// the next one, down to kMinChunk, and answers grow it back.
+constexpr int kMaxNonces = 200;
+constexpr int kMaxChunk = 600;
+constexpr int kMinChunk = 2;
+constexpr int kMaxSubCalls = 1800;
+static_assert(kMaxNonces + 1 <= net::EthRpc::kMaxBatch,
               "eth_chainId and the nonces of a chunk must fit one JSON-RPC batch");
+// How long a sweep waits after the last one began: an hour, or more where reading them all
+// at a pace a public endpoint keeps up takes that long.
+constexpr qint64 kNoncePassMs = 3600 * 1000;
+constexpr qint64 kNoncesPerSecond = 50;
+// A start reads every nonce again as long as it takes a few minutes; past that it trusts
+// what the database kept, for the interval above.
+constexpr qint64 kReadNoncesAtStart = 10'000;
+// Batches of the smallest size in a row that miss a nonce: no endpoint gives them now, and
+// what a pass is for is the balances. Asked again after a while.
+constexpr int kMaxNonceFailures = 3;
+constexpr qint64 kNonceRetrySeconds = 600;
+// Good batches after which a higher ceiling is tried: it may have been a bad moment.
+constexpr int kBatchesBeforeProbe = 64;
+// How far past its plan a pass may run before the figures stop passing for current.
+constexpr qint64 kPassGraceMs = 60 * 1000;
 
 constexpr int kMaxRetries = 3; // then the chunk is skipped until the next pass
 constexpr int kRetryMs = 10'000;
 constexpr int kProgressMs = 250;
 constexpr int kMaxGap = 100'000;
+// While a pass runs longer than the refresh interval, unused addresses after the last
+// used one that go ahead of it in every short round, per account.
+constexpr qint64 kHotAhead = 20;
 // Rows derived per account at most. Every used address pushes the window `gap`
 // rows further and the model never drops a row, so an endpoint that calls every
 // address used (a nonce of 1, or 1 wei, for each) would otherwise grow the
@@ -42,21 +73,24 @@ constexpr int kMaxGap = 100'000;
 // shop seed needs (the controller's largest gap is 5,000), and well below 2^31,
 // where non-hardened BIP32 indices end.
 constexpr qint64 kMaxEthRows = 100'000;
-// Rows derived over all accounts together: wallets add up, and a pass over this
-// many already takes most of an hour at one chunk at a time.
-constexpr qint64 kMaxEthTotalRows = EthScanner::kMaxFollowedRows;
+// Rows derived over all accounts together: wallets add up.
+constexpr qint64 kMaxEthTotalRows = EvmScanner::kMaxFollowedRows;
 // Rows derived per event-loop turn when a pass sets up its windows: BtcScanner's
 // slice, so that many wallets or a large gap never freeze the window.
 constexpr qint64 kDeriveSlice = 250;
-// A nonce counts the transactions an address has sent. No mainnet address comes
+// A nonce counts the transactions an address has sent. No address comes
 // anywhere near 2^32 of them, so a larger one is a malformed reply, not proof
 // that the address was used.
 constexpr quint64 kMaxPlausibleNonce = quint64(1) << 32;
-constexpr int kMinRefreshSeconds = 10; // public endpoints rate-limit; never poll faster
+// Public endpoints rate-limit; never poll faster.
+int& minRefreshSeconds()
+{
+    static int seconds = 10;
+    return seconds;
+}
 constexpr int kMaxRefreshSeconds = 24 * 3600;
 constexpr qsizetype kMaxReported = 64;      // distinct messages remembered at once
 constexpr qsizetype kMaxServerDetail = 200; // characters of server text a problem() carries
-constexpr quint64 kMainnetChainId = 1;
 constexpr quint32 kGetChainIdSelector = 0x3408e470u; // Multicall3.getChainId()
 
 int hexValue(QChar c)
@@ -99,8 +133,7 @@ bool parseQuantity(const QJsonValue& value, quint64* out)
 // also proves where they come from, whichever endpoint EthRpc failed over to:
 // Multicall3 sits at this same address on BSC, Polygon, the L2s and testnets, so
 // reaching it proves nothing by itself. The selector is derived and checked the
-// way net::multicall checks its own (all four default endpoints answered chain
-// id 1 to it on 2026-10-31); a mismatch leaves the calldata empty, and
+// way net::multicall checks its own; a mismatch leaves the calldata empty, and
 // sendBalances() then sends nothing.
 const QByteArray& chainIdCall()
 {
@@ -147,12 +180,12 @@ enum class BalanceReply {
 // The aggregate3 reply: the chain id, then per address getEthBalance and
 // balanceOf on every token. known[k] stays false where the k-th balance sub-call
 // reverted: that balance is unknown and the row keeps its old value.
-// No number counts unless the reply shows it ran on mainnet: chain id 1, and
-// every token answering with one uint256 word as USDT and USDC always do there.
+// No number counts unless the reply shows it ran on this network: its chain id, and
+// every token answering with one uint256 word as a listed token always does there.
 // A call to an address without code "succeeds" with empty data, which is how
-// the mainnet token addresses answer on another chain, and an eth_call to a
+// a contract address answers on another chain, and an eth_call to a
 // missing Multicall3 returns no data at all. `why` then names the evidence.
-BalanceReply parseBalances(const QJsonValue& result, qsizetype addresses,
+BalanceReply parseBalances(const QJsonValue& result, qsizetype addresses, quint64 expectedChainId,
                            const QList<AssetInfo>& tokens, QList<bool>* known,
                            QList<chain::Amount>* amounts, QString* why)
 {
@@ -173,7 +206,7 @@ BalanceReply parseBalances(const QJsonValue& result, qsizetype addresses,
         const net::multicall::Result& id = decoded.at(0);
         quint64 chainId = 0;
         const bool readable = id.success && wordValue(id.returnData, &chainId);
-        if (!readable || chainId != kMainnetChainId) {
+        if (!readable || chainId != expectedChainId) {
             *why = readable ? QStringLiteral("chain id %1").arg(chainId)
                             : QStringLiteral("no valid chain id in its reply");
             return BalanceReply::OtherChain;
@@ -204,26 +237,11 @@ BalanceReply parseBalances(const QJsonValue& result, qsizetype addresses,
     }
 }
 
-bool anyBalance(const AddressRow& row)
-{
-    if (!row.ethWei.isZero())
-        return true;
-    for (auto it = row.tokens.cbegin(); it != row.tokens.cend(); ++it)
-        if (!it.value().isZero())
-            return true;
-    return false;
-}
-
 // Only the scan fields change here; skipping identical rows keeps a refresh
 // pass from repainting the whole table every minute.
-bool scanFieldsDiffer(const AddressRow& a, const AddressRow& b, const QList<AssetInfo>& tokens)
+bool scanFieldsDiffer(const AddressRow& a, const AddressRow& b)
 {
-    if (a.checked != b.checked || a.used != b.used || a.nonce != b.nonce || a.ethWei != b.ethWei)
-        return true;
-    for (const AssetInfo& t : tokens)
-        if (a.tokens.value(t.asset) != b.tokens.value(t.asset))
-            return true;
-    return false;
+    return a.checked != b.checked || a.used != b.used || a.nonce != b.nonce || a.balances != b.balances;
 }
 
 // What an endpoint sent (EthRpc's failure texts quote it), as problem() passes
@@ -251,23 +269,28 @@ QString serverDetail(const QString& text)
     return line;
 }
 
-// Settings accept any https URL; this is how a BSC, Polygon, L2 or testnet
-// endpoint gets noticed. Both requests of an attempt word it alike, so an
+// Settings accept any https URL; this is how an endpoint of another chain, an L2 or a
+// testnet gets noticed. Both requests of an attempt word it alike, so an
 // endpoint that fails both proofs is reported once.
-QString notMainnet(const QString& why)
+QString otherChainText(const QString& network, const QString& why)
 {
-    return QStringLiteral("Ethereum: the RPC endpoint does not look like Ethereum mainnet (%1), "
-                          "so its answers are ignored; check the Ethereum endpoints in Settings")
-        .arg(why);
+    return QStringLiteral("%1: the RPC endpoint does not look like %1 (%2), "
+                          "so its answers are ignored; check the %1 endpoints in Settings")
+        .arg(network, why);
 }
 
 } // namespace
 
-EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
-    : QObject(parent)
-    , rpc_(rpc)
-    , model_(model)
+EvmScanner::EvmScanner(Network network, net::BudgetPool* budgets, WalletModel* model, QObject* parent)
+    : ChainScanner(network, model, parent)
+    , rpc_(new net::EthRpc(info().name, info().chainId, info().servers, info().serverPace, budgets, this))
+    , nonceLimit_(kMaxNonces)
+    , nonceCeiling_(kMaxNonces)
 {
+    connect(rpc_, &net::EthRpc::endpointChanged, this, &ChainScanner::serverChanged);
+    // Nobody else can reach the client, so its diagnostics end up here.
+    connect(rpc_, &net::EthRpc::log, this, [](const QString& line) { qCDebug(lcEvm).noquote() << line; });
+
     // Single-shot and re-armed when a pass ends, so passes never overlap and
     // the interval is measured from the end of the previous one.
     refreshTimer_ = new QTimer(this);
@@ -293,6 +316,9 @@ EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
             emitProgress();
     });
 
+    hotTimer_ = new QTimer(this);
+    connect(hotTimer_, &QTimer::timeout, this, &EvmScanner::queueHotRound);
+
     // The window assumes its rows exist; after a clear, start over. A stop() or
     // start() the controller issues right after supersedes this restart, since
     // the scan itself only begins on the next event-loop turn. The balances
@@ -303,10 +329,14 @@ EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
         connect(model_, &WalletModel::cleared, this, [this] {
             bool rowsLeft = false;
             for (int r = 0; r < model_->size() && !rowsLeft; ++r)
-                rowsLeft = model_->at(r).type == chain::ScriptType::EthAccount && model_->at(r).checked;
+                rowsLeft = model_->at(r).network == network_ && model_->at(r).checked;
             if (!rowsLeft) {
                 balancesAt_ = QDateTime();
+                noncesAt_ = QDateTime();
                 refreshFailing_ = false;
+                sweepOpen_ = false;
+                sweepClears_ = false;
+                restoredSweep_ = NonceSweep();
             }
             if (running_)
                 start();
@@ -314,33 +344,46 @@ EthScanner::EthScanner(net::EthRpc* rpc, WalletModel* model, QObject* parent)
     }
 }
 
-void EthScanner::setAccounts(const QList<AccountKey>& accounts)
+EvmScanner::~EvmScanner()
+{
+    // Before the client goes: a scanner that stopped acts on none of its replies.
+    stop();
+    delete rpc_;
+    rpc_ = nullptr;
+}
+
+void EvmScanner::setAccounts(const QList<AccountKey>& accounts)
 {
     // Applies at the next start(); a running scan works on its own copy.
     accounts_.clear();
     owned_.clear();
     for (const AccountKey& key : accounts) {
         // A second key for the same account number of a wallet would fight over its rows.
-        if (key.type != chain::ScriptType::EthAccount || ownsAccount(key.wallet, key.account))
+        if (!key.serves(network_) || ownsAccount(key.wallet, key.account))
             continue;
         accounts_.append(key);
         owned_.insert({key.wallet, key.account});
     }
 }
 
-void EthScanner::setGap(int gap)
+void EvmScanner::setSettings(const ScanSettings& settings)
 {
-    gap_ = qBound(1, gap, kMaxGap);
-}
-
-void EthScanner::setRefreshSeconds(int seconds)
-{
-    refreshSeconds_ = qBound(kMinRefreshSeconds, seconds, kMaxRefreshSeconds);
+    gap_ = qBound(1, settings.evmGap, kMaxGap);
+    refreshSeconds_ = qBound(minRefreshSeconds(), settings.evmRefreshSeconds, kMaxRefreshSeconds);
+    const QStringList lines = settings.servers.value(info().id);
+    // Other endpoints: what the last ones said about every nonce may be why.
+    if (configured_ && lines != serverLines_) {
+        noncesWanted_ = true;
+        nonceLimit_ = kMaxNonces;
+        nonceCeiling_ = kMaxNonces;
+    }
+    configured_ = true;
+    serverLines_ = lines;
     if (refreshTimer_->isActive())
         refreshTimer_->start(refreshSeconds_ * 1000);
 }
 
-void EthScanner::start()
+void EvmScanner::start()
 {
     stopWork();
     if (!rpc_ || !model_) {
@@ -349,50 +392,108 @@ void EthScanner::start()
     }
     running_ = true;
     finished_ = false;
+    answered_ = false;
+    firstPass_ = true;
+    nonceMissed_.clear();
+    sweepRetryAt_ = QDateTime();
     passActive_ = true; // counts as a pass already, so refreshNow() waits for it
     reported_.clear();
     lastChecked_ = -1;
     lastDerived_ = -1;
+    if (!accounts_.isEmpty())
+        rpc_->setEndpoints(serverLines_); // cancels what is still on its way from an earlier run
+    chunkLimit_ = kMaxChunk;
     // Deferred: the caller finishes its own setup before any signal arrives,
     // and a stop()/start() issued right after cancels this one cleanly.
-    defer(&EthScanner::beginScan);
+    defer(&EvmScanner::beginScan);
 }
 
-void EthScanner::stop()
+void EvmScanner::stop()
 {
     stopWork();
+    if (rpc_)
+        rpc_->cancelAll();
     running_ = false;
     finished_ = false;
+    answered_ = false;
 }
 
-void EthScanner::refreshNow()
+void EvmScanner::restoreTimes(const QDateTime& balancesAt, const QDateTime& noncesAt, const NonceSweep& sweep)
+{
+    // Of rows that are there: the database keeps a time after its rows have gone.
+    if (!model_ || model_->rowsOn(network_) == 0)
+        return;
+    if (!balancesAt_.isValid())
+        balancesAt_ = balancesAt;
+    if (!noncesAt_.isValid())
+        noncesAt_ = noncesAt;
+    if (!sweepOpen_ && !restoredSweep_.from.isValid())
+        restoredSweep_ = sweep;
+}
+
+NonceSweep EvmScanner::nonceSweep() const
+{
+    if (!sweepOpen_ || acc_.isEmpty())
+        return restoredSweep_;
+    // The first it has not read: a row missed before where it has got to comes first.
+    int account = sweepAccount_;
+    quint32 index = sweepIndex_;
+    for (const QPair<int, quint32>& missed : nonceMissed_) {
+        if (missed.first < account || (missed.first == account && missed.second < index)) {
+            account = missed.first;
+            index = missed.second;
+        }
+    }
+    NonceSweep out;
+    out.from = sweepFrom_;
+    out.clears = sweepClears_;
+    const bool atEnd = account >= acc_.size();
+    const AccountKey& key = acc_.at(atEnd ? acc_.size() - 1 : account).key;
+    out.wallet = key.wallet;
+    out.account = key.account;
+    out.index = atEnd ? std::numeric_limits<quint32>::max() : index;
+    return out;
+}
+
+void EvmScanner::setMinRefreshForTest(int seconds)
+{
+    minRefreshSeconds() = seconds;
+}
+
+void EvmScanner::allowLocalHttpForTest()
+{
+    rpc_->allowLocalHttpForTest();
+}
+
+void EvmScanner::refreshNow()
 {
     if (!running_ || passActive_)
         return;
+    sweepRetryAt_ = QDateTime(); // someone is waiting: nonces no endpoint gave are asked for again
     refreshTimer_->stop();
     startPass();
 }
 
-bool EthScanner::isScanning() const
+bool EvmScanner::isScanning() const
 {
     return running_ && !finished_;
 }
 
-int EthScanner::checkedCount() const
+int EvmScanner::checkedCount() const
 {
     int checked = 0, derived = 0;
     countRows(&checked, &derived);
     return checked;
 }
 
-int EthScanner::derivedCount() const
+int EvmScanner::derivedCount() const
 {
     int checked = 0, derived = 0;
     countRows(&checked, &derived);
     return derived;
 }
 
-bool EthScanner::limitReached() const
+bool EvmScanner::limitReached() const
 {
     if (totalCut_)
         return true;
@@ -402,32 +503,59 @@ bool EthScanner::limitReached() const
     return false;
 }
 
-bool EthScanner::wrongChain() const
+bool EvmScanner::wrongChain() const
 {
     // Judged by the endpoint requests go to now: once EthRpc has moved on from
     // a rejected one, the answers of the next decide.
     return rpc_ && !offMainnet_.isEmpty() && offMainnet_.contains(rpc_->currentEndpoint());
 }
 
-QDateTime EthScanner::balancesAt() const
+QString EvmScanner::serverName() const
+{
+    // Host only: a configured endpoint may carry an API key in its path, query
+    // or user info, and this name is shown on screen and written to reports.
+    return rpc_ ? QUrl(rpc_->currentEndpoint()).host() : QString();
+}
+
+ScanTiers EvmScanner::tiers() const
+{
+    ScanTiers t;
+    t.live = int(totalRows_);
+    // A pass that takes longer than the refresh leaves the rest to its own pace.
+    if (lastPassSeconds_ > refreshSeconds_) {
+        t.live = hotRows_;
+        t.rounds = int(totalRows_) - hotRows_;
+        t.roundSeconds = lastPassSeconds_;
+    }
+    return t;
+}
+
+QDateTime EvmScanner::balancesAt() const
 {
     return balancesAt_;
 }
 
-bool EthScanner::refreshFailing() const
+bool EvmScanner::refreshFailing() const
 {
-    return refreshFailing_;
+    if (refreshFailing_)
+        return true;
+    // No whole pass for this long: an outage that fails nothing, a night's sleep. Until
+    // the first answers are in, the time is from an earlier run and says so anyway.
+    if (!running_ || !finished_ || !balancesAt_.isValid())
+        return false;
+    // The pass under way may be one that reads every nonce, a lot longer than the last.
+    const qint64 sweeping = sweepAsking_ && passActive_ ? totalRows_ / kNoncesPerSecond : 0;
+    const qint64 planned = qMax(qMax<qint64>(lastPassSeconds_, refreshSeconds_), sweeping) * 1000;
+    return balancesAt_.msecsTo(QDateTime::currentDateTime()) > 2 * planned + kPassGraceMs;
 }
 
 // ------------------------------------------------------------ the window ----
 
-void EthScanner::beginScan()
+void EvmScanner::beginScan()
 {
-    const QList<AssetInfo> erc20 = erc20Assets();
     tokens_.clear();
-    for (const AssetInfo& t : erc20)
-        if (!t.contract.isEmpty())
-            tokens_.append(t);
+    for (const Asset token : info().tokens)
+        tokens_.append(assetInfo(token));
 
     acc_.clear();
     for (const AccountKey& key : std::as_const(accounts_)) {
@@ -438,7 +566,8 @@ void EthScanner::beginScan()
         } catch (const std::exception&) {
             // The parser's own text is not passed on: it could quote the key.
             report({Problem::Skipped,
-                    QStringLiteral("Ethereum account %1: the stored public key could not be read")
+                    QStringLiteral("%1 account %2: the stored public key could not be read")
+                        .arg(info().name)
                         .arg(key.account),
                     QString()});
             continue;
@@ -448,74 +577,98 @@ void EthScanner::beginScan()
 
     totalRows_ = 0;
     totalCut_ = false;
+    placeRestoredSweep();
     const quint64 gen = gen_;
-    for (int i = 0; i < acc_.size(); ++i) {
-        adoptRows(i);
-        if (gen != gen_)
-            return; // a model slot restarted or stopped the scan
-    }
+    adoptRows();
+    if (gen != gen_)
+        return; // a model slot restarted or stopped the scan
     startPass();
 }
 
-// Rows of this account already in the model (a restart with new settings) are
-// reused: they size the window at once and need no derivation.
-void EthScanner::adoptRows(int i)
+// Rows of these accounts already in the model (a restart with new settings, or the
+// database at the start) are reused: they size the windows at once and need no
+// derivation. One walk over the rows for all accounts: a thousand accounts must not
+// walk them a thousand times.
+void EvmScanner::adoptRows()
 {
-    AccountState& a = acc_[i];
-    qint64 maxIndex = -1;
-    qint64 lowest = -1;
-    QString lowestAddress;
+    struct Seen {
+        qint64 maxIndex = -1;
+        qint64 lowest = -1;
+        QString lowestAddress;
+    };
+    QHash<QPair<quint32, quint32>, int> positions;
+    for (int i = 0; i < acc_.size(); ++i)
+        positions.insert({acc_.at(i).key.wallet, acc_.at(i).key.account}, i);
+    QList<Seen> seen(acc_.size());
+    const bool clearing = noncesWanted_ || (sweepOpen_ && sweepClears_);
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
-        if (row.type != chain::ScriptType::EthAccount || row.wallet != a.key.wallet
-            || row.account != a.key.account
-            || row.change != 0 || qint64(row.index) >= kMaxEthRows) // past the cap: never derived here
+        if (row.network != network_ || row.change != 0 || qint64(row.index) >= kMaxEthRows) // past the cap: never derived here
             continue;
+        const auto found = positions.constFind({row.wallet, row.account});
+        if (found == positions.cend())
+            continue;
+        Seen& one = seen[*found];
         const qint64 index = row.index;
-        maxIndex = qMax(maxIndex, index);
+        one.maxIndex = qMax(one.maxIndex, index);
+        // Unless the endpoints changed, and it may be their word that made them used. The
+        // answers of this sweep decide then: the flag only says what to read first.
+        if (!clearing && row.used)
+            acc_[*found].lastUsed = qMax(acc_.at(*found).lastUsed, index);
         if (row.used)
-            a.lastUsed = qMax(a.lastUsed, index);
-        if (lowest < 0 || index < lowest) {
-            lowest = index;
-            lowestAddress = row.address;
+            acc_[*found].savedUsed = qMax(acc_.at(*found).savedUsed, index);
+        if (one.lowest < 0 || index < one.lowest) {
+            one.lowest = index;
+            one.lowestAddress = row.address;
         }
     }
-    if (maxIndex < 0)
-        return;
 
-    // Rows of another key (a wallet replaced without clearing the model) would
-    // show someone else's balances; re-deriving one row tells them apart.
-    bool replace = false;
-    AddressRow probe;
-    QString why;
-    if (!deriveRow(a, quint32(lowest), &probe, &why)) {
-        report({Problem::Skipped, why, QString()});
-    } else if (probe.address.compare(lowestAddress, Qt::CaseInsensitive) != 0) {
-        replace = true;
-        a.lastUsed = -1;
-        balancesAt_ = QDateTime(); // it dated the other key's balances
+    const quint64 gen = gen_;
+    for (int i = 0; i < acc_.size(); ++i) {
+        const Seen& one = seen.at(i);
+        if (one.maxIndex < 0)
+            continue;
+        // Rows of another key (a wallet replaced without clearing the model) would
+        // show someone else's balances; re-deriving one row tells them apart.
+        bool replace = false;
+        AddressRow probe;
+        QString why;
+        if (!deriveRow(acc_.at(i), quint32(one.lowest), &probe, &why)) {
+            report({Problem::Skipped, why, QString()});
+        } else if (probe.address.compare(one.lowestAddress, Qt::CaseInsensitive) != 0) {
+            replace = true;
+            acc_[i].lastUsed = -1;
+            acc_[i].savedUsed = -1;
+            // They dated the other key's balances.
+            balancesAt_ = QDateTime();
+            noncesAt_ = QDateTime();
+            sweepOpen_ = false;
+        }
+        ensureRows(i, 0, one.maxIndex + 1, replace, false); // also fills any gap in the indices
+        if (gen != gen_)
+            return; // a model slot restarted or stopped the scan
     }
-    ensureRows(i, 0, maxIndex + 1, replace, false); // also fills any gap in the indices
 }
 
-bool EthScanner::deriveRow(const AccountState& account, quint32 index, AddressRow* out,
+bool EvmScanner::deriveRow(const AccountState& account, quint32 index, AddressRow* out,
                            QString* why) const
 {
     try {
-        const chain::AddressInfo info = chain::addressFromChainNode(
-            account.chainNode, chain::ScriptType::EthAccount, account.key.account, 0, index);
+        const chain::AddressInfo address = chain::addressFromChainNode(
+            account.chainNode, chain::ScriptType::EthAccount, account.key.account, 0, index, info().format);
         AddressRow row;
         row.wallet = account.key.wallet;
+        row.network = network_;
         row.type = chain::ScriptType::EthAccount;
         row.account = account.key.account;
         row.change = 0;
         row.index = index;
-        row.path = QString::fromStdString(info.path);
-        row.address = QString::fromStdString(info.address);
+        row.address = QString::fromStdString(address.address);
         *out = row;
         return true;
     } catch (const std::exception& e) {
-        *why = QStringLiteral("Ethereum account %1: address %2 could not be derived (%3)")
+        *why = QStringLiteral("%1 account %2: address %3 could not be derived (%4)")
+                   .arg(info().name)
                    .arg(account.key.account)
                    .arg(index)
                    .arg(QString::fromUtf8(e.what()));
@@ -526,7 +679,7 @@ bool EthScanner::deriveRow(const AccountState& account, quint32 index, AddressRo
 // Makes rows [from, to) of account i exist in the model, deriving the missing
 // ones (or, with `replace`, all of them), and optionally queues every one of
 // them for the current pass.
-void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool enqueue)
+void EvmScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool enqueue)
 {
     const quint64 gen = gen_;
     for (qint64 index = from; index < to; ++index) {
@@ -537,15 +690,15 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
             totalCut_ = true;
             static const QLocale english(QLocale::English, QLocale::UnitedStates);
             report({Problem::Limit,
-                    QStringLiteral("Ethereum scan stopped at %1 addresses, the most GitWallet follows, shared by "
-                                   "all wallets. Lower the Ethereum gap in Settings or remove wallets you do not "
+                    QStringLiteral("%1 scan stopped at %2 addresses, the most GitWallet follows, shared by "
+                                   "all wallets. Lower the gap in Settings or remove wallets you do not "
                                    "need here.")
-                        .arg(english.toString(kMaxEthTotalRows)),
+                        .arg(info().name, english.toString(kMaxEthTotalRows)),
                     QString()});
             return;
         }
         if (replace
-            || model_->find(acc_.at(i).key.wallet, chain::ScriptType::EthAccount, acc_.at(i).key.account,
+            || model_->find(acc_.at(i).key.wallet, network_, chain::ScriptType::EthAccount, acc_.at(i).key.account,
                             0, idx) < 0) {
             AddressRow row;
             QString why;
@@ -572,20 +725,20 @@ void EthScanner::ensureRows(int i, qint64 from, qint64 to, bool replace, bool en
 
 // lastUsed + 1 + gap, but never past an index that failed to derive, nor past
 // kMaxEthRows.
-qint64 EthScanner::windowEnd(const AccountState& account) const
+qint64 EvmScanner::windowEnd(const AccountState& account) const
 {
     return qMin(qMin(account.lastUsed + 1 + gap_, account.limit), kMaxEthRows);
 }
 
 // The rows the window wants past kMaxEthRows are neither derived nor checked.
-bool EthScanner::cutAtLimit(const AccountState& account) const
+bool EvmScanner::cutAtLimit(const AccountState& account) const
 {
     return qMin(account.lastUsed + 1 + gap_, account.limit) > kMaxEthRows;
 }
 
 // Derives (and, during a pass, queues) the part below `upTo` of the rows the window
 // gained since it was last computed.
-void EthScanner::extendWindowTo(int i, bool enqueue, qint64 upTo)
+void EvmScanner::extendWindowTo(int i, bool enqueue, qint64 upTo)
 {
     AccountState& a = acc_[i];
     if (!a.capReported && cutAtLimit(a)) {
@@ -597,9 +750,9 @@ void EthScanner::extendWindowTo(int i, bool enqueue, qint64 upTo)
                                   chain::accountRootPath(chain::ScriptType::EthAccount, a.key.account))
                               + QStringLiteral("/0");
         report({Problem::Limit,
-                QStringLiteral("Stopped at %1 addresses on %2, the limit per account: the Ethereum "
+                QStringLiteral("Stopped at %1 addresses on %2, the limit per account: the %3 "
                                "endpoint reports addresses that far out as used.")
-                    .arg(english.toString(kMaxEthRows), where),
+                    .arg(english.toString(kMaxEthRows), where, info().name),
                 QString()});
     }
     if (upTo > a.end)
@@ -610,21 +763,56 @@ void EthScanner::extendWindowTo(int i, bool enqueue, qint64 upTo)
 
 // The initial scan and every refresh are the same pass: all known rows of the
 // window, checked chunk by chunk, one chunk in flight at a time.
-void EthScanner::startPass()
+void EvmScanner::startPass()
 {
     passActive_ = true;
     passFailed_ = false;
     passSkipped_ = false;
     queue_.clear();
     queueHead_ = 0;
+    hotQueue_.clear();
     deriving_ = 0;
     growing_.clear(); // deriveWindows() covers every window
+    noncesDecided_ = false;
+    passClock_.start();
+    passStartedAt_ = QDateTime::currentDateTime();
+    hotTimer_->start(refreshSeconds_ * 1000);
+    // The timer ran out with the last pass: what it would have read goes first.
+    if (lastPassSeconds_ > refreshSeconds_)
+        queueHotRound();
     deriveWindows();
+}
+
+bool EvmScanner::hotRow(const AccountState& account, const AddressRow& row) const
+{
+    const qint64 index = row.index;
+    const qint64 last = qMax(account.lastUsed, account.savedUsed);
+    return !row.balances.isEmpty() || (index > last && index <= last + kHotAhead);
+}
+
+// A pass longer than the refresh interval must not leave a fresh address waiting for
+// it: these go first, whatever the pass has got to.
+void EvmScanner::queueHotRound()
+{
+    if (!running_ || !passActive_ || !hotQueue_.isEmpty())
+        return;
+    QHash<QPair<quint32, quint32>, int> positions;
+    for (int i = 0; i < acc_.size(); ++i)
+        positions.insert({acc_.at(i).key.wallet, acc_.at(i).key.account}, i);
+    for (int r = 0; r < model_->size(); ++r) {
+        const AddressRow& row = model_->at(r);
+        if (row.network != network_)
+            continue;
+        const auto found = positions.constFind({row.wallet, row.account});
+        if (found != positions.cend() && hotRow(acc_.at(*found), row))
+            hotQueue_.append(Slot{*found, row.index, QString()});
+    }
+    hotRows_ = int(hotQueue_.size());
 }
 
 // Brings every window up to date, kDeriveSlice rows per event-loop turn, then
 // queues the whole pass. A slice that does not finish them comes back next turn.
-void EthScanner::deriveWindows()
+void EvmScanner::deriveWindows()
 {
     const quint64 gen = gen_;
     qint64 budget = kDeriveSlice;
@@ -641,19 +829,19 @@ void EthScanner::deriveWindows()
     }
     if (deriving_ < acc_.size() && !totalCut_) {
         noteProgress();
-        defer(&EthScanner::deriveWindows);
+        defer(&EvmScanner::deriveWindows);
         return;
     }
     for (int i = 0; i < acc_.size(); ++i)
         for (qint64 index = 0; index < acc_.at(i).end; ++index)
             queue_.append(Slot{i, quint32(index), QString()});
     noteProgress();
-    defer(&EthScanner::nextChunk);
+    defer(&EvmScanner::nextChunk);
 }
 
 // The windows a used address moved during the pass, queued as they grow: the same
 // slices as deriveWindows(), so a far-out address never freezes the window either.
-void EthScanner::growWindows()
+void EvmScanner::growWindows()
 {
     const quint64 gen = gen_;
     qint64 budget = kDeriveSlice;
@@ -671,10 +859,10 @@ void EthScanner::growWindows()
     if (totalCut_)
         growing_.clear();
     noteProgress();
-    defer(growing_.isEmpty() ? &EthScanner::nextChunk : &EthScanner::growWindows);
+    defer(growing_.isEmpty() ? &EvmScanner::nextChunk : &EvmScanner::growWindows);
 }
 
-void EthScanner::nextChunk()
+void EvmScanner::nextChunk()
 {
     if (!growing_.isEmpty()) {
         growWindows();
@@ -682,15 +870,31 @@ void EthScanner::nextChunk()
     }
     chunk_.clear();
     attempts_ = 0;
-    while (queueHead_ < queue_.size() && chunk_.size() < kChunk) {
-        Slot s = queue_.at(queueHead_++);
-        const AccountKey& key = acc_.at(s.account).key;
-        const int pos = model_->find(key.wallet, chain::ScriptType::EthAccount, key.account, 0, s.index);
+    if (!noncesDecided_)
+        decideNonces();
+    else
+        moveSweepOn();
+    // What one eth_call can read, with this network's tokens.
+    const int perCall = int(kMaxSubCalls / (1 + tokens_.size()));
+    const int limit = qBound(kMinChunk, qMin(chunkLimit_, perCall), kMaxChunk);
+    const int nonceLimit = qMin(limit, nonceLimit_);
+    int nonces = 0;
+    const auto take = [&](const Slot& slot, bool fromPass) {
+        const AccountKey& key = acc_.at(slot.account).key;
+        const int pos = model_->find(key.wallet, network_, chain::ScriptType::EthAccount, key.account, 0, slot.index);
         if (pos < 0)
-            continue;
+            return;
+        Slot s = slot;
         s.address = model_->at(pos).address;
+        // A slot back from a failed attempt still wants what it wanted.
+        s.readNonce = slot.readNonce || !model_->at(pos).checked || (fromPass && sweepWants(slot));
+        nonces += s.readNonce ? 1 : 0;
         chunk_.append(s);
-    }
+    };
+    while (!hotQueue_.isEmpty() && chunk_.size() < limit && nonces < nonceLimit)
+        take(hotQueue_.takeLast(), false);
+    while (queueHead_ < queue_.size() && chunk_.size() < limit && nonces < nonceLimit)
+        take(queue_.at(queueHead_++), true);
     if (chunk_.isEmpty()) {
         finishPass();
         return;
@@ -698,62 +902,149 @@ void EthScanner::nextChunk()
     sendNonces();
 }
 
+bool EvmScanner::noncesDue() const
+{
+    if (!noncesAt_.isValid())
+        return true;
+    const qint64 age = (sweepEndedAt_.isValid() ? sweepEndedAt_ : noncesAt_).msecsTo(QDateTime::currentDateTime());
+    return age < 0 || age > qMax(kNoncePassMs, totalRows_ * 1000 / kNoncesPerSecond);
+}
+
+void EvmScanner::decideNonces()
+{
+    noncesDecided_ = true;
+    const bool fresh = noncesWanted_ || (!sweepOpen_ && ((firstPass_ && totalRows_ <= kReadNoncesAtStart) || noncesDue()));
+    if (fresh) {
+        sweepClears_ = noncesWanted_ || (sweepOpen_ && sweepClears_);
+        noncesWanted_ = false;
+        sweepOpen_ = true;
+        sweepFrom_ = passStartedAt_;
+        sweepAccount_ = 0;
+        sweepIndex_ = 0;
+        sweepRetryAt_ = QDateTime();
+        nonceMissed_.clear();
+    }
+    firstPass_ = false;
+    nonceFailures_ = 0;
+    sweepAsking_ = sweepOpen_ && (!sweepRetryAt_.isValid() || QDateTime::currentDateTime() >= sweepRetryAt_);
+}
+
+void EvmScanner::placeRestoredSweep()
+{
+    const NonceSweep sweep = std::exchange(restoredSweep_, NonceSweep());
+    if (!sweep.from.isValid() || acc_.isEmpty())
+        return;
+    sweepOpen_ = true;
+    sweepFrom_ = sweep.from;
+    sweepClears_ = sweep.clears;
+    sweepAccount_ = 0;
+    sweepIndex_ = 0;
+    // Its account may have gone with a wallet: from the top then, under the same time.
+    for (int i = 0; i < acc_.size(); ++i) {
+        if (acc_.at(i).key.wallet == sweep.wallet && acc_.at(i).key.account == sweep.account) {
+            sweepAccount_ = i;
+            sweepIndex_ = sweep.index;
+            break;
+        }
+    }
+}
+
+bool EvmScanner::sweepWants(const Slot& slot) const
+{
+    if (!sweepAsking_ || nonceFailures_ >= kMaxNonceFailures)
+        return false;
+    return slot.account > sweepAccount_ || (slot.account == sweepAccount_ && slot.index >= sweepIndex_)
+           || nonceMissed_.contains({slot.account, slot.index});
+}
+
+void EvmScanner::moveSweepOn()
+{
+    // Only forward: a window that grows queues its rows last, and they want a nonce anyway.
+    if (!sweepOpen_ || !sweepAsking_ || nonceFailures_ >= kMaxNonceFailures)
+        return;
+    if (queueHead_ >= queue_.size()) {
+        sweepAccount_ = int(acc_.size());
+        sweepIndex_ = 0;
+        return;
+    }
+    const Slot& next = queue_.at(queueHead_);
+    if (next.account > sweepAccount_ || (next.account == sweepAccount_ && next.index > sweepIndex_)) {
+        sweepAccount_ = next.account;
+        sweepIndex_ = next.index;
+    }
+}
+
 // (a) One JSON-RPC batch: eth_chainId, then eth_getTransactionCount of every
 // address in the chunk. The batch is a single HTTP request (see kChunk), so its
 // chain id proves where its nonces come from, whichever endpoint answered it;
 // the eth_call of (b) cannot, since EthRpc may fail over between the two. No
-// nonce counts without chain id 1: one read on another chain would mark the
-// address used here (sticky) and push the window. EthRpc itself withholds the
-// answers of an endpoint whose eth_chainId is not 1 and replies with an error
+// nonce counts without this network's chain id: one read on another chain would mark
+// the address used here (sticky) and push the window. EthRpc itself withholds the
+// answers of an endpoint whose eth_chainId is another and replies with an error
 // instead (EthRpc::isOffChain() tells it apart), so the chain id check here is
 // the second line. Endpoint failure texts quote the endpoint: they go out as
 // the server detail only.
-void EthScanner::sendNonces()
+void EvmScanner::sendNonces()
 {
     chunkIssues_.clear();
-    QList<QPair<QString, QJsonArray>> calls;
-    calls.reserve(1 + chunk_.size());
-    calls.append(qMakePair(QStringLiteral("eth_chainId"), QJsonArray()));
-    for (const Slot& s : std::as_const(chunk_))
-        calls.append(qMakePair(QStringLiteral("eth_getTransactionCount"),
-                               QJsonArray{s.address, QStringLiteral("latest")}));
-
     const qsizetype n = chunk_.size();
+    QList<QPair<QString, QJsonArray>> calls;
+    calls.append(qMakePair(QStringLiteral("eth_chainId"), QJsonArray()));
+    QList<qsizetype> asked; // positions in chunk_ of the nonces asked for
+    for (qsizetype i = 0; i < n; ++i) {
+        if (!chunk_.at(i).readNonce)
+            continue;
+        asked.append(i);
+        calls.append(qMakePair(QStringLiteral("eth_getTransactionCount"),
+                               QJsonArray{chunk_.at(i).address, QStringLiteral("latest")}));
+    }
+    // None wanted: on to the balances, whose reply proves its own chain.
+    if (asked.isEmpty()) {
+        onNonces(QList<quint64>(n, quint64(0)), QList<bool>(n, true), {});
+        return;
+    }
+
     const quint64 gen = gen_;
     const quint64 seq = ++nextSeq_;
     pendingSeq_ = seq;
-    QPointer<EthScanner> self(this);
-    rpc_->batch(calls, [self, gen, seq, n](const QList<QJsonValue>& results, const QStringList& errors,
-                                           const QStringList& endpoints) {
+    QPointer<EvmScanner> self(this);
+    rpc_->batch(calls, [self, gen, seq, n, asked](const QList<QJsonValue>& results, const QStringList& errors,
+                                                  const QStringList& endpoints) {
         if (!self || !self->acceptReply(gen, seq))
             return;
         QList<quint64> nonces(n, quint64(0));
         QList<bool> ok(n, false);
+        for (qsizetype i = 0; i < n; ++i)
+            ok[i] = !asked.contains(i); // what was not asked needs no answer; see the loop below
         QList<Issue> issues;
         const QString idError = errors.value(0, QStringLiteral("no reply"));
         quint64 chainId = 0;
+        bool unusable = false; // it answered, and what it said about a nonce makes no sense
         if (!idError.isEmpty() && self->rpc_->isOffChain(endpoints.value(0))) {
             // EthRpc already skips it; recorded here so wrongChain() can say so.
             if (!self->offMainnet_.contains(endpoints.value(0)))
                 self->offMainnet_.append(endpoints.value(0));
-            issues << Issue{Problem::WrongChain, notMainnet(QStringLiteral("eth_chainId is not 1")),
+            issues << Issue{Problem::WrongChain,
+                            otherChainText(self->info().name,
+                                           QStringLiteral("eth_chainId is not %1").arg(self->info().chainId)),
                             serverDetail(idError)};
         } else if (!idError.isEmpty()) {
-            issues << Issue{Problem::Failure, QStringLiteral("Ethereum nonce lookup failed"),
+            issues << Issue{Problem::Failure, QStringLiteral("%1 nonce lookup failed").arg(self->info().name),
                             serverDetail(idError)};
         } else if (!parseQuantity(results.value(0), &chainId)) {
             issues << Issue{Problem::Failure,
-                            QStringLiteral("Ethereum nonce lookup failed: no valid chain id in the reply"),
+                            QStringLiteral("%1 nonce lookup failed: no valid chain id in the reply").arg(self->info().name),
                             QString()};
-        } else if (chainId != kMainnetChainId) {
-            issues << Issue{Problem::WrongChain, notMainnet(QStringLiteral("chain id %1").arg(chainId)),
-                            QString()};
+        } else if (chainId != self->info().chainId) {
+            issues << Issue{Problem::WrongChain,
+                            otherChainText(self->info().name, QStringLiteral("chain id %1").arg(chainId)), QString()};
             self->refuseEndpoint(endpoints.value(0), true);
             if (!self || gen != self->gen_)
                 return; // a slot of EthRpc's signals restarted or stopped the scan
         } else {
-            for (qsizetype i = 0; i < n; ++i) {
-                const qsizetype call = 1 + i; // after eth_chainId
+            for (qsizetype a = 0; a < asked.size(); ++a) {
+                const qsizetype i = asked.at(a);
+                const qsizetype call = 1 + a; // after eth_chainId
                 const QString err = errors.value(call, QStringLiteral("no reply"));
                 quint64 nonce = 0;
                 if (err.isEmpty() && parseQuantity(results.value(call), &nonce)
@@ -761,20 +1052,26 @@ void EthScanner::sendNonces()
                     nonces[i] = nonce;
                     ok[i] = true;
                 } else if (!err.isEmpty()) {
-                    issues << Issue{Problem::Failure, QStringLiteral("Ethereum nonce lookup failed"),
+                    issues << Issue{Problem::Failure, QStringLiteral("%1 nonce lookup failed").arg(self->info().name),
                                     serverDetail(err)};
                 } else {
+                    unusable = true;
                     issues << Issue{Problem::Failure,
-                                    QStringLiteral("Ethereum nonce lookup failed: unexpected reply"),
+                                    QStringLiteral("%1 nonce lookup failed: unexpected reply").arg(self->info().name),
                                     QString()};
                 }
             }
+        }
+        if (unusable) {
+            self->refuseEndpoint(endpoints.value(0), false);
+            if (!self || gen != self->gen_)
+                return; // a slot of EthRpc's signals restarted or stopped the scan
         }
         self->onNonces(nonces, ok, issues);
     });
 }
 
-void EthScanner::onNonces(const QList<quint64>& nonces, const QList<bool>& ok,
+void EvmScanner::onNonces(const QList<quint64>& nonces, const QList<bool>& ok,
                           const QList<Issue>& issues)
 {
     nonce_ = nonces;
@@ -782,17 +1079,17 @@ void EthScanner::onNonces(const QList<quint64>& nonces, const QList<bool>& ok,
     for (const Issue& issue : issues)
         noteFailure(issue);
     // (b) runs even when (a) failed: whatever balances arrive are still shown.
-    defer(&EthScanner::sendBalances);
+    defer(&EvmScanner::sendBalances);
 }
 
 // (b) One eth_call to Multicall3.aggregate3: getChainId first, then per address
 // getEthBalance plus balanceOf on every ERC-20 contract, in that order. An
 // endpoint that answers it with something unusable, or with what shows another
-// chain (or no mainnet state), may well have said chain id 1 to eth_chainId:
+// chain (or no state of this one), may well have said the right id to eth_chainId:
 // only this reply gives it away, so it is rejected here, before the retry.
-void EthScanner::sendBalances()
+void EvmScanner::sendBalances()
 {
-    const QString multicall = QString::fromLatin1(net::multicall::kAddress);
+    const QString multicall = info().multicall;
     const qsizetype n = chunk_.size();
     const qsizetype count = n * (1 + tokens_.size()); // balance sub-calls, after the chain id
     QString data;
@@ -821,8 +1118,9 @@ void EthScanner::sendBalances()
     if (!encoded) {
         applyChunk(QList<bool>(count, false), QList<chain::Amount>(count),
                    {Issue{Problem::Failure,
-                          QStringLiteral("Ethereum balance lookup failed: the Multicall3 request "
-                                         "could not be encoded"),
+                          QStringLiteral("%1 balance lookup failed: the Multicall3 request "
+                                         "could not be encoded")
+                              .arg(info().name),
                           QString()}},
                    false);
         return;
@@ -834,7 +1132,7 @@ void EthScanner::sendBalances()
     const quint64 gen = gen_;
     const quint64 seq = ++nextSeq_;
     pendingSeq_ = seq;
-    QPointer<EthScanner> self(this);
+    QPointer<EvmScanner> self(this);
     rpc_->call(QStringLiteral("eth_call"), QJsonArray{tx, QStringLiteral("latest")},
                [self, gen, seq, n, tokens = tokens_](const QJsonValue& result, const QString& rpcError,
                                                      const QString& endpoint) {
@@ -847,27 +1145,31 @@ void EthScanner::sendBalances()
                    bool otherChain = false;
                    bool unusable = false;
                    QString why;
+                   const QString name = self->info().name;
                    if (!rpcError.isEmpty()) {
-                       issues << Issue{Problem::Failure, QStringLiteral("Ethereum balance lookup failed"),
+                       issues << Issue{Problem::Failure, QStringLiteral("%1 balance lookup failed").arg(name),
                                        serverDetail(rpcError)};
                    } else {
-                       switch (parseBalances(result, n, tokens, &known, &amounts, &why)) {
+                       switch (parseBalances(result, n, self->info().chainId, tokens, &known, &amounts, &why)) {
                        case BalanceReply::Ok:
-                           self->offMainnet_.removeAll(endpoint); // it serves mainnet (again)
+                           self->offMainnet_.removeAll(endpoint); // it serves this network (again)
+                           // Not one of them, or still some on a retry that asked for fewer: the
+                           // size was not the reason, and there is no use asking it again.
+                           unusable = !known.contains(true) || (self->attempts_ >= 1 && known.contains(false));
                            if (known.contains(false))
                                issues << Issue{Problem::Failure,
-                                               QStringLiteral("Ethereum balance lookup: some balance calls failed"),
+                                               QStringLiteral("%1 balance lookup: some balance calls failed").arg(name),
                                                QString()};
                            break;
                        case BalanceReply::Malformed:
                            unusable = true;
                            issues << Issue{Problem::Failure,
-                                           QStringLiteral("Ethereum balance lookup failed: unexpected Multicall3 reply"),
+                                           QStringLiteral("%1 balance lookup failed: unexpected Multicall3 reply").arg(name),
                                            QString()};
                            break;
                        case BalanceReply::OtherChain:
                            otherChain = true;
-                           issues << Issue{Problem::WrongChain, notMainnet(why), QString()};
+                           issues << Issue{Problem::WrongChain, otherChainText(name, why), QString()};
                            break;
                        }
                    }
@@ -887,7 +1189,7 @@ void EthScanner::sendBalances()
 // where (b) did. With `otherChain` the nonces are dropped as well, so an
 // attempt that met a non-mainnet endpoint changes no row and is retried whole,
 // on another endpoint if there is one (sendBalances() rejected that one).
-void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>& amounts,
+void EvmScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>& amounts,
                             const QList<Issue>& issues, bool otherChain)
 {
     for (const Issue& issue : issues)
@@ -898,50 +1200,100 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
     const QList<Slot> attempt = chunk_;
     QList<Slot> failed;
     QList<int> grown; // accounts whose last used index moved up
+    bool nonceLate = false; // a row's balances answered, and its nonce did not
+    bool nonceAnswered = false;
+    bool nonceMissing = false;
+    int noncesAsked = 0;
+    QList<Slot> late;
 
     for (qsizetype i = 0; i < attempt.size(); ++i) {
         const Slot& s = attempt.at(i);
         const AccountKey& key = acc_.at(s.account).key;
-        const int pos = model_->find(key.wallet, chain::ScriptType::EthAccount, key.account, 0, s.index);
+        const int pos = model_->find(key.wallet, network_, chain::ScriptType::EthAccount, key.account, 0, s.index);
         if (pos < 0 || model_->at(pos).address.compare(s.address, Qt::CaseInsensitive) != 0)
             continue; // replaced or removed while the request was out
         const AddressRow old = model_->at(pos);
         AddressRow row = old;
 
-        bool ok = !otherChain && nonceOk_.value(i, false);
-        if (ok)
+        const bool nonceRead = !otherChain && s.readNonce && nonceOk_.value(i, false);
+        noncesAsked += s.readNonce ? 1 : 0;
+        nonceMissing = nonceMissing || (s.readNonce && !nonceRead);
+        const quint64 oldNonce = old.nonce;
+        if (nonceRead) {
             row.nonce = nonce_.at(i);
+            nonceAnswered = true;
+            nonceMissed_.remove({s.account, s.index});
+        }
+        bool balancesOk = !otherChain;
         const qsizetype base = i * stride;
         for (qsizetype k = 0; k < stride; ++k) {
             if (!known.value(base + k, false)) {
-                ok = false; // unknown: keep the old value
+                balancesOk = false; // unknown: keep the old value
                 continue;
             }
-            if (k == 0)
-                row.ethWei = amounts.at(base);
-            else
-                row.tokens[tokens_.at(k - 1).asset] = amounts.at(base + k);
+            row.setBalance(k == 0 ? info().coin : tokens_.at(k - 1).asset, amounts.at(base + k));
         }
+        const bool noNonce = s.readNonce && !nonceRead;
         // A failed attempt never downgrades a row: what an earlier pass
         // confirmed stays shown until a newer answer replaces it.
-        row.checked = old.checked || ok;
-        // Sticky, so the window never shrinks behind an address that was used.
-        row.used = old.used || row.nonce > 0 || anyBalance(row);
+        row.checked = old.checked || (balancesOk && !noNonce);
+        // It stays used once it held something: a spend by signature leaves its nonce at 0,
+        // and the next address may be paid. A nonce that falls shows the earlier answer was
+        // false, and after a change of endpoints nothing an earlier one said counts.
+        const bool shown = row.nonce > 0 || !row.balances.isEmpty();
+        const bool refuted = nonceRead && (sweepClears_ || oldNonce > 0);
+        row.used = shown || (old.used && !refuted);
 
-        if (scanFieldsDiffer(row, old, tokens_)) {
+        if (scanFieldsDiffer(row, old)) {
             model_->upsert(row);
             if (gen != gen_)
                 return; // a model slot restarted or stopped the scan
         }
         AccountState& a = acc_[s.account];
-        // An index at or past kMaxEthRows never moves the window (none is queued).
-        if (row.used && qint64(s.index) > a.lastUsed && qint64(s.index) < kMaxEthRows) {
+        // An index at or past kMaxEthRows never moves the window (none is queued). In a sweep
+        // that clears, what an earlier endpoint said moves it no more than it did at the start.
+        if ((sweepClears_ ? shown : row.used) && qint64(s.index) > a.lastUsed && qint64(s.index) < kMaxEthRows) {
             a.lastUsed = s.index;
             if (!grown.contains(s.account))
                 grown.append(s.account);
         }
-        if (!ok)
+        // The nonce of a row that has answered before is the rare extra: it does not hold
+        // fresh balances back, and is asked again next pass.
+        if (!balancesOk || (noNonce && !old.checked)) {
             failed.append(s);
+        } else if (noNonce) {
+            nonceLate = true;
+            nonceMissed_.insert({s.account, s.index});
+            late.append(s);
+        }
+    }
+
+    // How many at once this endpoint takes: some cap a batch at 3 or 10. Learned only from an
+    // attempt whose balances answered: it was there, and refused the batch. In an outage
+    // both fail, and nothing is learned. What the batch was too large for goes again at once.
+    const bool learning = !otherChain && nonceMissing && known.contains(true) && noncesAsked > kMinChunk;
+    if (!otherChain && noncesAsked > 0 && known.contains(true)) {
+        if (nonceMissing) {
+            goodBatches_ = 0;
+            nonceCeiling_ = qMax(kMinChunk, noncesAsked - 1);
+            nonceLimit_ = qMax(kMinChunk, qMin(noncesAsked / 2, nonceCeiling_));
+        } else {
+            nonceLimit_ = qMin(nonceLimit_ * 2, nonceCeiling_);
+            if (++goodBatches_ >= kBatchesBeforeProbe) {
+                goodBatches_ = 0;
+                nonceCeiling_ = qMin(nonceCeiling_ * 2, kMaxNonces);
+            }
+        }
+    }
+    if (learning) {
+        hotQueue_.append(late);
+    } else if (nonceLate && noncesAsked <= kMinChunk) {
+        if (++nonceFailures_ >= kMaxNonceFailures && sweepAsking_) {
+            sweepAsking_ = false;
+            sweepRetryAt_ = QDateTime::currentDateTime().addSecs(kNonceRetrySeconds);
+        }
+    } else if (nonceAnswered) {
+        nonceFailures_ = 0;
     }
 
     for (int a : std::as_const(grown)) {
@@ -952,24 +1304,46 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
 
     if (failed.isEmpty()) {
         chunk_.clear();
-        defer(&EthScanner::nextChunk);
+        chunkLimit_ = qMin(chunkLimit_ * 2, kMaxChunk);
+        if (nonceLate && !learning) {
+            passFailed_ = true;
+            for (const Issue& m : std::as_const(chunkIssues_))
+                report(m);
+        }
+        defer(&EvmScanner::nextChunk);
         return;
     }
 
+    // Too much at once for this endpoint, maybe; the next attempt asks for less.
+    chunkLimit_ = qMax(chunkLimit_ / 2, kMinChunk);
     passFailed_ = true;
     QList<Issue> messages = chunkIssues_;
     if (attempts_ < kMaxRetries) {
         ++attempts_;
-        chunk_ = failed; // only the rows still missing an answer
+        // Only the rows still missing an answer, and no more than the smaller limit: the
+        // others go first once this attempt is through.
+        while (failed.size() > chunkLimit_) {
+            const Slot later = failed.takeLast();
+            hotQueue_.append(later);
+            // The sweep moves on past it; should the run end first, it has not been read.
+            if (later.readNonce)
+                nonceMissed_.insert({later.account, later.index});
+        }
+        chunk_ = failed;
         retryTimer_->start();
     } else {
         // Skipped for this pass: the rows stay unchecked (or keep their last
         // confirmed values) and the next refresh pass tries them again.
+        for (const Slot& slot : std::as_const(failed)) {
+            if (slot.readNonce)
+                nonceMissed_.insert({slot.account, slot.index});
+        }
         chunk_.clear();
-        defer(&EthScanner::nextChunk);
+        defer(&EvmScanner::nextChunk);
         messages << Issue{Problem::Failure,
-                          QStringLiteral("Ethereum: some addresses could not be checked after %1 "
+                          QStringLiteral("%1: some addresses could not be checked after %2 "
                                          "retries; the next refresh tries them again")
+                              .arg(info().name)
                               .arg(kMaxRetries),
                           QString()};
         // The pass can no longer answer every row. Said now, not when it ends:
@@ -986,32 +1360,53 @@ void EthScanner::applyChunk(const QList<bool>& known, const QList<chain::Amount>
         report(m);
 }
 
-void EthScanner::finishPass()
+void EvmScanner::finishPass()
 {
     passActive_ = false;
+    moveSweepOn();
+    const int hotLeft = hotTimer_->isActive() ? hotTimer_->remainingTime() : -1;
+    hotTimer_->stop();
+    lastPassSeconds_ = int(passClock_.elapsed() / 1000);
     queue_.clear();
     queueHead_ = 0;
+    hotQueue_.clear();
     chunk_.clear();
-    // The balances are current as of now only if every row of the pass got a
-    // full answer and the whole window exists; otherwise balancesAt() keeps
-    // the end of the last pass that did. Past the limit over all accounts no row
-    // will ever exist: nothing failed, and limitReached() says what is missing.
+    // The balances stand for when the pass began, a long one too, only if every row of
+    // it got a full answer and the whole window exists; otherwise balancesAt() keeps the
+    // last pass that did. Past the limit over all accounts no row will ever exist:
+    // nothing failed, and limitReached() says what is missing.
     const bool windowDone = windowChecked();
     const bool complete = !passSkipped_ && (windowDone || totalCut_);
-    if (complete)
-        balancesAt_ = QDateTime::currentDateTime();
+    if (complete) {
+        balancesAt_ = passStartedAt_;
+        answered_ = true;
+    }
     refreshFailing_ = !complete;
+    // The end of a sweep: every row has had its nonce read, in this pass or an earlier one,
+    // in this run or an earlier one.
+    const quint64 settling = gen_;
+    if (complete && sweepOpen_ && sweepAsking_ && sweepAccount_ >= acc_.size() && nonceMissed_.isEmpty()) {
+        noncesAt_ = sweepFrom_;
+        sweepEndedAt_ = QDateTime::currentDateTime();
+        sweepOpen_ = false;
+        settleWindows();
+        sweepClears_ = false;
+        if (settling != gen_)
+            return; // a model slot restarted or stopped the scan
+    }
     // A pass without failures ends an outage: the next one is reported again
     // instead of staying silent for the rest of the session.
     if (!passFailed_)
         reported_.clear();
+    // A pass that outlasted the refresh: the next begins with the hot rows, at the tick
+    // the hot timer would have given them, not a whole interval from here.
     if (!acc_.isEmpty())
-        refreshTimer_->start(refreshSeconds_ * 1000);
+        refreshTimer_->start(lastPassSeconds_ > refreshSeconds_ && hotLeft >= 0 ? hotLeft : refreshSeconds_ * 1000);
 
     const quint64 gen = gen_;
-    // Skipped chunks leave the window incomplete; the refresh passes keep
-    // retrying them, and the scan counts as finished once nothing is missing.
-    if (!finished_ && windowDone) {
+    // Skipped chunks leave the window incomplete; the refresh passes keep retrying them,
+    // and the scan counts as finished once nothing is missing and a pass has answered.
+    if (!finished_ && windowDone && complete) {
         finished_ = true;
         progressTimer_->stop();
         emitProgress(); // the final counts before scanFinished()
@@ -1023,12 +1418,52 @@ void EthScanner::finishPass()
         emit passFinished();
 }
 
-bool EthScanner::windowChecked() const
+void EvmScanner::settleWindows()
+{
+    QHash<QPair<quint32, quint32>, int> positions;
+    for (int i = 0; i < acc_.size(); ++i) {
+        positions.insert({acc_.at(i).key.wallet, acc_.at(i).key.account}, i);
+        acc_[i].lastUsed = -1;
+        acc_[i].savedUsed = -1;
+    }
+    for (int r = 0; r < model_->size(); ++r) {
+        const AddressRow& row = model_->at(r);
+        if (row.network != network_ || row.change != 0 || qint64(row.index) >= kMaxEthRows || !row.used)
+            continue;
+        const auto found = positions.constFind({row.wallet, row.account});
+        if (found != positions.cend())
+            acc_[*found].lastUsed = qMax(acc_.at(*found).lastUsed, qint64(row.index));
+    }
+    bool shrunk = false;
+    for (const AccountState& a : std::as_const(acc_))
+        shrunk = shrunk || a.end > windowEnd(a);
+    if (!shrunk)
+        return;
+    // A row past a window was never used, or the window would reach it.
+    const quint64 gen = gen_;
+    model_->dropRows([this, &positions](const AddressRow& row) {
+        if (row.network != network_ || row.change != 0)
+            return true;
+        const auto found = positions.constFind({row.wallet, row.account});
+        return found == positions.cend() || qint64(row.index) < windowEnd(acc_.at(*found));
+    });
+    if (gen != gen_)
+        return;
+    totalRows_ = 0;
+    totalCut_ = false;
+    for (AccountState& a : acc_) {
+        a.end = qMin(a.end, windowEnd(a));
+        a.capReported = false;
+        totalRows_ += a.end;
+    }
+}
+
+bool EvmScanner::windowChecked() const
 {
     for (const AccountState& a : acc_) {
         const qint64 target = windowEnd(a);
         for (qint64 index = 0; index < target; ++index) {
-            const int pos = model_->find(a.key.wallet, chain::ScriptType::EthAccount, a.key.account, 0,
+            const int pos = model_->find(a.key.wallet, network_, chain::ScriptType::EthAccount, a.key.account, 0,
                                          quint32(index));
             if (pos < 0 || !model_->at(pos).checked)
                 return false;
@@ -1041,7 +1476,7 @@ bool EthScanner::windowChecked() const
 
 // A reply counts only if it belongs to this generation and is the request
 // currently awaited; a late or repeated callback is dropped.
-bool EthScanner::acceptReply(quint64 gen, quint64 seq)
+bool EvmScanner::acceptReply(quint64 gen, quint64 seq)
 {
     if (gen != gen_ || seq != pendingSeq_)
         return false;
@@ -1051,7 +1486,7 @@ bool EthScanner::acceptReply(quint64 gen, quint64 seq)
 
 // Steps run from the event loop, never inside an EthRpc callback, and only
 // while the generation that scheduled them is current.
-void EthScanner::defer(void (EthScanner::*step)())
+void EvmScanner::defer(void (EvmScanner::*step)())
 {
     const quint64 gen = gen_;
     QTimer::singleShot(0, this, [this, gen, step] {
@@ -1060,16 +1495,23 @@ void EthScanner::defer(void (EthScanner::*step)())
     });
 }
 
-void EthScanner::stopWork()
+void EvmScanner::stopWork()
 {
+    // Whatever comes next, in terms that outlive the list of accounts.
+    if (sweepOpen_ && !acc_.isEmpty()) {
+        restoredSweep_ = nonceSweep();
+        sweepOpen_ = false;
+    }
     ++gen_;
     pendingSeq_ = 0;
     refreshTimer_->stop();
     retryTimer_->stop();
     progressTimer_->stop();
+    hotTimer_->stop();
     acc_.clear();
     queue_.clear();
     queueHead_ = 0;
+    hotQueue_.clear();
     chunk_.clear();
     nonce_.clear();
     nonceOk_.clear();
@@ -1087,8 +1529,8 @@ void EthScanner::stopWork()
 
 // `url` (as the reply named it) gave an answer nothing can be read from: EthRpc
 // moves requests to another endpoint and tries it last for a while. `offMainnet`:
-// the answer showed it does not serve Ethereum mainnet (see wrongChain()).
-void EthScanner::refuseEndpoint(const QString& url, bool offMainnet)
+// the answer showed it does not serve this network (see wrongChain()).
+void EvmScanner::refuseEndpoint(const QString& url, bool offMainnet)
 {
     if (url.isEmpty())
         return;
@@ -1098,7 +1540,7 @@ void EthScanner::refuseEndpoint(const QString& url, bool offMainnet)
     rpc_->rejectEndpoint(url);
 }
 
-void EthScanner::noteFailure(const Issue& issue)
+void EvmScanner::noteFailure(const Issue& issue)
 {
     for (const Issue& noted : std::as_const(chunkIssues_))
         if (noted.message == issue.message)
@@ -1111,7 +1553,7 @@ void EthScanner::noteFailure(const Issue& issue)
 // restarting the scanner never runs in the middle of a step. Keyed on
 // GitWallet's own sentence alone: an endpoint that varies its error texts
 // cannot multiply the reports.
-void EthScanner::report(const Issue& issue)
+void EvmScanner::report(const Issue& issue)
 {
     if (issue.message.isEmpty() || reported_.contains(issue.message))
         return;
@@ -1126,13 +1568,13 @@ void EthScanner::report(const Issue& issue)
 }
 
 // A chunk updates up to kChunk rows at once: coalesce into one signal per 250 ms.
-void EthScanner::noteProgress()
+void EvmScanner::noteProgress()
 {
     if (!progressTimer_->isActive())
         progressTimer_->start();
 }
 
-void EthScanner::emitProgress()
+void EvmScanner::emitProgress()
 {
     int checked = 0, derived = 0;
     countRows(&checked, &derived);
@@ -1143,7 +1585,7 @@ void EthScanner::emitProgress()
     emit progress(checked, derived);
 }
 
-void EthScanner::countRows(int* checked, int* derived) const
+void EvmScanner::countRows(int* checked, int* derived) const
 {
     *checked = 0;
     *derived = 0;
@@ -1151,8 +1593,7 @@ void EthScanner::countRows(int* checked, int* derived) const
         return;
     for (int r = 0; r < model_->size(); ++r) {
         const AddressRow& row = model_->at(r);
-        if (row.type != chain::ScriptType::EthAccount || row.change != 0
-            || !ownsAccount(row.wallet, row.account))
+        if (row.network != network_ || row.change != 0 || !ownsAccount(row.wallet, row.account))
             continue;
         ++*derived;
         if (row.checked)
@@ -1160,7 +1601,7 @@ void EthScanner::countRows(int* checked, int* derived) const
     }
 }
 
-bool EthScanner::ownsAccount(quint32 wallet, quint32 account) const
+bool EvmScanner::ownsAccount(quint32 wallet, quint32 account) const
 {
     return owned_.contains({wallet, account});
 }

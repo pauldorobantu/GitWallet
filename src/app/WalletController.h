@@ -1,5 +1,7 @@
 #pragma once
 
+#include "store/LedgerDb.h"
+#include "wallet/Scheduler.h"
 #include "wallet/Types.h"
 #include "wallet/WalletStore.h"
 
@@ -16,23 +18,23 @@ class QLockFile;
 class QTimer;
 
 namespace net {
-class ElectrumClient;
-class EthRpc;
 class PriceFeed;
 } // namespace net
 
+namespace store {
+class Ledger;
+} // namespace store
+
 namespace wallet {
 class WalletModel;
-class BtcScanner;
-class EthScanner;
 } // namespace wallet
 
 namespace app {
 
-// Owns the wallet's data and services: the store (xpubs + settings), the address
-// model, the Electrum and Ethereum clients, the USD price feed and the two
-// scanners. Pages read from it; the import dialog and the Settings page write
-// through it. One process at a time writes a data folder (its wallet.lock): a
+// Owns the wallet's data and services: the store (xpubs + settings), the database of
+// what they have shown so far, the address model, the USD price feed and the scheduler
+// that runs a scan per network. Pages read from it; the import dialog and the Settings
+// page write through it. One process at a time writes a data folder (its wallet.lock): a
 // second GitWallet on the same folder shows the wallet but saves nothing.
 // GUI thread only.
 class WalletController : public QObject
@@ -45,7 +47,8 @@ public:
     bool hasWallet() const;
 
     // At startup: takes the data folder's lock if it is free, loads wallet.dat
-    // if present and starts scanning. Returns false with an empty `error` when
+    // if present, shows what the database kept and starts scanning. Returns false with an
+    // empty `error` when
     // there is no wallet yet, false with a message when the file could not be
     // read.
     bool loadExisting(QString* error);
@@ -110,26 +113,34 @@ public:
     wallet::WalletModel* model() const { return model_; }
     net::PriceFeed* prices() const { return prices_; }
 
-    void refresh(); // prices + Ethereum balances now (Bitcoin is live)
+    void refresh(); // prices + a round of every balance that is polled, now (what is followed live is live)
 
-    bool isScanning() const;  // either chain
-    bool btcScanning() const; // the Bitcoin scan is not through (it never is while cut at the limit)
-    bool ethScanning() const;
-    bool addressLimitReached() const; // a Bitcoin or Ethereum window is cut at the row limit
-    bool ethWrongChain() const;       // the Ethereum endpoint in use was found not to serve mainnet
-    // When the last Ethereum pass ended that answered every address (local
-    // time); invalid before the first one.
-    QDateTime ethBalancesAt() const;
-    // The last Ethereum pass failed or left addresses without an answer: the
-    // ETH, USDT and USDC figures are as of ethBalancesAt() at best.
-    bool ethRefreshFailing() const;
+    bool isScanning() const;  // any network
+    bool addressLimitReached() const; // a window is cut at the row limit
+    // How one network's scan stands: is it through, on which server, as of when.
+    wallet::NetworkStatus networkStatus(wallet::Network network) const;
     // Every balance shown is whole and current: statusText() says "Up to date".
     bool balancesComplete() const;
+    // What is shown is as current as it gets, a key this version does not read aside.
+    bool figuresCurrent() const;
+    bool hasUnreadKeys() const; // a wallet has a key of a kind or network this version does not know
     // One short line for the title bar chip. "Up to date" only when
     // balancesComplete(); otherwise it leads with what keeps it from that.
     QString statusText() const;
-    QString electrumServer() const;
-    QString ethEndpoint() const;
+
+    // What the figures on screen are from until the servers have answered: true from the
+    // start, when the database holds rows, until every network has answered for all it
+    // follows. The time is the oldest network's, and invalid if one never had a whole answer.
+    bool showingSaved() const { return showingSaved_; }
+    QDateTime savedAt() const { return savedAt_; }
+    // The database is still handing over what it kept: whatever is there is part of it.
+    bool loadingSaved() const { return waitingForLedger_; }
+    bool keepingSaved() const; // the database is open, so what happens now is there at the next start
+
+    // "Prices: DefiLlama · 14:02", beside any USD figure: where the prices of what the wallets
+    // hold come from and how old the oldest is, with the date once it is not today, and
+    // that it stopped moving, which of them has no price, and that a refresh is failing.
+    QString pricesLine() const;
 
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
@@ -150,10 +161,11 @@ private:
     // What statusText() leads with, the most pressing first.
     enum class Status {
         NoWallet,
+        Loading,    // the database is still handing over what it kept
         Connecting,
         Limit,      // a window cut at the row limit
-        WrongChain, // the Ethereum endpoint is off mainnet
-        EthStale,   // the last Ethereum pass left addresses without an answer
+        WrongChain, // a server answers for another network
+        Stale,      // the last round on a network left addresses without an answer
         Scanning,
         Unchecked,  // nothing scans, yet a row has no answer
         Unscanned,  // an account, or a Bitcoin chain, has no rows at all
@@ -163,8 +175,16 @@ private:
     void startServices();
     void stopServices();
     void queueStatus();                   // throttled statusChanged() for progress and balances
-    void onScanFinished(bool* chainDone); // a scanner finished its initial scan
+    void onScanFinished();                // every network has its first answers in
+    void onScanProgress();
+    void tryLedgerAgain(); // the data folder was held at the start
     void onScannerProblem(wallet::Problem kind, const QString& message, const QString& serverDetail);
+    // Opens the database, if this window may write it, and starts scanning once what it
+    // kept is in the model.
+    void openLedger();
+    void onLedgerLoaded(const QList<store::SavedPrice>& prices, const QList<store::SavedTime>& times);
+    void saveTimes();  // when each network last had a whole answer
+    void savePrices();
     Status status() const;
     bool accountUnscanned() const; // an account (a Bitcoin one: either chain) without a single row
     // Takes, or keeps, the data folder's wallet.lock. False while another
@@ -189,17 +209,21 @@ private:
 
     wallet::WalletStore store_;
     wallet::WalletModel* model_ = nullptr;
-    net::ElectrumClient* electrum_ = nullptr;
-    net::EthRpc* eth_ = nullptr;
     net::PriceFeed* prices_ = nullptr;
-    wallet::BtcScanner* btcScanner_ = nullptr;
-    wallet::EthScanner* ethScanner_ = nullptr;
+    wallet::Scheduler* scheduler_ = nullptr;
+    store::Ledger* ledger_ = nullptr;
     QTimer* priceTimer_ = nullptr;
     QTimer* statusTimer_ = nullptr; // single-shot throttle behind queueStatus()
-    bool btcDone_ = false;
-    bool ethDone_ = false;
+    QTimer* timesTimer_ = nullptr;
+    QTimer* ledgerRetry_ = nullptr; // the data folder is held: asks again until it is free
+    int ledgerRetries_ = 0;
+    int rowsBeforeLedger_ = 0;      // rows with an answer in the model when the database was opened
+    bool settingsOnlyHere_ = false; // the settings in use are not what wallet.dat holds
+    bool olderCopied_ = false;      // this session has made the way back from an older wallet.dat
     bool running_ = false;          // between startServices() and stopServices()
-    bool scanFinishedSent_ = false; // scanFinished() already emitted for this start
+    bool waitingForLedger_ = false; // the scans start when the database has handed over
+    bool showingSaved_ = false;
+    QDateTime savedAt_;
     // Taken at the first load or write and held until this controller is
     // destroyed, however many days the window stays open.
     std::unique_ptr<QLockFile> lock_;

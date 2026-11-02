@@ -9,7 +9,7 @@
 #include "ui/PageKit.h"
 #include "ui/XpubField.h"
 #include "ui/design/Style.h"
-#include "wallet/BtcScanner.h"
+#include "wallet/UtxoScanner.h"
 #include "wallet/WalletStore.h"
 
 #include <QByteArray>
@@ -199,7 +199,7 @@ void wipeTextEdit(QPlainTextEdit* edit)
 QString firstAddress(const wallet::AccountKey& key)
 {
     const chain::HdPubKey chainNode = key.node().deriveChild(0);
-    return QString::fromStdString(chain::addressFromChainNode(chainNode, key.type, key.account, 0, 0).address);
+    return QString::fromStdString(chain::addressFromChainNode(chainNode, key.type, key.account, 0, 0, key.format()).address);
 }
 
 // The status line of a list: how many lines can go in, and what is wrong with the rest.
@@ -276,6 +276,14 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     sourceBlock->addWidget(source_);
     identity->addLayout(sourceBlock, 1);
     root->addLayout(identity);
+
+    auto* watched = new QLabel(QStringLiteral("GitWallet watches account 0 of native SegWit, nested SegWit and legacy "
+                                              "Bitcoin, and of Ethereum. Taproot and other accounts are not scanned yet."),
+                               this);
+    watched->setObjectName(QStringLiteral("watchedAccounts"));
+    watched->setWordWrap(true);
+    setTone(watched, Tone::Muted);
+    root->addWidget(watched);
 
     pages_ = new QStackedWidget(this);
     auto* wordsPage = new QWidget(pages_);
@@ -605,22 +613,24 @@ void ImportSeedDialog::validateSeedList()
                               problems);
         tone = !problems.isEmpty() ? (listReady_ > 0 ? Tone::Warning : Tone::Error)
                                    : (listReady_ > 0 ? Tone::Success : Tone::Muted);
-        // What they ask of the one connection, at the gaps set now: each new seed has
-        // three Bitcoin accounts, and each account watches both of its chains.
+        // What they ask of a network's scan, at the gaps set now: each account watches
+        // both of its chains.
         if (controller_ && listReady_ > 0) {
             const wallet::ScanSettings& s = controller_->store().settings;
             const QList<wallet::AccountKey> accounts = controller_->store().allAccounts();
-            const qint64 bitcoinAccounts = std::count_if(accounts.cbegin(), accounts.cend(), [](const wallet::AccountKey& key) {
-                return chain::isBitcoin(key.type);
-            }) + 3 * qint64(listReady_);
-            const qint64 needed = bitcoinAccounts * (qint64(s.btcReceiveGap) + s.btcChangeGap);
-            if (needed > wallet::BtcScanner::kMaxFollowedRows) {
+            const qint64 perSeed = std::count_if(wallet::capturedAccounts().cbegin(), wallet::capturedAccounts().cend(),
+                                                 [](const wallet::CapturedAccount& a) { return chain::isUtxo(a.type); });
+            const qint64 utxoAccounts = std::count_if(accounts.cbegin(), accounts.cend(), [](const wallet::AccountKey& key) {
+                return chain::isUtxo(key.type);
+            }) + perSeed * qint64(listReady_);
+            const qint64 needed = utxoAccounts * (qint64(s.utxoReceiveGap) + s.utxoChangeGap);
+            if (needed > wallet::UtxoScanner::kMaxFollowedRows) {
                 message += QLatin1Char('\n')
-                           + trText(QStringLiteral("At these gaps the wallets need about %1 Bitcoin addresses, more than "
-                                                   "the %2 one connection follows. Lower the gaps in Settings, or the "
+                           + trText(QStringLiteral("At these gaps the wallets need about %1 addresses, more than "
+                                                   "the %2 GitWallet watches. Lower the gaps in Settings, or the "
                                                    "scan stops there and the wallets read Address limit reached."))
                                  .arg(needed)
-                                 .arg(wallet::BtcScanner::kMaxFollowedRows);
+                                 .arg(wallet::UtxoScanner::kMaxFollowedRows);
                 tone = Tone::Warning;
             }
         }

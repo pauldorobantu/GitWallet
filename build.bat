@@ -1,7 +1,7 @@
 @echo off
 rem GitWallet - configure + build (MSVC x64 + Ninja + Qt 6.10.3 + vcpkg).
-rem Reuses the shared vcpkg at C:\app-vcpkg and its installed tree so botan/zlib
-rem (already built for FlowSuite) are not rebuilt; only secp256k1 compiles.
+rem Reuses the shared vcpkg at C:\app-vcpkg and its installed tree so what is already
+rem built there is not built again; a clean machine builds every library in vcpkg.json.
 setlocal
 cd /d "%~dp0"
 

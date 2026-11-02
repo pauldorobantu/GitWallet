@@ -19,10 +19,12 @@
 #include <QDateTime>
 #include <QFormLayout>
 #include <QFrame>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLocale>
 #include <QPushButton>
+#include <QSet>
 #include <QStackedLayout>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -38,10 +40,10 @@ namespace {
 // Manual refreshes go to public Ethereum endpoints that rate-limit; a pause
 // between clicks keeps a burst of them from getting the app throttled.
 constexpr int kRefreshCooldownMs = 3000;
-// How often the page checks whether the calendar day has changed under it.
-constexpr int kDayCheckMs = 60 * 1000;
-// Bits of a row's pending mask: bit i stands for wallet::assets()[i].
-constexpr qsizetype kMaskBits = 32;
+// How often the page looks at how old what it shows has become.
+constexpr int kAgeCheckMs = 60 * 1000;
+// A scan signals per address: the page follows that many times a second at most.
+constexpr int kRowsThrottleMs = 200;
 
 using figures::atLeast;
 using figures::dash;
@@ -49,53 +51,11 @@ using figures::formatAmount;
 using figures::formatCount;
 using figures::formatUsd;
 
-// BTC lives on Bitcoin rows; ETH and the ERC-20 tokens on Ethereum rows.
-bool onChain(const wallet::AddressRow& row, const wallet::AssetInfo& info)
+// The card's second line: what the symbol stands for, and which tokens are counted:
+// those of this network's standard only.
+QString assetName(const wallet::AssetInfo& info)
 {
-    return (info.asset == wallet::Asset::BTC) == row.isBitcoin();
-}
-
-// The zero this row holds in `info` may only mean "no answer yet": the row is
-// not fully checked (nothing answered, or an Ethereum balance call failed) and
-// holds none of it. A non-zero amount is an answer, from this pass or an
-// earlier one. The per-asset form of the Addresses table's balancePending():
-// an Ethereum row whose ETH balance arrived while its USDT call failed is
-// still unknown for USDT.
-bool balancePending(const wallet::AddressRow& row, const wallet::AssetInfo& info)
-{
-    if (row.checked || !onChain(row, info))
-        return false;
-    // A Bitcoin row holds BTC only, and state() reads it without building an
-    // Amount (a BigInt): this runs inside the model's signals.
-    if (row.isBitcoin())
-        return row.state() != wallet::AddressState::Funded;
-    return row.amount(info.asset).isZero();
-}
-
-quint32 pendingMask(const wallet::AddressRow& row)
-{
-    quint32 mask = 0;
-    if (row.checked)
-        return mask; // nearly every row once the scan is through
-    const QList<wallet::AssetInfo>& list = wallet::assets();
-    for (qsizetype i = 0; i < list.size() && i < kMaskBits; ++i) {
-        if (balancePending(row, list.at(i)))
-            mask |= quint32(1) << i;
-    }
-    return mask;
-}
-
-// The card's second line: what the symbol stands for, and that the dollar
-// tokens counted are the Ethereum (ERC-20) ones only.
-QString assetName(wallet::Asset asset)
-{
-    switch (asset) {
-    case wallet::Asset::BTC: return QStringLiteral("Bitcoin");
-    case wallet::Asset::ETH: return QStringLiteral("Ethereum");
-    case wallet::Asset::USDT: return QStringLiteral("Tether USD · ERC-20");
-    case wallet::Asset::USDC: return QStringLiteral("USD Coin · ERC-20");
-    }
-    return QString();
+    return info.standard.isEmpty() ? info.name : QStringLiteral("%1 · %2").arg(info.name, info.standard);
 }
 
 // Why a figure is not final yet: how many addresses have no answer, or, while
@@ -124,17 +84,25 @@ QString shownTime(const QDateTime& when, const QDate& today)
     return QLocale(QLocale::English).toString(local, QStringLiteral("d MMM HH:mm"));
 }
 
-bool hasBitcoinAccount(const QList<wallet::AccountKey>& accounts)
-{
-    return std::any_of(accounts.cbegin(), accounts.cend(),
-                       [](const wallet::AccountKey& a) { return chain::isBitcoin(a.type); });
-}
+constexpr qint64 kNoncesOldSeconds = 6 * 3600;
 
-// A server row: its name, or a muted "Not connected" while there is none.
-void setServer(QLabel* label, const QString& name)
+// A server row: its name, or a muted "Not connected" while there is none, and how far
+// behind a long round can leave what is not followed live.
+void setServer(QLabel* label, const wallet::NetworkStatus& status)
 {
-    label->setText(name.isEmpty() ? trText(QStringLiteral("Not connected")) : name);
-    setTone(label, name.isEmpty() ? Tone::Muted : Tone::Neutral);
+    QString text = status.server.isEmpty() ? trText(QStringLiteral("Not connected")) : status.server;
+    if (status.tiers.rounds > 0) {
+        const int minutes = qMax(1, status.tiers.roundSeconds / 60);
+        text += QLatin1String(" · ")
+                + trText(QStringLiteral("%1 live, %2 read every %3 min"))
+                      .arg(formatCount(status.tiers.live), formatCount(status.tiers.rounds), formatCount(minutes));
+    }
+    // Nonces are read now and then, and all they can add is a rare address. Long overdue, the
+    // figures are as right as ever, but what lies past those windows is not looked at.
+    if (status.noncesAt.isValid() && status.noncesAt.secsTo(QDateTime::currentDateTime()) > kNoncesOldSeconds)
+        text += QLatin1String(" · ") + trText(QStringLiteral("nonces from %1")).arg(shownTime(status.noncesAt, QDate::currentDate()));
+    label->setText(text);
+    setTone(label, status.server.isEmpty() ? Tone::Muted : Tone::Neutral);
 }
 
 } // namespace
@@ -150,17 +118,19 @@ OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
     states_->addWidget(emptyState_);
     states_->addWidget(walletState_);
 
-    pendingPerAsset_.fill(0, qMin(wallet::assets().size(), kMaskBits));
+    rowsTimer_ = new QTimer(this);
+    rowsTimer_->setSingleShot(true);
+    rowsTimer_->setInterval(kRowsThrottleMs);
+    connect(rowsTimer_, &QTimer::timeout, this, &OverviewPage::scheduleRefresh);
     if (wallet::WalletModel* model = controller_ ? controller_->model() : nullptr) {
-        // Which balances still lack an answer, followed row by row: a scan
-        // signals per address, and a recount would walk every row each time.
-        connect(model, &wallet::WalletModel::rowsAppended, this, [this] {
-            if (syncPending())
-                scheduleRefresh();
-        });
-        connect(model, &wallet::WalletModel::rowChanged, this, &OverviewPage::notePendingRow);
-        connect(model, &wallet::WalletModel::cleared, this, &OverviewPage::resetPending);
-        syncPending(); // rows the model already holds
+        // How many balances still lack an answer: the model keeps the count.
+        const auto rowsMoved = [this] {
+            if (!rowsTimer_->isActive())
+                rowsTimer_->start();
+        };
+        connect(model, &wallet::WalletModel::rowsAppended, this, rowsMoved);
+        connect(model, &wallet::WalletModel::rowChanged, this, rowsMoved);
+        connect(model, &wallet::WalletModel::cleared, this, &OverviewPage::scheduleRefresh);
     }
 
     if (controller_) {
@@ -177,19 +147,15 @@ OverviewPage::OverviewPage(WalletController* controller, QWidget* parent)
                 &OverviewPage::scheduleRefresh);
     }
 
-    // A price from an earlier day shows its date, so the page also re-renders
-    // when the day changes under it: while CoinGecko keeps failing and no
-    // balance moves, no signal would. Comparing calendar days once a minute,
-    // rather than aiming a timer at midnight, also copes with sleep and clock
-    // changes.
-    auto* dayCheck = new QTimer(this);
-    dayCheck->setTimerType(Qt::VeryCoarseTimer);
-    dayCheck->setInterval(kDayCheckMs);
-    connect(dayCheck, &QTimer::timeout, this, [this] {
-        if (QDate::currentDate().toJulianDay() != shownDay_)
-            scheduleRefresh();
-    });
-    dayCheck->start();
+    // A price says how old it is, and the time it shows gains its date on another day,
+    // so the page also re-renders as time passes under it: while every source keeps
+    // failing and no balance moves, no signal would. Once a minute, rather than aiming a
+    // timer at a moment, also copes with sleep and clock changes.
+    auto* ageCheck = new QTimer(this);
+    ageCheck->setTimerType(Qt::VeryCoarseTimer);
+    ageCheck->setInterval(kAgeCheckMs);
+    connect(ageCheck, &QTimer::timeout, this, &OverviewPage::scheduleRefresh);
+    ageCheck->start();
 
     refreshView();
     showState();
@@ -200,7 +166,7 @@ QWidget* OverviewPage::buildEmptyState()
     QWidget* empty = page::makeEmptyState(
         this, static_cast<int>(icon::Kind::Dashboard), QStringLiteral("No wallet yet"),
         QStringLiteral("Add your seeds, one by one or a whole list, or just their public keys, to see "
-                       "every Bitcoin and Ethereum address they control."));
+                       "every address they control."));
     auto* actions = new QWidget(empty);
     auto* row = new QHBoxLayout(actions);
     row->setContentsMargins(0, 0, 0, 0);
@@ -250,7 +216,7 @@ QWidget* OverviewPage::buildWalletState()
     cards->setContentsMargins(0, 0, 0, 0);
     cards->setSpacing(page::kPageSpacing);
     for (const wallet::AssetInfo& info : wallet::assets()) {
-        const page::Section card = page::makeSection(host, info.symbol, assetName(info.asset));
+        const page::Section card = page::makeSection(host, info.symbol, assetName(info));
         auto* amount = new QLabel(dash(), card.card);
         amount->setObjectName(QStringLiteral("statValue"));
         amount->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -288,8 +254,8 @@ QWidget* OverviewPage::buildWalletState()
     scannedLabel_ = addValueRow(QStringLiteral("Addresses scanned"));
     usedLabel_ = addValueRow(QStringLiteral("Used addresses"));
     fundedLabel_ = addValueRow(QStringLiteral("Funded addresses"));
-    electrumLabel_ = addValueRow(QStringLiteral("Electrum server"));
-    ethLabel_ = addValueRow(QStringLiteral("Ethereum endpoint"));
+    for (const wallet::NetworkInfo& network : wallet::networks())
+        serverLabels_.append(addValueRow(QStringLiteral("%1 server").arg(network.name)));
     page::finishForms({form});
     root->addWidget(status.card);
 
@@ -298,7 +264,7 @@ QWidget* OverviewPage::buildWalletState()
     const page::ActionBar bar = page::makeActionBar(host);
     refreshButton_ = new QPushButton(QStringLiteral("Refresh"), bar.widget);
     refreshButton_->setToolTip(
-        QStringLiteral("Fetch prices and Ethereum balances now. Bitcoin balances update live."));
+        QStringLiteral("Fetch prices and read the balances that are not followed live, now."));
     const auto tintRefresh = [button = refreshButton_] {
         page::setLabeledIcon(button, makeIcon(icon::Kind::Refresh, page::text(), 15));
     };
@@ -311,7 +277,7 @@ QWidget* OverviewPage::buildWalletState()
             return;
         controller_->refresh();
         Feedback::show(refreshButton_, Feedback::Type::Info,
-                       trText(QStringLiteral("Refreshing prices and Ethereum balances")));
+                       trText(QStringLiteral("Refreshing prices and balances")));
         refreshButton_->setEnabled(false);
         QTimer::singleShot(kRefreshCooldownMs, refreshButton_,
                            [button = refreshButton_] { button->setEnabled(true); });
@@ -341,139 +307,77 @@ void OverviewPage::scheduleRefresh()
     });
 }
 
-void OverviewPage::resetPending()
-{
-    rowPending_.clear();
-    pendingPerAsset_.fill(0);
-    pendingRows_ = 0;
-    syncPending(); // whatever the model holds (nothing, right after a clear)
-    scheduleRefresh();
-}
-
-bool OverviewPage::syncPending()
-{
-    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
-    const qsizetype size = model ? model->size() : 0;
-    bool moved = false;
-    if (size < rowPending_.size()) {
-        // Rows only go away through cleared(); should that ever be missed,
-        // the counts start over rather than describe rows that are gone.
-        rowPending_.clear();
-        pendingPerAsset_.fill(0);
-        pendingRows_ = 0;
-        moved = true;
-    }
-    // From the model's size, not a signal's range: a listener that upserts
-    // from inside another one's slot makes appends arrive out of order. Reserved
-    // for a burst only: reserve() allocates exactly what it is asked for, and
-    // this runs once per row during a scan, which would copy the list every time.
-    if (size - rowPending_.size() > 1)
-        rowPending_.reserve(size);
-    for (qsizetype i = rowPending_.size(); i < size; ++i) {
-        const quint32 mask = pendingMask(model->at(int(i)));
-        rowPending_.append(mask);
-        if (mask != 0) {
-            countPending(mask, +1);
-            moved = true;
-        }
-    }
-    return moved;
-}
-
-void OverviewPage::notePendingRow(int row)
-{
-    const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
-    if (!model || row < 0 || row >= model->size())
-        return;
-    if (row >= rowPending_.size()) {
-        // Not counted yet: appending reads its current state.
-        if (syncPending())
-            scheduleRefresh();
-        return;
-    }
-    const quint32 now = pendingMask(model->at(row));
-    const quint32 before = rowPending_.at(row);
-    if (now == before)
-        return;
-    countPending(before, -1);
-    countPending(now, +1);
-    rowPending_[row] = now;
-    scheduleRefresh();
-}
-
-void OverviewPage::countPending(quint32 mask, int sign)
-{
-    if (mask == 0)
-        return;
-    pendingRows_ += sign;
-    for (qsizetype i = 0; i < pendingPerAsset_.size(); ++i) {
-        if (mask & (quint32(1) << i))
-            pendingPerAsset_[i] += sign;
-    }
-}
-
 void OverviewPage::refreshView()
 {
-    // Recorded even without a wallet: nothing on the empty state depends on
-    // the day, and the day check stays quiet instead of firing every minute.
     const QDate today = QDate::currentDate();
-    shownDay_ = today.toJulianDay();
     if (!controller_ || !controller_->hasWallet())
         return;
 
     const wallet::WalletModel* model = controller_->model();
     const net::PriceFeed* prices = controller_->prices();
-    syncPending(); // a no-op while the model's signals keep the counts current
 
-    // Only xpubs are stored, so every start begins with an empty model. An
-    // account whose first row does not exist yet has not been derived (or its
-    // key could not be read): no balance of its chain is known.
+    // An account whose first row does not exist yet has not been derived (or its key
+    // could not be read): no balance of that network is known.
     const QList<wallet::AccountKey> accounts = controller_->store().allAccounts();
-    bool btcMissing = false;
-    bool ethMissing = false;
-    bool btcWatched = false;
-    bool ethWatched = false;
+    QSet<wallet::Network> watched;
+    QSet<wallet::Network> missing;
     for (const wallet::AccountKey& account : accounts) {
-        (chain::isBitcoin(account.type) ? btcWatched : ethWatched) = true;
-        if (model && model->find(account.wallet, account.type, account.account, 0, 0) >= 0)
-            continue;
-        (chain::isBitcoin(account.type) ? btcMissing : ethMissing) = true;
+        for (const wallet::NetworkInfo& network : wallet::networks()) {
+            if (!account.serves(network.network))
+                continue;
+            watched.insert(network.network);
+            if (!model || model->find(account.wallet, network.network, account.type, account.account, 0, 0) < 0)
+                missing.insert(network.network);
+        }
     }
 
-    // The scan state, per chain where the controller tells it apart. The
-    // address limit is reported for the wallet as a whole, so it holds back
-    // every figure. The Ethereum figures (ETH, USDT, USDC) are from an earlier
-    // pass while the endpoint is off mainnet or the last refresh could not
-    // answer every address: they say since when, or, before any pass answered
-    // in full, why not.
-    const bool btcScanning = controller_->btcScanning();
-    const bool ethScanning = controller_->ethScanning();
+    // The scan state, per network. The address limit is reported for the wallet as a
+    // whole, so it holds back every figure. Figures of a network from an earlier round
+    // (a server on another chain, a round that could not answer every address) say
+    // since when, or, before any round answered in full, why not.
+    QHash<wallet::Network, wallet::NetworkStatus> states;
+    for (const wallet::NetworkInfo& network : wallet::networks())
+        states.insert(network.network, controller_->networkStatus(network.network));
     const bool limit = controller_->addressLimitReached();
-    const bool wrongChain = controller_->ethWrongChain();
-    const bool ethFailing = controller_->ethRefreshFailing();
-    const bool ethStale = wrongChain || ethFailing;
-    const QDateTime ethAt = controller_->ethBalancesAt();
-    QString ethAsOf;    // on the Ethereum cards
-    QString ethCaption; // under the total, and on the chip for a failed refresh
-    if (ethAt.isValid()) {
-        ethAsOf = trText(QStringLiteral("as of %1")).arg(shownTime(ethAt, today));
-        ethCaption = trText(QStringLiteral("ETH balances from %1")).arg(shownTime(ethAt, today));
-    } else if (wrongChain) {
-        ethAsOf = trText(QStringLiteral("endpoint not on mainnet"));
-        ethCaption = trText(QStringLiteral("Ethereum endpoint not on mainnet"));
-    } else {
-        ethAsOf = trText(QStringLiteral("lookups failing"));
-        ethCaption = trText(QStringLiteral("ETH lookups failing"));
+    const bool saved = controller_->showingSaved();
+    const bool loading = controller_->loadingSaved(); // part of what the database kept
+    const bool unread = controller_->hasUnreadKeys(); // a key's coins are in no figure
+    const auto asOfText = [&](const wallet::NetworkStatus& st) {
+        if (st.balancesAt.isValid())
+            return trText(QStringLiteral("as of %1")).arg(shownTime(st.balancesAt, today));
+        return st.wrongChain ? trText(QStringLiteral("server on another chain"))
+                             : trText(QStringLiteral("lookups failing"));
+    };
+    QString staleCaption; // under the total, and on the chip for a failed refresh
+    bool anyWrongChain = false;
+    bool anyFailing = false;
+    bool anyScanning = false;
+    QString wrongChainText;
+    for (const wallet::NetworkInfo& network : wallet::networks()) {
+        const wallet::NetworkStatus& st = states[network.network];
+        anyScanning = anyScanning || st.scanning;
+        if (st.wrongChain && !anyWrongChain) {
+            anyWrongChain = true;
+            wrongChainText = trText(QStringLiteral("%1 endpoint answers for another network")).arg(network.name);
+        }
+        anyFailing = anyFailing || st.failing;
+        if ((st.wrongChain || st.failing || (st.connecting && !saved && st.balancesAt.isValid())) && staleCaption.isEmpty()) {
+            const QString coin = wallet::assetInfo(network.coin).symbol;
+            staleCaption = st.balancesAt.isValid()
+                               ? trText(QStringLiteral("%1 balances from %2")).arg(coin, shownTime(st.balancesAt, today))
+                           : st.wrongChain ? wrongChainText
+                                           : trText(QStringLiteral("%1 lookups failing")).arg(coin);
+        }
     }
 
     // A card, and the total, read plain only once every balance behind them
     // has answered: a "0" for an address nobody has answered for (a scan in
-    // progress, every Ethereum endpoint failing) would claim the funds are
+    // progress, every endpoint failing) would claim the funds are
     // gone. Until then they show what is known as a lower bound ("≥"), or "—"
     // while nothing is, and say how many addresses are still unchecked; so
     // too while the address limit leaves addresses unchecked. Figures that
-    // are known but may have moved since (a chain still scanning, Ethereum
-    // figures from an earlier pass) stay plain and say so. An asset with a
+    // are known but may have moved since (a chain still scanning, figures from an
+    // earlier round) stay plain and say so. An asset with a
     // balance but no price would make the total silently too low, so then it
     // is not shown at all.
     bool anyPrice = false;
@@ -482,18 +386,18 @@ void OverviewPage::refreshView()
     const QList<wallet::AssetInfo>& list = wallet::assets();
     for (qsizetype i = 0; i < list.size() && i < amountLabels_.size(); ++i) {
         const wallet::AssetInfo& info = list.at(i);
-        const bool bitcoin = info.asset == wallet::Asset::BTC;
+        const wallet::NetworkInfo& network = wallet::networkInfo(info.network);
+        const wallet::NetworkStatus& st = states[info.network];
         // No wallet has a key on this chain: nothing was looked at, so no zero.
-        if (!(bitcoin ? btcWatched : ethWatched)) {
+        if (!watched.contains(info.network)) {
             amountLabels_.at(i)->setText(dash());
-            usdLabels_.at(i)->setText(bitcoin ? trText(QStringLiteral("No wallet has a Bitcoin key"))
-                                              : trText(QStringLiteral("No wallet has an Ethereum key")));
+            usdLabels_.at(i)->setText(trText(QStringLiteral("No wallet has a key on %1")).arg(network.name));
             continue;
         }
-        const double price = prices ? prices->usd(info.symbol) : 0.0;
-        const int pending = pendingPerAsset_.value(i);
-        const bool unchecked = pending > 0 || (bitcoin ? btcMissing : ethMissing);
-        const bool incomplete = unchecked || limit;
+        const double price = prices ? prices->usd(info.asset) : 0.0;
+        const int pending = model ? model->uncheckedOn(info.network) : 0;
+        const bool unchecked = pending > 0 || missing.contains(info.network);
+        const bool incomplete = unchecked || limit || loading || unread;
         QString amountText = dash();
         QString usdText = dash();
         bool hasBalance = false;
@@ -522,10 +426,12 @@ void OverviewPage::refreshView()
             parts << uncheckedNote(pending, parts.isEmpty());
         if (limit)
             parts << trText(QStringLiteral("address limit reached"));
-        if (!bitcoin && ethStale)
-            parts << ethAsOf;
-        else if (!incomplete && (bitcoin ? btcScanning : ethScanning))
-            parts << trText(QStringLiteral("still scanning"));
+        if (st.wrongChain || st.failing)
+            parts << asOfText(st);
+        else if (st.connecting && st.balancesAt.isValid())
+            parts << asOfText(st); // no server to say what has moved since
+        else if (!incomplete && st.scanning)
+            parts << (saved ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning")));
         QString usdLine = parts.isEmpty() ? dash() : parts.join(QStringLiteral(" · "));
         if (!usdLine.isEmpty() && usdLine.at(0).isLower())
             usdLine[0] = usdLine.at(0).toUpper(); // a note that opens the line
@@ -553,45 +459,50 @@ void OverviewPage::refreshView()
     }
     totalLabel_->setText(totalText);
 
-    // Under the total: why it is not final yet, if it is not, then the prices.
-    // While a scan runs with every row answered (a Bitcoin balance still on
-    // its way), the figure is whole so far but may still move.
+    // Under the total: where the figures come from, why they are not final yet, if they
+    // are not, then the prices and how old those are.
+    const int uncheckedRows = model ? model->size() - model->checkedCount() : 0;
     QStringList caption;
-    if (pendingRows_ > 0)
-        caption << uncheckedNote(pendingRows_, true);
-    else if (btcMissing || ethMissing)
+    if (saved) {
+        const QDateTime savedAt = controller_->savedAt();
+        caption << (savedAt.isValid() ? trText(QStringLiteral("Saved balances from %1, being checked")).arg(shownTime(savedAt, today))
+                                      : trText(QStringLiteral("Saved balances, being checked")));
+    }
+    if (uncheckedRows > 0)
+        caption << uncheckedNote(uncheckedRows, true);
+    else if (!missing.isEmpty() || unread)
         caption << trText(QStringLiteral("Not all accounts checked yet"));
     if (limit)
         caption << trText(QStringLiteral("Address limit reached"));
-    if (ethStale)
-        caption << ethCaption;
-    else if (caption.isEmpty() && (btcScanning || ethScanning))
+    if (!staleCaption.isEmpty())
+        caption << staleCaption;
+    else if (caption.isEmpty() && anyScanning)
         caption << trText(QStringLiteral("Still scanning"));
-    const QDateTime updated = prices ? prices->updatedAt() : QDateTime();
-    caption << (updated.isValid() ? trText(QStringLiteral("Prices: CoinGecko · updated %1"))
-                                        .arg(shownTime(updated, today))
-                                  : trText(QStringLiteral("Prices: CoinGecko · not loaded yet")));
+    caption << controller_->pricesLine();
     pricesLabel_->setText(caption.join(QStringLiteral(" · ")));
 
     // The controller's title-bar status, in this page's words and in its
     // order: what keeps a balance missing or stale for good comes before
     // "Scanning…", which a window cut at the limit would otherwise show for
-    // ever. Bitcoin balances are followed live over Electrum, and a
-    // connection lost after the scan finished is retried inside the client
-    // with nothing pending in the scanner, so without a server the chip must
-    // not claim "Up to date" either. Nor may it while a balance has no answer
-    // and nothing is scanning for it.
-    const QString electrumServer = controller_->electrumServer();
-    if (electrumServer.isEmpty() && hasBitcoinAccount(accounts))
+    // ever. A network followed live over Electrum with a connection lost after the
+    // scan finished is retried inside the client with nothing pending in the scanner,
+    // so without a server the chip must not claim "Up to date" either. Nor may it
+    // while a balance has no answer and nothing is scanning for it.
+    const bool anyConnecting = std::any_of(states.cbegin(), states.cend(),
+                                           [](const wallet::NetworkStatus& st) { return st.connecting; });
+    if (loading)
+        setChip(scanLabel_, trText(QStringLiteral("Loading saved balances…")), Tone::Accent);
+    else if (anyConnecting)
         setChip(scanLabel_, trText(QStringLiteral("Connecting…")), Tone::Warning);
     else if (limit)
         setChip(scanLabel_, trText(QStringLiteral("Address limit reached")), Tone::Error);
-    else if (wrongChain)
-        setChip(scanLabel_, trText(QStringLiteral("Ethereum endpoint not on mainnet")), Tone::Error);
-    else if (ethFailing)
-        setChip(scanLabel_, ethCaption, Tone::Warning);
-    else if (btcScanning || ethScanning)
-        setChip(scanLabel_, trText(QStringLiteral("Scanning…")), Tone::Accent);
+    else if (anyWrongChain)
+        setChip(scanLabel_, wrongChainText, Tone::Error);
+    else if (anyFailing)
+        setChip(scanLabel_, staleCaption, Tone::Warning);
+    else if (anyScanning)
+        setChip(scanLabel_, saved ? trText(QStringLiteral("Checking saved balances…")) : trText(QStringLiteral("Scanning…")),
+                Tone::Accent);
     else if (anyIncomplete)
         setChip(scanLabel_, trText(QStringLiteral("Incomplete")), Tone::Warning);
     else
@@ -599,14 +510,17 @@ void OverviewPage::refreshView()
     const int derived = model ? model->size() : 0;
     const int checked = model ? model->checkedCount() : 0;
     walletsLabel_->setText(formatCount(int(controller_->store().wallets.size())));
-    scannedLabel_->setText(checked >= derived
+    // Until the servers have answered, what a row says it knows is from an earlier run.
+    scannedLabel_->setText(saved ? trText(QStringLiteral("%1 saved")).arg(formatCount(derived))
+                           : checked >= derived
                                ? formatCount(derived)
                                : trText(QStringLiteral("%1 of %2"))
                                      .arg(formatCount(checked), formatCount(derived)));
     usedLabel_->setText(formatCount(model ? model->usedCount() : 0));
     fundedLabel_->setText(formatCount(model ? model->fundedCount() : 0));
-    setServer(electrumLabel_, electrumServer);
-    setServer(ethLabel_, controller_->ethEndpoint());
+    const QList<wallet::NetworkInfo>& networkList = wallet::networks();
+    for (qsizetype i = 0; i < networkList.size() && i < serverLabels_.size(); ++i)
+        setServer(serverLabels_.at(i), states[networkList.at(i).network]);
 }
 
 } // namespace app::ui
