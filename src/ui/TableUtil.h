@@ -1,7 +1,10 @@
 #pragma once
 
 #include <QList>
+#include <QModelIndex>
 #include <QString>
+
+#include <functional>
 
 class QAbstractItemView;
 class QTableWidgetItem;
@@ -30,6 +33,8 @@ void copyTextToClipboard(QWidget* host, const QString& text,
 // O celulă poate da valoarea exactă de copiat prin kCopyRole (ex. URL-ul întreg
 // când afișează doar host-ul); kCopyRole setat dar gol = celula nu se copiază.
 constexpr int kCopyRole = 0x0100 + 50; // Qt::UserRole + 50
-void installCopyOnClick(QAbstractItemView* view, const QList<int>& columns);
+// `resolve`, if given, says at the moment of the click what goes to the clipboard; empty: nothing does.
+void installCopyOnClick(QAbstractItemView* view, const QList<int>& columns,
+                        const std::function<QString(const QModelIndex&)>& resolve = {});
 
 } // namespace app::ui

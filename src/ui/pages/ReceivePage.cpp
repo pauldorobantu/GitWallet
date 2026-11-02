@@ -34,6 +34,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <exception>
 
 namespace app::ui {
@@ -44,7 +45,7 @@ constexpr int kQrSide = 248;      // px on screen, at most; a module stays a who
 constexpr int kQrFileScale = 12;  // px a module in a file
 constexpr int kListedRows = 200;  // of what was given out, the latest
 constexpr int kUpdateMs = 400;    // a scan signals per address
-constexpr int kLabelChars = 100;
+constexpr int kLabelChars = 1024; // as the Addresses page takes them
 
 enum ListColumn { ListAddress, ListLabel, ListPath, ListBalance, ListUsd, ListState, ListColumns };
 
@@ -102,10 +103,11 @@ struct ReceivePage::Ui : QObject
     QLineEdit* label = nullptr;
     QLabel* qr = nullptr;
     QLabel* mark = nullptr;
-    QLabel* address = nullptr;
+    QLabel* addressLine = nullptr;
     QLabel* state = nullptr;
     QLabel* only = nullptr;
     QLabel* status = nullptr;
+    QLabel* owed = nullptr;
     QPushButton* copy = nullptr;
     QPushButton* save = nullptr;
     QPushButton* next = nullptr;
@@ -114,12 +116,15 @@ struct ReceivePage::Ui : QObject
     QWidget* filler = nullptr; // keeps the card its own height while there is no list under it
     QTimer* update = nullptr;
 
-    // What is on screen. Either the offer, which moves on by itself until it was given out, or
-    // one address asked for.
-    wallet::ReceiveOffer offer;
-    bool given = false;     // it left this screen
-    bool asked = false;     // one address, asked for: nothing moves it on
-    wallet::AddressRow row; // that address
+    // What is on screen: all of QR, text, Copy and Save go by these.
+    QString address;           // as its key gives it; empty: none
+    wallet::AddressRow row;    // what tells it apart in the model
+    wallet::ReceiveOffer::State offerState = wallet::ReceiveOffer::State::NoKey;
+    QString why;               // why there is none
+    bool held = false;         // it stays until told otherwise: asked for, or given out just now
+    bool labelTyped = false;   // the field holds what someone typed, not what the address is called
+    QString labelProblem;      // why what was typed was not kept
+    QString lastCopied;
 };
 
 ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidget(parent), controller_(controller)
@@ -186,12 +191,12 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     ui_->mark = new QLabel(card);
     ui_->mark->setFixedSize(24, 24);
     addressRow->addWidget(ui_->mark, 0, Qt::AlignVCenter);
-    ui_->address = new QLabel(card);
-    ui_->address->setObjectName(QStringLiteral("receiveAddress"));
-    ui_->address->setTextFormat(Qt::PlainText);
-    ui_->address->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    ui_->address->setWordWrap(true);
-    addressRow->addWidget(ui_->address, 1);
+    ui_->addressLine = new QLabel(card);
+    ui_->addressLine->setObjectName(QStringLiteral("receiveAddress"));
+    ui_->addressLine->setTextFormat(Qt::PlainText);
+    ui_->addressLine->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ui_->addressLine->setWordWrap(true);
+    addressRow->addWidget(ui_->addressLine, 1);
     right->addLayout(addressRow);
 
     ui_->state = new QLabel(card);
@@ -210,6 +215,12 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     ui_->status->setWordWrap(true);
     setStatus(ui_->status, QString(), Tone::Muted);
     right->addWidget(ui_->status);
+    ui_->owed = new QLabel(card);
+    ui_->owed->setObjectName(QStringLiteral("receiveOwed"));
+    ui_->owed->setTextFormat(Qt::PlainText);
+    ui_->owed->setWordWrap(true);
+    setStatus(ui_->owed, QString(), Tone::Warning);
+    right->addWidget(ui_->owed);
     right->addStretch(1);
 
     auto* buttons = new QHBoxLayout;
@@ -256,11 +267,7 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     connect(ui_->update, &QTimer::timeout, this, [this] {
         if (!isVisible())
             return;
-        // Until it left this screen it may have been used elsewhere, or only now answered for.
-        if (!ui_->asked && !ui_->given)
-            offerNext();
-        else
-            updateShown();
+        offerNext();
         updateList();
     });
     const auto queue = [this] {
@@ -270,47 +277,59 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
 
     connect(ui_->wallet, &QComboBox::currentIndexChanged, this, [this] {
         rebuildCoins();
-        ui_->asked = false;
-        offerNext();
-        updateList();
+        chosenChanged();
     });
     connect(ui_->coin, &QComboBox::currentIndexChanged, this, [this] {
         rebuildTypes();
-        ui_->asked = false;
-        offerNext();
-        updateList();
+        chosenChanged();
     });
-    connect(ui_->type, &QComboBox::currentIndexChanged, this, [this] {
-        ui_->asked = false;
-        offerNext();
-        updateList();
-    });
+    connect(ui_->type, &QComboBox::currentIndexChanged, this, &ReceivePage::chosenChanged);
     connect(ui_->amount, &QLineEdit::textChanged, this, &ReceivePage::updateShown);
+    connect(ui_->label, &QLineEdit::textEdited, this, [this] {
+        ui_->labelTyped = true;
+        ui_->labelProblem.clear();
+    });
     // Of one that has left this screen, or was asked for, a label is kept as soon as it is written.
     connect(ui_->label, &QLineEdit::editingFinished, this, [this] {
-        if (ui_->given || ui_->asked)
+        if (ui_->held) {
             keepLabel();
+            updateShown();
+        }
     });
     connect(ui_->copy, &QPushButton::clicked, this, [this] {
-        const QString address = ui_->address->text();
+        const QString address = ui_->address;
         if (address.isEmpty())
             return;
         giveOut();
+        ui_->lastCopied = address;
         copyTextToClipboard(ui_->copy, address, trText(QStringLiteral("Address copied")));
     });
     connect(ui_->save, &QPushButton::clicked, this, &ReceivePage::saveQr);
     connect(ui_->next, &QPushButton::clicked, this, &ReceivePage::newAddress);
-    connect(list, &QTableWidget::cellClicked, this, [this](int row, int) {
-        const int position = ui_->list->item(row, ListAddress)->data(Qt::UserRole).toInt();
+    const auto rowOfCell = [this](int row) {
+        // By what tells it apart, and only if that is still what the line says: rows move.
+        const QTableWidgetItem* cell = ui_->list->item(row, ListAddress);
+        const QList<wallet::AccountKey> keys = ui_->coin->count() > 0 ? controller_->receiveKeys(ui_->wallet->currentData().toUInt(), chosenNetwork()) : QList<wallet::AccountKey>();
+        const auto key = std::find_if(keys.cbegin(), keys.cend(), [this](const wallet::AccountKey& k) { return k.type == chosenType(); });
+        if (!cell || key == keys.cend())
+            return -1;
         const wallet::WalletModel* model = controller_->model();
-        if (position >= 0 && position < model->size())
-            showAddress(model->at(position));
+        const int position = model->find(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType(), key->account, 0, cell->data(Qt::UserRole).toUInt());
+        return position >= 0 && model->at(position).address == cell->text() ? position : -1;
+    };
+    connect(list, &QTableWidget::cellClicked, this, [this, rowOfCell](int row, int) {
+        const int position = rowOfCell(row);
+        if (position >= 0)
+            showAddress(controller_->model()->at(position));
+        else
+            updateList();
     });
-    connect(list, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
-        const int position = ui_->list->item(row, ListAddress)->data(Qt::UserRole).toInt();
-        const wallet::WalletModel* model = controller_->model();
-        if (position >= 0 && position < model->size())
-            emit openAddressRequested(model->at(position));
+    connect(list, &QTableWidget::cellDoubleClicked, this, [this, rowOfCell](int row, int) {
+        const int position = rowOfCell(row);
+        if (position >= 0)
+            emit openAddressRequested(controller_->model()->at(position));
+        else
+            updateList();
     });
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this] {
         rebuildTypes();
@@ -320,12 +339,20 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     if (controller_) {
         connect(controller_, &WalletController::walletChanged, this, [this] {
             rebuildWallets();
+            // What stays on screen stays only while its wallet does.
+            if (ui_->held && !controller_->store().find(ui_->row.wallet)) {
+                ui_->held = false;
+                resetTyped();
+            }
             offerNext();
             updateList();
         });
         connect(controller_, &WalletController::totalsChanged, this, queue);
         connect(controller_, &WalletController::statusChanged, this, queue);
-        connect(controller_, &WalletController::labelsChanged, this, queue);
+        connect(controller_, &WalletController::labelsChanged, this, [this, queue] {
+            loadLabel();
+            queue();
+        });
         connect(controller_, &WalletController::givenOutChanged, this, queue);
         if (wallet::WalletModel* model = controller_->model()) {
             connect(model, &wallet::WalletModel::rowChanged, this, queue);
@@ -336,17 +363,6 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     }
     rebuildWallets();
     offerNext();
-    updateList();
-}
-
-void ReceivePage::showEvent(QShowEvent* event)
-{
-    QWidget::showEvent(event);
-    // What was given out has gone: coming back, the next one is what is wanted.
-    if (ui_->given && !ui_->asked)
-        ui_->label->clear();
-    if (!ui_->asked)
-        offerNext();
     updateList();
 }
 
@@ -427,21 +443,32 @@ chain::ScriptType ReceivePage::chosenType() const
     return static_cast<chain::ScriptType>(ui_->type->currentData().toInt());
 }
 
+void ReceivePage::chosenChanged()
+{
+    ui_->held = false;
+    ui_->address.clear();
+    resetTyped();
+    offerNext();
+    updateList();
+}
+
 void ReceivePage::showFor(quint32 walletId, std::optional<wallet::Asset> asset)
 {
-    if (walletId != 0) {
-        const int index = ui_->wallet->findData(walletId);
+    {
+        const QSignalBlocker quiet(ui_->wallet);
+        const int index = walletId != 0 ? ui_->wallet->findData(walletId) : -1;
         if (index >= 0)
             ui_->wallet->setCurrentIndex(index);
     }
-    if (asset) {
-        const int index = ui_->coin->findData(int(*asset));
+    rebuildCoins();
+    {
+        const QSignalBlocker quiet(ui_->coin);
+        const int index = asset ? ui_->coin->findData(int(*asset)) : -1;
         if (index >= 0)
             ui_->coin->setCurrentIndex(index);
     }
-    ui_->asked = false;
-    offerNext();
-    updateList();
+    rebuildTypes();
+    chosenChanged();
 }
 
 void ReceivePage::showAddress(const wallet::AddressRow& row)
@@ -466,58 +493,86 @@ void ReceivePage::showAddress(const wallet::AddressRow& row)
         if (index >= 0)
             ui_->type->setCurrentIndex(index);
     }
-    ui_->asked = true;
+    ui_->held = true;
     ui_->row = row;
-    ui_->given = true;
-    ui_->offer = {};
-    ui_->offer.address = controller_->checkedAddress(row);
-    ui_->offer.state = ui_->offer.address.isEmpty() ? wallet::ReceiveOffer::State::Failed : wallet::ReceiveOffer::State::Ready;
-    if (ui_->offer.address.isEmpty())
-        ui_->offer.why = QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.");
-    ui_->offer.path = row.path();
-    ui_->offer.account = row.account;
-    ui_->offer.index = row.index;
-    ui_->label->setText(controller_->addressLabel(row.address));
-    setStatus(ui_->status, QString(), Tone::Muted);
+    ui_->address = controller_->checkedAddress(row);
+    ui_->offerState = ui_->address.isEmpty() ? wallet::ReceiveOffer::State::Failed : wallet::ReceiveOffer::State::Ready;
+    ui_->why = ui_->address.isEmpty() ? QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.") : QString();
+    resetTyped();
     updateShown();
     updateList();
 }
 
+void ReceivePage::resetTyped()
+{
+    ui_->amount->clear();
+    ui_->labelTyped = false;
+    ui_->labelProblem.clear();
+    loadLabel();
+}
+
+void ReceivePage::loadLabel()
+{
+    if (ui_->labelTyped)
+        return;
+    const QString kept = controller_ && !ui_->address.isEmpty() ? controller_->addressLabel(ui_->address) : QString();
+    if (ui_->label->text() != kept)
+        ui_->label->setText(kept);
+}
+
 void ReceivePage::offerNext()
 {
-    if (!controller_ || ui_->coin->count() == 0 || ui_->type->count() == 0) {
-        ui_->offer = {};
-        ui_->given = false;
+    if (ui_->held) {
         updateShown();
         return;
     }
-    const wallet::ReceiveOffer next = controller_->nextReceive(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType());
-    if (next.address != ui_->offer.address) {
-        ui_->given = false;
-        ui_->label->clear();
-        setStatus(ui_->status, QString(), Tone::Muted);
+    if (!controller_ || ui_->coin->count() == 0 || ui_->type->count() == 0) {
+        ui_->address.clear();
+        ui_->offerState = wallet::ReceiveOffer::State::NoKey;
+        ui_->why.clear();
+        loadLabel();
+        updateShown();
+        return;
     }
-    ui_->offer = next;
+    const quint32 walletId = ui_->wallet->currentData().toUInt();
+    const wallet::ReceiveOffer next = controller_->nextReceive(walletId, chosenNetwork(), chosenType());
+    ui_->offerState = next.state;
+    ui_->why = next.why;
+    if (next.state == wallet::ReceiveOffer::State::Ready) {
+        const wallet::WalletModel* model = controller_->model();
+        ui_->row = model->at(model->find(walletId, chosenNetwork(), chosenType(), next.account, 0, next.index));
+    }
+    // What was typed is for the payment, so it goes along if the address moves on by itself.
+    if (next.address != ui_->address) {
+        ui_->address = next.address;
+        ui_->labelProblem.clear();
+        loadLabel();
+    }
     updateShown();
+}
+
+int ReceivePage::shownPosition() const
+{
+    const wallet::AddressRow& row = ui_->row;
+    return ui_->address.isEmpty() || !controller_ ? -1 : controller_->model()->find(row.wallet, row.network, row.type, row.account, row.change, row.index);
 }
 
 QString ReceivePage::payload() const
 {
-    const QString address = ui_->offer.address;
-    if (address.isEmpty())
+    if (ui_->address.isEmpty())
         return {};
     const QString amount = ui_->amount->text().trimmed();
-    const wallet::NetworkInfo& network = wallet::networkInfo(chosenNetwork());
+    const wallet::NetworkInfo& network = wallet::networkInfo(ui_->row.network);
     const wallet::AssetInfo& coin = wallet::assetInfo(network.coin);
     if (amount.isEmpty() || network.family != wallet::Family::Utxo || !validAmount(amount, coin))
-        return address;
+        return ui_->address;
     // BIP 21. The label stays out: whoever scans it has no business reading the name given here.
-    return QStringLiteral("%1:%2?amount=%3").arg(network.id, address, amount);
+    return QStringLiteral("%1:%2?amount=%3").arg(network.id, ui_->address, amount);
 }
 
 QString ReceivePage::shownAddress() const
 {
-    return ui_->address->text();
+    return ui_->address;
 }
 
 QString ReceivePage::shownPayload() const
@@ -525,22 +580,25 @@ QString ReceivePage::shownPayload() const
     return payload();
 }
 
+QString ReceivePage::lastCopied() const
+{
+    return ui_->lastCopied;
+}
+
 void ReceivePage::updateShown()
 {
-    const wallet::ReceiveOffer& offer = ui_->offer;
-    const bool ready = offer.state == wallet::ReceiveOffer::State::Ready && !offer.address.isEmpty();
+    const bool ready = !ui_->address.isEmpty();
     ui_->copy->setEnabled(ready);
     ui_->save->setEnabled(ready);
-    // Moving on from one asked for goes back to what is next; from nothing, there is nothing to skip.
     ui_->next->setEnabled(ready);
     ui_->label->setEnabled(ready);
-    ui_->address->setText(ready ? offer.address : QString());
+    ui_->addressLine->setText(ui_->address);
     ui_->mark->setVisible(ready);
     ui_->only->setVisible(ready);
-    if (ui_->coin->count() > 0) {
-        const wallet::AssetInfo& info = wallet::assetInfo(wallet::Asset(quint16(ui_->coin->currentData().toInt())));
-        ui_->mark->setPixmap(coinIcon(info, 24).pixmap(QSize(24, 24)));
-        ui_->only->setText(onlyLine(wallet::networkInfo(info.network)));
+    if (ready) {
+        const wallet::NetworkInfo& network = wallet::networkInfo(ui_->row.network);
+        ui_->mark->setPixmap(coinIcon(wallet::assetInfo(network.coin), 24).pixmap(QSize(24, 24)));
+        ui_->only->setText(onlyLine(network));
     }
 
     const QString text = payload();
@@ -555,13 +613,16 @@ void ReceivePage::updateShown()
         image.setDevicePixelRatio(ratio);
         ui_->qr->setPixmap(QPixmap::fromImage(image));
     }
-    const QString amount = ui_->amount->text().trimmed();
-    if (!amount.isEmpty() && ui_->coin->count() > 0 && ready && !validAmount(amount, wallet::assetInfo(wallet::networkInfo(chosenNetwork()).coin)))
-        setStatus(ui_->status, trText(QStringLiteral("That amount cannot go into the QR code: write it like 0.015")), Tone::Warning);
-    else if (ui_->status->text().startsWith(trText(QStringLiteral("That amount cannot go into the QR code: write it like 0.015"))))
-        setStatus(ui_->status, QString(), Tone::Muted);
 
-    switch (offer.state) {
+    // What typed input came to, and whether what was given out is in the file.
+    const QString amount = ui_->amount->text().trimmed();
+    QString problem = ui_->labelProblem;
+    if (problem.isEmpty() && ready && !amount.isEmpty() && !validAmount(amount, wallet::assetInfo(wallet::networkInfo(ui_->row.network).coin)))
+        problem = trText(QStringLiteral("That amount cannot go into the QR code: write it like 0.015"));
+    setStatus(ui_->status, problem, Tone::Warning);
+    setStatus(ui_->owed, controller_ && controller_->givenOutOwed() ? trText(QStringLiteral("An address given out could not be written down yet, so another start may offer it again. This is tried again every half a minute.")) : QString(), Tone::Warning);
+
+    switch (ui_->offerState) {
     case wallet::ReceiveOffer::State::Checking:
         setStatus(ui_->state, trText(QStringLiteral("Looking for the next unused address: a server has to answer for it first.")), Tone::Muted);
         return;
@@ -569,39 +630,39 @@ void ReceivePage::updateShown()
         setStatus(ui_->state, ui_->coin->count() == 0 ? trText(QStringLiteral("This wallet has no key to receive on.")) : trText(QStringLiteral("This wallet has no such key.")), Tone::Warning);
         return;
     case wallet::ReceiveOffer::State::Failed:
-        setStatus(ui_->state, trText(offer.why), Tone::Error);
+        setStatus(ui_->state, trText(ui_->why), Tone::Error);
         return;
     case wallet::ReceiveOffer::State::Ready:
         break;
     }
 
-    // What has come of it, for one that left this screen; what is known of it, for one that has not.
-    const wallet::WalletModel* model = controller_->model();
-    const quint32 walletId = ui_->wallet->currentData().toUInt();
-    const int position = model->find(walletId, chosenNetwork(), chosenType(), offer.account, 0, offer.index);
-    const int asked = ui_->asked ? model->find(ui_->row.wallet, ui_->row.network, ui_->row.type, ui_->row.account, ui_->row.change, ui_->row.index) : -1;
-    const int at = ui_->asked ? asked : position;
-    QString line = offer.path;
+    // What is known of it, and no more than that.
+    const int at = shownPosition();
+    QString line = ui_->row.path();
     Tone tone = Tone::Muted;
     if (at >= 0) {
-        const wallet::AddressRow& row = model->at(at);
+        const wallet::AddressRow& row = controller_->model()->at(at);
+        const bool given = controller_->isGivenOut(row);
+        const auto say = [&line](const QString& what) { line += QStringLiteral(" · ") + what; };
         if (row.state() == wallet::AddressState::Funded) {
             QStringList held;
-            row.forEachBalance([&held](wallet::Asset asset, const chain::Amount& value) {
+            row.forEachBalance([&held, &row](wallet::Asset asset, const chain::Amount& value) {
                 const wallet::AssetInfo& info = wallet::assetInfo(asset);
-                held << figures::formatAmount(value, info) + QLatin1Char(' ') + info.symbol;
+                const QString amountText = figures::formatAmount(value, info) + QLatin1Char(' ') + info.symbol;
+                held << (row.checked ? amountText : figures::atLeast(amountText));
             });
-            line += QStringLiteral(" · ") + trText(QStringLiteral("Holds %1")).arg(held.join(QStringLiteral(", ")));
+            say(trText(QStringLiteral("Holds %1")).arg(held.join(QStringLiteral(", "))));
             tone = Tone::Success;
         } else if (row.used) {
-            line += QStringLiteral(" · ") + trText(QStringLiteral("Has been used, and holds nothing now"));
-        } else if (ui_->given) {
-            line += QStringLiteral(" · ") + trText(QStringLiteral("Given out, nothing has come in yet"));
-            tone = Tone::Accent;
+            say(row.checked ? trText(QStringLiteral("Has been used, and holds nothing now")) : trText(QStringLiteral("Has been used; what it holds is being read")));
+            tone = row.checked ? Tone::Muted : Tone::Accent;
+        } else if (!row.checked) {
+            say(given ? trText(QStringLiteral("Given out; no server has answered for it yet")) : trText(QStringLiteral("No server has answered for it yet")));
         } else if (controller_->showingSaved()) {
-            line += QStringLiteral(" · ") + trText(QStringLiteral("Unused as far as was saved, being checked"));
+            say(given ? trText(QStringLiteral("Given out; nothing had come in as far as was saved, being checked")) : trText(QStringLiteral("Unused as far as was saved, being checked")));
         } else {
-            line += QStringLiteral(" · ") + trText(QStringLiteral("Unused"));
+            say(given ? trText(QStringLiteral("Given out, nothing has come in yet")) : trText(QStringLiteral("Unused")));
+            tone = given ? Tone::Accent : Tone::Muted;
         }
     }
     setStatus(ui_->state, line, tone);
@@ -635,7 +696,7 @@ void ReceivePage::updateList()
             cell->setTextAlignment(alignment);
             return cell;
         };
-        put(ListAddress, row.address)->setData(Qt::UserRole, rows.at(i));
+        put(ListAddress, row.address)->setData(Qt::UserRole, row.index);
         put(ListLabel, controller_->addressLabel(row.address));
         put(ListPath, row.path());
         QStringList held;
@@ -655,15 +716,20 @@ void ReceivePage::updateList()
         const Qt::Alignment numbers = Qt::AlignRight | Qt::AlignVCenter;
         put(ListBalance, held.isEmpty() ? (row.checked ? QStringLiteral("0") : figures::dash()) : held.join(QStringLiteral(" · ")), numbers);
         put(ListUsd, row.checked && priced ? figures::formatUsd(usd) : figures::dash(), numbers);
+        // No more than is known of it: a figure that was only saved says so.
         QString state;
         Tone tone = Tone::Muted;
-        if (row.state() == wallet::AddressState::Funded) {
+        if (!row.checked) {
+            state = trText(QStringLiteral("Checking…"));
+        } else if (controller_->showingSaved()) {
+            state = trText(QStringLiteral("Saved, being checked"));
+        } else if (row.state() == wallet::AddressState::Funded) {
             state = trText(QStringLiteral("Received"));
             tone = Tone::Success;
         } else if (row.used) {
             state = trText(QStringLiteral("Used"));
         } else {
-            state = trText(row.checked ? QStringLiteral("Waiting") : QStringLiteral("Checking…"));
+            state = trText(QStringLiteral("Waiting"));
         }
         put(ListState, state)->setForeground(toneColor(tone));
     }
@@ -671,70 +737,84 @@ void ReceivePage::updateList()
 
 bool ReceivePage::keepLabel()
 {
-    const QString address = ui_->address->text();
+    if (!ui_->labelTyped || ui_->address.isEmpty())
+        return true;
     const QString wanted = ui_->label->text().trimmed();
-    if (address.isEmpty() || wanted == controller_->addressLabel(address))
-        return true;
     QString error;
-    if (controller_->setAddressLabel(address, wanted, &error))
+    if (wanted == controller_->addressLabel(ui_->address) || controller_->setAddressLabel(ui_->address, wanted, &error)) {
+        ui_->labelTyped = false;
+        ui_->labelProblem.clear();
         return true;
-    setStatus(ui_->status, error, Tone::Warning);
+    }
+    ui_->labelProblem = error;
     // Not kept on screen either, if that is why it was refused.
-    if (wallet::looksLikeSecret(wanted))
+    if (wallet::looksLikeSecret(wanted)) {
         ui_->label->clear();
+        ui_->labelTyped = false;
+    }
     return false;
 }
 
-void ReceivePage::giveOut()
+bool ReceivePage::giveOut()
 {
-    if (ui_->address->text().isEmpty())
-        return;
+    if (ui_->address.isEmpty())
+        return true;
     const bool labelled = keepLabel();
-    if (ui_->asked || ui_->given) {
-        if (labelled)
-            setStatus(ui_->status, QString(), Tone::Muted);
-        updateShown();
-        return;
+    // As it stands now: one that has had a payment meanwhile has no need of a mark.
+    const int at = shownPosition();
+    if (at >= 0) {
+        QString error;
+        controller_->markGivenOut(controller_->model()->at(at), &error); // what fails stays on screen, and is tried again
     }
-    QString error;
-    const bool kept = controller_->markGivenOut(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType(), ui_->offer.index, &error);
-    ui_->given = true;
-    if (!kept)
-        setStatus(ui_->status, error, Tone::Warning);
-    else if (labelled)
-        setStatus(ui_->status, QString(), Tone::Muted);
+    ui_->held = true;
     updateShown();
     updateList();
+    return labelled;
 }
 
 void ReceivePage::newAddress()
 {
-    giveOut();
-    ui_->asked = false;
-    ui_->given = false;
-    ui_->offer = {};
-    ui_->label->clear();
-    ui_->amount->clear();
+    // A label refused stays in its field, with why: moving on would lose it.
+    if (!giveOut())
+        return;
+    ui_->held = false;
+    ui_->address.clear();
+    resetTyped();
     offerNext();
     updateList();
 }
 
-void ReceivePage::saveQr()
+bool ReceivePage::saveQrAs(const QString& path)
 {
     const QString text = payload();
-    if (text.isEmpty())
+    if (text.isEmpty() || !QrCode::encode(text.toUtf8()).toImage(kQrFileScale).save(path, "PNG"))
+        return false;
+    giveOut();
+    return true;
+}
+
+void ReceivePage::saveQr()
+{
+    if (ui_->address.isEmpty())
         return;
+    // Nothing moves what is on screen while the file is being chosen: it is what goes in the file.
+    const bool wasHeld = ui_->held;
+    ui_->held = true;
     const QString path = QFileDialog::getSaveFileName(this, trText(QStringLiteral("Save QR")),
-                                                      QStringLiteral("receive-%1.png").arg(ui_->address->text().left(12)),
+                                                      QStringLiteral("receive-%1.png").arg(ui_->address.left(12)),
                                                       QStringLiteral("PNG (*.png)"));
-    if (path.isEmpty())
-        return;
-    if (!QrCode::encode(text.toUtf8()).toImage(kQrFileScale).save(path, "PNG")) {
-        Feedback::show(ui_->save, Feedback::Type::Error, trText(QStringLiteral("Could not write the file")));
+    if (path.isEmpty()) {
+        ui_->held = wasHeld;
+        offerNext();
         return;
     }
-    giveOut();
-    Feedback::show(ui_->save, Feedback::Type::Success, trText(QStringLiteral("QR saved")));
+    if (saveQrAs(path)) {
+        Feedback::show(ui_->save, Feedback::Type::Success, trText(QStringLiteral("QR saved")));
+    } else {
+        ui_->held = wasHeld;
+        offerNext();
+        Feedback::show(ui_->save, Feedback::Type::Error, trText(QStringLiteral("Could not write the file")));
+    }
 }
 
 } // namespace app::ui

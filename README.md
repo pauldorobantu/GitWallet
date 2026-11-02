@@ -73,7 +73,10 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
    it is for and stays on this PC, out of the code. What was given out is listed under it with what came
    of it. An address is derived from the key each time it is shown, and if what is kept says another, none
    is offered. Those given out count as used for the gap and are followed ahead of the rest, so a payment to
-   one shows as soon as any. No address is offered until a server has said it has no history.
+   one shows as soon as any. No address is offered until a server has said it has no history; once that
+   was said in an earlier run it is offered with a note, as the servers may not have answered yet. Copying
+   an address anywhere in the app marks it the same way. Removing a wallet forgets what it gave out, and
+   the dialog says how many of those are still waiting for a payment.
 4. **Send BTC** *(later)* — sweep selected or all addresses into one transaction.
 5. **Sweep ETH + tokens** *(after that)* — empty each account in turn (Ethereum
    needs one transaction per address; gas is funded automatically for tokens).
@@ -97,7 +100,7 @@ compare with the other wallet.
 
 - `wallet.dat`, encrypted for the current Windows user with DPAPI: each wallet's name
   and **account-level public keys** (zpub / ypub / xpub at `m/84'/0'/0'`, `m/49'/0'/0'`,
-  `m/44'/0'/0'`, `m/44'/60'/0'`, or those you pasted), how far each has given out addresses, the
+  `m/44'/0'/0'`, `m/44'/60'/0'`, or those you pasted), which addresses each has given out, the
   scan settings and the key of the database below. A seed is used once to derive those keys and is then scrubbed
   from memory; it is never written anywhere. Public keys can show balances but cannot
   spend. A `wallet.dat` from an earlier version loads as it was, and a copy stays beside it

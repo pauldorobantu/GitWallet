@@ -15,6 +15,22 @@
 // Shared value types of the wallet layer.
 namespace wallet {
 
+// Which receive addresses of a key were given out, so that none goes to two payers. Runs in order, as
+// they nearly always follow one another.
+struct GivenOut {
+    struct Run {
+        quint32 from = 0;
+        quint32 to = 0; // one past the last
+    };
+    QList<Run> runs;
+
+    bool isEmpty() const { return runs.isEmpty(); }
+    bool contains(quint32 index) const;
+    void add(quint32 index);
+    quint32 end() const { return runs.isEmpty() ? 0 : runs.constLast().to; } // one past the highest
+    quint32 nextFree(quint32 index) const; // the first at or past `index` that was not given out
+};
+
 // One stored account: the public node at m/purpose'/coin'/account'.
 struct AccountKey {
     quint32 wallet = 0; // WalletEntry::id of its wallet; the entry's position in the file says it
@@ -22,8 +38,7 @@ struct AccountKey {
     Network network{};  // a UTXO type's network; an Evm account serves every Evm network
     quint32 account = 0;
     QString xpub; // serialized with chain::xpubVersionFor(type)
-    quint32 issued = 0;     // receive addresses below this index are never offered again
-    quint32 issuedFrom = 0; // the first one Receive gave out: before it, what was used was used elsewhere
+    GivenOut given;
 
     // Parses `xpub`; throws std::runtime_error if it is not a valid extended key.
     chain::HdPubKey node() const;
@@ -96,6 +111,7 @@ enum class Problem {
     FolderHeld,     // another window holds the data folder, so nothing is saved here for now
     LabelsNotKept,  // labels and notes, which exist nowhere else, are not going into the database
     LabelsOwed,     // those of a file set aside have yet to come over, and until they have none can change
+    GivenOutNotKept, // an address given out has yet to reach wallet.dat
 };
 
 // One address on one network. An Evm address exists on every Evm network, with one row

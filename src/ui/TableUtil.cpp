@@ -121,7 +121,8 @@ private:
 
 } // namespace
 
-void installCopyOnClick(QAbstractItemView* view, const QList<int>& columns)
+void installCopyOnClick(QAbstractItemView* view, const QList<int>& columns,
+                        const std::function<QString(const QModelIndex&)>& resolve)
 {
     if (!view || columns.isEmpty())
         return;
@@ -129,8 +130,10 @@ void installCopyOnClick(QAbstractItemView* view, const QList<int>& columns)
     view->setMouseTracking(true);
     view->viewport()->installEventFilter(new CopyCursorFilter(view, allowed));
     QObject::connect(view, &QAbstractItemView::clicked, view,
-                     [view, allowed](const QModelIndex& index) {
-                         const QString text = copyValue(index, allowed);
+                     [view, allowed, resolve](const QModelIndex& index) {
+                         QString text = copyValue(index, allowed);
+                         if (!text.isEmpty() && resolve)
+                             text = resolve(index);
                          if (!text.isEmpty())
                              copyTextToClipboard(view, text);
                      });

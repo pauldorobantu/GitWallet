@@ -30,9 +30,13 @@ public:
     virtual void start() = 0;
     virtual void stop() = 0;
     virtual void refreshNow() {}
-    // Receive addresses of this account below `key.issued` were given out, just now: a payment comes
-    // to those, so they count as used for how far the window reaches, and are followed first.
-    virtual void noteIssued(const AccountKey& key) { Q_UNUSED(key); }
+    // The receive address at `index` of this account was given out, just now: a payment comes to those,
+    // so they count as used for how far the window reaches, and those not paid yet are followed first.
+    virtual void noteGiven(const AccountKey& key, quint32 index)
+    {
+        Q_UNUSED(key);
+        Q_UNUSED(index);
+    }
     // What the database kept of the last run, before the next start().
     virtual void restoreTimes(const QDateTime& balancesAt, const QDateTime& noncesAt, const NonceSweep& sweep)
     {

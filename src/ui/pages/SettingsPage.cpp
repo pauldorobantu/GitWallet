@@ -577,6 +577,13 @@ void SettingsPage::confirmRemove()
         detail += QLatin1Char(' ')
                   + QStringLiteral("Its database could not be read just now: whatever labels and notes it holds go too, for good.");
     }
+    const int waiting = controller_->givenOutWaiting();
+    if (waiting > 0) {
+        detail += QLatin1Char(' ')
+                  + QStringLiteral("%1 of the addresses they gave out have had nothing come in yet. If those seeds are added again, they "
+                                   "will be offered to someone else: only this PC knows they were given out.")
+                        .arg(waiting);
+    }
     const int databases = controller_->databasesKeptAside();
     if (databases > 0) {
         detail += QLatin1Char(' ')

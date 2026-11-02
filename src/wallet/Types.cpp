@@ -2,6 +2,8 @@
 
 #include <QtNumeric>
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -22,6 +24,38 @@ qint64 utxoNet(qint64 confirmed, qint64 unconfirmed)
 }
 
 } // namespace
+
+bool GivenOut::contains(quint32 index) const
+{
+    const auto after = std::upper_bound(runs.cbegin(), runs.cend(), index, [](quint32 value, const Run& run) { return value < run.from; });
+    return after != runs.cbegin() && index < std::prev(after)->to;
+}
+
+void GivenOut::add(quint32 index)
+{
+    if (contains(index))
+        return;
+    const auto after = std::upper_bound(runs.begin(), runs.end(), index, [](quint32 value, const Run& run) { return value < run.from; });
+    const qsizetype at = after - runs.begin();
+    const bool joinsBefore = at > 0 && runs.at(at - 1).to == index;
+    const bool joinsAfter = at < runs.size() && runs.at(at).from == index + 1;
+    if (joinsBefore && joinsAfter) {
+        runs[at - 1].to = runs.at(at).to;
+        runs.removeAt(at);
+    } else if (joinsBefore) {
+        runs[at - 1].to = index + 1;
+    } else if (joinsAfter) {
+        runs[at].from = index;
+    } else {
+        runs.insert(at, Run{index, index + 1});
+    }
+}
+
+quint32 GivenOut::nextFree(quint32 index) const
+{
+    const auto after = std::upper_bound(runs.cbegin(), runs.cend(), index, [](quint32 value, const Run& run) { return value < run.from; });
+    return after != runs.cbegin() && index < std::prev(after)->to ? std::prev(after)->to : index;
+}
 
 chain::HdPubKey AccountKey::node() const
 {

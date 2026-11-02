@@ -39,11 +39,16 @@ signals:
     void openAddressRequested(const wallet::AddressRow& row);
     void showHistoryRequested(const wallet::AddressRow& row);
 
+protected:
+    void showEvent(QShowEvent* event) override; // what a place left narrowed goes back as the page shows
+
 private:
     WalletController* controller_ = nullptr;
 
     // --- implementation (AddressesPage.cpp) ---
     struct Ui; // the page's widgets and models
+
+    void becomeWhole();
 
     void applyColumnWidths();
     void rebuildWalletFilter(); // the combo follows the wallet list; one wallet needs neither it nor the column

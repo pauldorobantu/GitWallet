@@ -110,11 +110,11 @@ QList<HistoryBook*> Scheduler::books() const
     return out;
 }
 
-void Scheduler::noteIssued(const AccountKey& key)
+void Scheduler::noteGiven(const AccountKey& key, quint32 index)
 {
     for (ChainScanner* scanner : std::as_const(scanners_)) {
         if (key.serves(scanner->network()))
-            scanner->noteIssued(key);
+            scanner->noteGiven(key, index);
     }
 }
 

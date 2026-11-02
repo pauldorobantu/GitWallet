@@ -91,15 +91,20 @@ public:
         if (wallet != wallet_)
             change([&] { wallet_ = wallet; });
     }
-    // With the state Funded, it is this asset the row has to hold.
-    void setHeld(std::optional<wallet::Asset> asset, const wallet::WalletModel* model)
+    // All of it in one go: a pass over the rows per field is a long time at a million.
+    void setAll(quint32 wallet, int chain, int state, std::optional<wallet::Asset> held, const wallet::WalletModel* model)
     {
-        if (asset != held_) {
-            change([&] {
-                held_ = asset;
-                model_ = model;
-            });
-        }
+        if (wallet == wallet_ && chain == chain_ && state == state_ && held == held_ && query_.isEmpty())
+            return;
+        change([&] {
+            wallet_ = wallet;
+            chain_ = chain;
+            state_ = state;
+            held_ = held;
+            model_ = model;
+            query_.clear();
+            pathQuery_ = true;
+        });
     }
     // A combo narrows the list (the search text is reported separately).
     bool filtered() const { return wallet_ != 0 || chain_ != kAllChains || state_ != StateAll; }
@@ -249,7 +254,10 @@ struct AddressesPage::Ui : QObject
     QTimer* update = nullptr;    // batches recounts while a scan streams rows in
     QTimer* searchPause = nullptr; // on a large list, the query waits for the typing to stop
     QTimer* cooldown = nullptr;  // Refresh stays disabled while it runs
+    QWidget* nothingHere = nullptr; // a place where no address holds what it is about
     bool inPlace = false;        // the wallet and chain come from the place, and their combos are gone
+    int placeState = 0;          // the state a place came up on: anything else is the reader's own
+    bool wholeOwed = false;      // the place has been left, and the rows go back when the page next shows
 };
 
 AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
@@ -284,7 +292,22 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     header->setStretchLastSection(false);
     header->setSortIndicator(AddressTableModel::ColPath, Qt::AscendingOrder);
     view->setSortingEnabled(true);
-    installCopyOnClick(view, {AddressTableModel::ColAddress});
+    // What goes on the clipboard may go to someone who is to pay: what the key gives, and marked.
+    installCopyOnClick(view, {AddressTableModel::ColAddress}, [this](const QModelIndex& index) {
+        const QModelIndex source = ui_->filter->mapToSource(index);
+        const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
+        if (!model || !source.isValid() || source.row() >= model->size())
+            return QString();
+        const wallet::AddressRow& row = model->at(source.row());
+        const QString address = controller_->checkedAddress(row);
+        if (address.isEmpty()) {
+            Feedback::show(ui_->view, Feedback::Type::Error, trText(QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.")));
+            return QString();
+        }
+        QString error;
+        controller_->markGivenOut(row, &error); // what fails is said on its own, and tried again
+        return address;
+    });
     applyColumnWidths();
     root->addWidget(view, 1);
 
@@ -293,9 +316,13 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->waiting = page::makeEmptyState(this, int(icon::Kind::Refresh), QStringLiteral("Scanning addresses"),
                                         QStringLiteral("Addresses appear here as GitWallet derives and checks them."));
     ui_->noResults = page::makeNoResultsState(this);
+    ui_->nothingHere = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("Nothing here holds it"),
+                                            QStringLiteral("No address of this holds any. All states, below, shows them all."));
     root->addWidget(ui_->noWallet, 1);
     root->addWidget(ui_->waiting, 1);
     root->addWidget(ui_->noResults, 1);
+    root->addWidget(ui_->nothingHere, 1);
+    ui_->nothingHere->hide();
 
     const page::ActionBar bar = page::makeActionBar(this);
     ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search address, label or path"));
@@ -456,7 +483,8 @@ void AddressesPage::showWallet(quint32 id)
 void AddressesPage::showPlace(quint32 wallet, std::optional<wallet::Asset> asset)
 {
     ui_->inPlace = true;
-    ui_->filter->setHeld(asset, controller_ ? controller_->model() : nullptr);
+    ui_->wholeOwed = false;
+    ui_->placeState = asset ? StateFunded : StateAll;
     {
         const QSignalBlocker quietWallet(ui_->wallet);
         const QSignalBlocker quietChain(ui_->chain);
@@ -466,13 +494,10 @@ void AddressesPage::showPlace(quint32 wallet, std::optional<wallet::Asset> asset
         ui_->wallet->setCurrentIndex(walletAt >= 0 ? walletAt : 0);
         const int chainAt = asset ? ui_->chain->findData(int(wallet::assetInfo(*asset).network)) : 0;
         ui_->chain->setCurrentIndex(chainAt >= 0 ? chainAt : 0);
-        ui_->state->setCurrentIndex(asset ? StateFunded : StateAll);
+        ui_->state->setCurrentIndex(ui_->placeState);
         ui_->search->clear();
     }
-    ui_->filter->setQuery(QString());
-    ui_->filter->setWallet(wallet);
-    ui_->filter->setChain(ui_->chain->currentData().toInt());
-    ui_->filter->setState(ui_->state->currentIndex());
+    ui_->filter->setAll(wallet, ui_->chain->currentData().toInt(), ui_->placeState, asset, controller_ ? controller_->model() : nullptr);
     ui_->wallet->setVisible(false);
     ui_->chain->setVisible(!asset.has_value());
     ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
@@ -485,7 +510,17 @@ void AddressesPage::clearPlace()
     if (!ui_->inPlace)
         return;
     ui_->inPlace = false;
-    ui_->filter->setHeld(std::nullopt, nullptr);
+    // Only once it shows again: leaving for another page has no business going over every row.
+    ui_->wholeOwed = true;
+    if (isVisible())
+        becomeWhole();
+}
+
+void AddressesPage::becomeWhole()
+{
+    if (!ui_->wholeOwed)
+        return;
+    ui_->wholeOwed = false;
     {
         const QSignalBlocker quietWallet(ui_->wallet);
         const QSignalBlocker quietChain(ui_->chain);
@@ -496,14 +531,17 @@ void AddressesPage::clearPlace()
         ui_->state->setCurrentIndex(StateAll);
         ui_->search->clear();
     }
-    ui_->filter->setQuery(QString());
-    ui_->filter->setWallet(0);
-    ui_->filter->setChain(kAllChains);
-    ui_->filter->setState(StateAll);
+    ui_->filter->setAll(0, kAllChains, StateAll, std::nullopt, nullptr);
     ui_->chain->setVisible(true);
     ui_->view->setColumnHidden(AddressTableModel::ColChain, false);
     rebuildWalletFilter();
     updateState();
+}
+
+void AddressesPage::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    becomeWhole();
 }
 
 void AddressesPage::openHistoryOf(const QModelIndex& index)
@@ -783,12 +821,17 @@ void AddressesPage::updateState()
     ui_->count->setVisible(hasWallet);
 
     // Without a wallet a leftover search or filter must not turn the
-    // first-run state into "No results".
-    QWidget* empty = hasWallet ? ui_->waiting : ui_->noWallet;
-    (hasWallet ? ui_->noWallet : ui_->waiting)->hide();
+    // first-run state into "No results". In a place, only what the reader chose counts as a filter.
+    const bool scanning = controller_ && controller_->isScanning();
+    QWidget* empty = !hasWallet ? ui_->noWallet : (ui_->inPlace && !scanning && shown == 0) ? ui_->nothingHere : ui_->waiting;
+    for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->nothingHere}) {
+        if (other != empty)
+            other->hide();
+    }
+    const bool narrowed = ui_->inPlace ? ui_->state->currentIndex() != ui_->placeState : ui_->filter->filtered();
     page::showListState(ui_->view, empty, ui_->noResults, shown,
                         hasWallet ? ui_->search->text().trimmed() : QString(),
-                        hasWallet && ui_->filter->filtered());
+                        hasWallet && narrowed);
 }
 
 } // namespace app::ui

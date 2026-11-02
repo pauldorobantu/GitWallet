@@ -46,6 +46,7 @@ namespace {
 // Price refresh failures. Never carries a seed or a key.
 Q_STATIC_LOGGING_CATEGORY(lcNet, "gitwallet.net")
 
+constexpr int kGivenRetryMs = 30 * 1000;
 constexpr int kMinGap = 20;
 constexpr int kMaxGap = 5000;
 constexpr int kMinRefreshSeconds = 15;
@@ -294,6 +295,18 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     connect(scheduler_, &wallet::Scheduler::scanFinished, this, &WalletController::onScanFinished);
     connect(scheduler_, &wallet::Scheduler::problem, this, &WalletController::onScannerProblem);
 
+    givenRetry_ = new QTimer(this);
+    givenRetry_->setSingleShot(true);
+    givenRetry_->setInterval(kGivenRetryMs);
+    connect(givenRetry_, &QTimer::timeout, this, [this] {
+        // Quietly: the notice is out, and goes when this works.
+        QString why = settingsSaveBlocker();
+        if (why.isEmpty() && saveStore(&why))
+            settingsOnlyHere_ = false;
+        else
+            givenRetry_->start();
+    });
+
     connect(ledger_, &store::Ledger::loaded, this, &WalletController::onLedgerLoaded);
     connect(ledger_, &store::Ledger::problem, this, [this](const QString& message) {
         emit errorOccurred(wallet::Problem::SavedData, message, QString());
@@ -344,6 +357,11 @@ WalletController::~WalletController()
     // destroyed().
     blockSignals(true);
     stopServices();
+    // What was given out and is still not in the file, one last time.
+    if (givenOwed_ && settingsSaveBlocker().isEmpty()) {
+        QString why;
+        saveStore(&why);
+    }
     // A copy of the labels someone is counting on: nothing would otherwise be there, with part of it
     // in the clear beside it.
     for (const QPointer<QThread>& thread : std::as_const(copiesBeingWritten_)) {
@@ -807,6 +825,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
     };
     struct Chain {
         QList<Row> rows;
+        wallet::Network network{};
         int gapNow = 0;
         int gapBefore = 0;
         qint64 issued = 0; // what was given out is in a window whatever the gap
@@ -824,16 +843,24 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
         // tokens away by signature reads as unused again.
         const bool found = funded || (r.isUtxo() ? r.used : r.nonce > 0);
         Chain& chain = chains[key];
-        if (chain.rows.isEmpty() && r.change == 0) {
-            const QList<wallet::AccountKey> keys = receiveKeys(r.wallet, r.network);
-            for (const wallet::AccountKey& own : keys) {
-                if (own.type == r.type && own.account == r.account)
-                    chain.issued = own.issued;
-            }
-        }
+        chain.network = r.network;
         chain.rows.append({r.index, funded, found, r.network});
         chain.gapNow = !r.isUtxo() ? s.evmGap : r.change == 0 ? s.utxoReceiveGap : s.utxoChangeGap;
         chain.gapBefore = !r.isUtxo() ? before.evmGap : r.change == 0 ? before.utxoReceiveGap : before.utxoChangeGap;
+    }
+    // What was given out holds a window open with nothing used on it too.
+    for (const wallet::AccountKey& own : store_.allAccounts()) {
+        if (own.given.isEmpty())
+            continue;
+        for (const wallet::NetworkInfo& network : wallet::networks()) {
+            if (!own.serves(network.network))
+                continue;
+            Chain& chain = chains[QStringLiteral("%1/%2/%3/%4/0").arg(own.wallet).arg(int(network.network)).arg(int(own.type)).arg(own.account)];
+            chain.network = network.network;
+            chain.issued = own.given.end();
+            chain.gapNow = network.family != wallet::Family::Utxo ? s.evmGap : s.utxoReceiveGap;
+            chain.gapBefore = network.family != wallet::Family::Utxo ? before.evmGap : before.utxoReceiveGap;
+        }
     }
 
     // A fresh scan walks each chain from index 0, up to where the gap ends. What it
@@ -865,7 +892,7 @@ WalletController::GapImpact WalletController::gapImpact(const wallet::ScanSettin
                         ++leftOut->funded;
                 }
             }
-            reach.grown[it->rows.constFirst().network] += last + 1;
+            reach.grown[it->network] += last + 1;
         }
         return reach;
     };
@@ -1487,18 +1514,27 @@ QList<wallet::AccountKey> WalletController::receiveKeys(quint32 wallet, wallet::
     const wallet::WalletEntry* entry = store_.find(wallet);
     if (!entry)
         return out;
-    // The order of the list of coins: what it names first is what wallets take today. Keys added on
-    // their own can be of any account.
+    // The order of the list of coins: what it names first is what wallets take today.
     for (const wallet::CapturedAccount& captured : wallet::capturedAccounts()) {
-        const wallet::AccountKey* lowest = nullptr;
-        for (const wallet::AccountKey& key : entry->accounts) {
-            if (key.type == captured.type && key.serves(network) && (!lowest || key.account < lowest->account))
-                lowest = &key;
-        }
-        if (lowest && !std::any_of(out.cbegin(), out.cend(), [lowest](const wallet::AccountKey& had) { return had.type == lowest->type; }))
-            out.append(*lowest);
+        const wallet::AccountKey* key = receiveKey(wallet, network, captured.type);
+        if (key && !std::any_of(out.cbegin(), out.cend(), [key](const wallet::AccountKey& had) { return had.type == key->type; }))
+            out.append(*key);
     }
     return out;
+}
+
+// Keys added on their own can be of any account: the lowest there is of that kind.
+const wallet::AccountKey* WalletController::receiveKey(quint32 wallet, wallet::Network network, chain::ScriptType type) const
+{
+    const wallet::WalletEntry* entry = store_.find(wallet);
+    const wallet::AccountKey* lowest = nullptr;
+    if (entry) {
+        for (const wallet::AccountKey& key : entry->accounts) {
+            if (key.type == type && key.serves(network) && (!lowest || key.account < lowest->account))
+                lowest = &key;
+        }
+    }
+    return lowest;
 }
 
 QString WalletController::checkedAddress(const wallet::AddressRow& row) const
@@ -1524,17 +1560,22 @@ QString WalletController::checkedAddress(const wallet::AddressRow& row) const
 wallet::ReceiveOffer WalletController::nextReceive(quint32 wallet, wallet::Network network, chain::ScriptType type) const
 {
     wallet::ReceiveOffer offer;
-    const QList<wallet::AccountKey> keys = receiveKeys(wallet, network);
-    const auto key = std::find_if(keys.cbegin(), keys.cend(), [type](const wallet::AccountKey& k) { return k.type == type; });
-    if (key == keys.cend())
+    const wallet::AccountKey* key = receiveKey(wallet, network, type);
+    if (!key)
         return offer;
     offer.state = wallet::ReceiveOffer::State::Checking;
     if (waitingForLedger_)
         return offer; // what the database kept says what has been used
-    for (quint32 index = key->issued;; ++index) {
+    for (quint32 index = key->given.nextFree(0);; index = key->given.nextFree(index + 1)) {
         const int position = model_->find(wallet, network, type, key->account, 0, index);
-        if (position < 0)
+        if (position < 0) {
+            // No row, and none is on its way: nobody is being waited for.
+            if (scheduler_->status(network).limit) {
+                offer.state = wallet::ReceiveOffer::State::Failed;
+                offer.why = QStringLiteral("The next unused address lies past the most GitWallet follows. The limit rises with the gaps in Settings, and falls with fewer wallets.");
+            }
             return offer;
+        }
         const wallet::AddressRow& row = model_->at(position);
         if (row.used || row.state() == wallet::AddressState::Funded)
             continue;
@@ -1554,52 +1595,83 @@ wallet::ReceiveOffer WalletController::nextReceive(quint32 wallet, wallet::Netwo
     }
 }
 
-bool WalletController::markGivenOut(quint32 wallet, wallet::Network network, chain::ScriptType type, quint32 index, QString* error)
+bool WalletController::isGivenOut(const wallet::AddressRow& row) const
+{
+    if (row.change != 0)
+        return false;
+    const wallet::AccountKey* key = receiveKey(row.wallet, row.network, row.type);
+    return key && key->account == row.account && key->given.contains(row.index);
+}
+
+bool WalletController::markGivenOut(const wallet::AddressRow& row, QString* error)
 {
     setError(error, QString());
-    const QList<wallet::AccountKey> keys = receiveKeys(wallet, network);
-    const auto chosen = std::find_if(keys.cbegin(), keys.cend(), [type](const wallet::AccountKey& k) { return k.type == type; });
-    if (chosen == keys.cend())
+    if (row.change != 0 || row.used || row.state() == wallet::AddressState::Funded)
         return true;
-    for (wallet::WalletEntry& entry : store_.wallets) {
-        if (entry.id != wallet)
-            continue;
-        for (wallet::AccountKey& key : entry.accounts) {
-            if (key.type != type || key.account != chosen->account || !key.serves(network))
-                continue;
-            if (index < key.issued)
-                return true; // given out already
-            if (key.issued == 0)
-                key.issuedFrom = index;
-            key.issued = index + 1;
-            const wallet::AccountKey marked = key;
-            scheduler_->noteIssued(marked);
-            emit givenOutChanged();
-            QString why = settingsSaveBlocker();
-            if (why.isEmpty() && saveStore(&why))
-                settingsOnlyHere_ = false; // what was for this session only has gone with it
-            if (why.isEmpty())
-                return true;
-            setError(error, QStringLiteral("It could not be written down, so another start may offer it again: %1").arg(why));
-            return false;
-        }
+    auto* key = const_cast<wallet::AccountKey*>(receiveKey(row.wallet, row.network, row.type));
+    if (!key || key->account != row.account || key->given.contains(row.index))
+        return true;
+    key->given.add(row.index);
+    const wallet::AccountKey marked = *key;
+    scheduler_->noteGiven(marked, row.index);
+    emit givenOutChanged();
+    return saveGivenOut(error);
+}
+
+bool WalletController::saveGivenOut(QString* error)
+{
+    QString why = settingsSaveBlocker();
+    if (why.isEmpty() && saveStore(&why)) {
+        settingsOnlyHere_ = false; // what was for this session only has gone with it
+        return true;
     }
-    return true;
+    const QString message = QStringLiteral("An address given out could not be written down, so another start may offer it again: %1. This is tried again every half a minute.").arg(why);
+    setError(error, message);
+    givenRetry_->start();
+    if (!givenOwed_) {
+        givenOwed_ = true;
+        emit errorOccurred(wallet::Problem::GivenOutNotKept, message, QString());
+    }
+    return false;
 }
 
 QList<int> WalletController::givenOutRows(quint32 wallet, wallet::Network network, chain::ScriptType type, int limit) const
 {
     QList<int> out;
-    const QList<wallet::AccountKey> keys = receiveKeys(wallet, network);
-    const auto key = std::find_if(keys.cbegin(), keys.cend(), [type](const wallet::AccountKey& k) { return k.type == type; });
-    if (key == keys.cend())
+    const wallet::AccountKey* key = receiveKey(wallet, network, type);
+    if (!key)
         return out;
-    for (quint32 index = key->issued; index > key->issuedFrom && out.size() < limit; --index) {
-        const int position = model_->find(wallet, network, type, key->account, 0, index - 1);
-        if (position >= 0)
-            out.append(position);
+    for (auto run = key->given.runs.crbegin(); run != key->given.runs.crend(); ++run) {
+        for (quint32 index = run->to; index > run->from && out.size() < limit; --index) {
+            const int position = model_->find(wallet, network, type, key->account, 0, index - 1);
+            if (position >= 0)
+                out.append(position);
+        }
     }
     return out;
+}
+
+int WalletController::givenOutWaiting(quint32 wallet) const
+{
+    int waiting = 0;
+    for (const wallet::WalletEntry& entry : store_.wallets) {
+        if (wallet != 0 && entry.id != wallet)
+            continue;
+        for (const wallet::AccountKey& key : entry.accounts) {
+            // One network is enough: an Ethereum address is the same on all of them.
+            const auto network = std::find_if(wallet::networks().cbegin(), wallet::networks().cend(), [&key](const wallet::NetworkInfo& n) { return key.serves(n.network); });
+            if (network == wallet::networks().cend())
+                continue;
+            for (const wallet::GivenOut::Run& run : key.given.runs) {
+                for (quint32 index = run.from; index < run.to; ++index) {
+                    const int position = model_->find(entry.id, network->network, key.type, key.account, 0, index);
+                    if (position < 0 || (!model_->at(position).used && model_->at(position).state() != wallet::AddressState::Funded))
+                        ++waiting;
+                }
+            }
+        }
+    }
+    return waiting;
 }
 
 double WalletController::usdValue(wallet::Asset asset) const
@@ -1939,6 +2011,12 @@ bool WalletController::saveStore(QString* why)
         return false;
     store_.forgetOlderFormat();
     fileDigest_ = digest;
+    // Any write takes along what was given out and owed. Posted: this may be half way through a change.
+    if (givenOwed_) {
+        givenOwed_ = false;
+        givenRetry_->stop();
+        QTimer::singleShot(0, this, &WalletController::statusChanged);
+    }
     return true;
 }
 

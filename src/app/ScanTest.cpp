@@ -1329,7 +1329,8 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
 {
     {
         wallet::AccountKey key = segwit;
-        key.issued = 30;
+        for (quint32 index = 0; index < 30; ++index)
+            key.given.add(index);
         FakeElectrum server;
         wallet::WalletModel model;
         UtxoRun run(&model, server, key, 5, 5);
@@ -1338,7 +1339,8 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         server.fund(scripthashOf(key, 0, 29), 400);
         server.notify(scripthashOf(key, 0, 29));
         check(waitFor([&run] { return run.total() == 400; }, 5000), QStringLiteral("a payment to the last one shows by notification"));
-        check(waitFor([&model] { return model.size() == 35 + 5; }, 500), QStringLiteral("the window stays where it was: that one was inside it"));
+        pause(500);
+        check(model.size() == 35 + 5, QStringLiteral("the window stays where it was: that one was inside it"));
         server.fund(scripthashOf(key, 0, 34), 100);
         server.notify(scripthashOf(key, 0, 34));
         check(waitFor([&model] { return model.size() == 40 + 5; }, 5000), QStringLiteral("and one past it moves it on (%1)").arg(model.size()));
@@ -1351,51 +1353,74 @@ void testGivenOutScans(const Check& check, const wallet::AccountKey& segwit, con
         UtxoRun growing(&fresh, quiet, none, 5, 5);
         check(waitFor([&growing] { return growing.finished; }, 15000), QStringLiteral("a wallet scans its window"));
         const int before = fresh.size();
-        none.issued = before + 20;
-        growing.scanner.noteIssued(none);
+        none.given.add(quint32(before + 19));
+        growing.scanner.noteGiven(none, quint32(before + 19));
         // Its gap past what was given out, on the receive chain, beside the change chain's.
         const int top = before + 30;
         const bool followed = waitFor([&fresh, top] { return fresh.size() == top; }, 8000);
         check(followed, QStringLiteral("given out far past it, the window follows at once (%1 from %2)").arg(fresh.size()).arg(before));
-        none.issued = 2;
-        growing.scanner.noteIssued(none);
+        none.given.add(2);
+        growing.scanner.noteGiven(none, 2);
         pause(200);
-        check(fresh.size() == top, QStringLiteral("and what was given out earlier does not take it back"));
+        check(fresh.size() == top, QStringLiteral("and one given out below that does not take it back"));
     }
-    // With too few places for all: what was given out goes ahead of the far end.
+    // With too few places for all: what was given out goes ahead, wherever it lies.
     {
-        wallet::UtxoScanner::setLivePlacesForTest(10);
+        wallet::UtxoScanner::setLivePlacesForTest(40);
         wallet::UtxoScanner::setPacesForTest(300, 200, 100);
         wallet::AccountKey key = segwit;
-        key.issued = 5;
+        key.given.add(70); // far past what the next unused ones reach, with a gap of 100
         FakeElectrum server;
+        server.fund(scripthashOf(key, 0, 90), 800); // something used past it
         wallet::WalletModel model;
-        UtxoRun run(&model, server, key, 20, 5);
-        check(waitFor([&run] { return run.finished; }, 20000), QStringLiteral("past its live places it scans"));
-        check(server.follows(scripthashOf(key, 0, 4)), QStringLiteral("what was given out is followed"));
-        check(!server.follows(scripthashOf(key, 0, 24)), QStringLiteral("what is far past it is not"));
-        const wallet::ScanTiers tiers = run.scanner.tiers();
-        check(tiers.live <= 10 && tiers.live + tiers.rounds == model.size(), QStringLiteral("within the places there are"));
-        run.scanner.stop();
+        {
+            UtxoRun run(&model, server, key, 100, 5);
+            check(waitFor([&run] { return run.finished; }, 30000), QStringLiteral("past its live places it scans"));
+            check(run.scanner.tiers().rounds > 0, QStringLiteral("not all of it followed live"));
+            check(server.follows(scripthashOf(key, 0, 70)), QStringLiteral("what was given out is followed, though a later one was paid"));
+            check(!server.follows(scripthashOf(key, 0, 50)), QStringLiteral("what lies before it and was never given out is not"));
+
+            // Given out while it runs, below what was used.
+            check(run.scanner.tiers().live < 40, QStringLiteral("with a place left"));
+            key.given.add(50);
+            run.scanner.noteGiven(key, 50);
+            check(waitFor([&server, &key] { return server.follows(scripthashOf(key, 0, 50)); }, 10000), QStringLiteral("given out now, it goes live at once"));
+
+            // Paid, it has done what it was followed for.
+            server.fund(scripthashOf(key, 0, 50), 300);
+            server.notify(scripthashOf(key, 0, 50));
+            check(waitFor([&run] { return run.total() == 1100; }, 5000), QStringLiteral("and its payment shows by notification"));
+            run.scanner.stop();
+        }
+        {
+            // From what was saved, the same.
+            FakeElectrum again;
+            again.fund(scripthashOf(key, 0, 90), 800);
+            again.fund(scripthashOf(key, 0, 50), 300);
+            UtxoRun second(&model, again, key, 100, 5);
+            check(waitFor([&second] { return second.finished; }, 30000), QStringLiteral("a new start scans from what was saved"));
+            check(again.follows(scripthashOf(key, 0, 70)), QStringLiteral("and what is still waiting for its payment is followed"));
+            second.scanner.stop();
+        }
         wallet::UtxoScanner::setLivePlacesForTest(wallet::UtxoScanner::kMaxLiveRows);
     }
     {
         wallet::AccountKey key = account;
-        key.issued = 8;
+        key.given.add(7);
         FakeRpc rpc;
         wallet::WalletModel model;
         EvmRun run(&model, {rpc.url()}, key, 5);
         check(waitFor([&run] { return run.finished; }, 15000), QStringLiteral("an Ethereum account that has given out 8 addresses scans"));
         check(model.size() == 13 && model.checkedCount() == 13, QStringLiteral("to the gap past those, every row answered (%1)").arg(model.size()));
-        key.issued = 12;
-        run.scanner.noteIssued(key);
+        key.given.add(11);
+        run.scanner.noteGiven(key, 11);
         check(waitFor([&model] { return model.size() == 17 && model.checkedCount() == 17; }, 10000), QStringLiteral("given out while it runs, its rows come and are read without waiting for a refresh (%1)").arg(model.size()));
         run.scanner.stop();
     }
     // An endpoint that said a lie leaves what was given out where it is.
     {
         wallet::AccountKey key = account;
-        key.issued = 7;
+        key.given.add(6);
         FakeRpc rpc;
         for (quint32 i = 0; i < 20; ++i)
             rpc.nonces.insert(evmAddress(key, i), 1);

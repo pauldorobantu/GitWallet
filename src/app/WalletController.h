@@ -184,12 +184,18 @@ public:
     // The next address of one of them. Always derived here and now from the key: what is kept beside
     // it only says which index is next, and if it says another address for that index, none is offered.
     wallet::ReceiveOffer nextReceive(quint32 wallet, wallet::Network network, chain::ScriptType type) const;
-    // The address at `index` of that key was given out: neither it nor any before it is offered again,
-    // and it is followed ahead of others. It holds for this session in any case; false + why when it
-    // cannot be written down, and another start would offer it again.
-    bool markGivenOut(quint32 wallet, wallet::Network network, chain::ScriptType type, quint32 index, QString* error);
+    // That address left this PC's screen for someone who is to pay: it is not offered again, and it is
+    // followed ahead of others until it is paid. Only a receive address of one of those keys with no
+    // history counts: others are no one's to be given. It holds for this session in any case; false +
+    // why when it cannot be written down, and then that is tried again until it is.
+    bool markGivenOut(const wallet::AddressRow& row, QString* error);
+    bool isGivenOut(const wallet::AddressRow& row) const;
     // Positions in the model of what was given out on that key, the latest first, at most `limit`.
     QList<int> givenOutRows(quint32 wallet, wallet::Network network, chain::ScriptType type, int limit) const;
+    // Addresses given out with nothing come in yet, of one wallet or all: removed, they would be
+    // offered again if the seed comes back.
+    int givenOutWaiting(quint32 wallet = 0) const;
+    bool givenOutOwed() const { return givenOwed_; } // what was given out has yet to reach the file
 
     double usdValue(wallet::Asset asset) const; // total of `asset` at the latest price
     double totalUsd() const;
@@ -210,6 +216,8 @@ signals:
 
 private:
     // --- implementation (WalletController.cpp may add private members) ---
+    const wallet::AccountKey* receiveKey(quint32 wallet, wallet::Network network, chain::ScriptType type) const; // the one Receive goes by
+    bool saveGivenOut(QString* why);
     // What statusText() leads with, the most pressing first.
     enum class Status {
         NoWallet,
@@ -276,6 +284,8 @@ private:
     QTimer* timesTimer_ = nullptr;
     QTimer* ledgerRetry_ = nullptr; // the data folder is held: asks again until it is free
     int ledgerRetries_ = 0;
+    QTimer* givenRetry_ = nullptr;  // what was given out did not reach the file: asks again until it does
+    bool givenOwed_ = false;
     int rowsBeforeLedger_ = 0;      // rows with an answer in the model when the database was opened
     bool settingsOnlyHere_ = false; // the settings in use are not what wallet.dat holds
     bool olderCopied_ = false;      // this session has made the way back from an older wallet.dat

@@ -53,7 +53,7 @@ public:
     void start() override;
     void stop() override;
     void refreshNow() override;
-    void noteIssued(const AccountKey& key) override;
+    void noteGiven(const AccountKey& key, quint32 index) override;
     void restoreTimes(const QDateTime& balancesAt, const QDateTime& noncesAt, const NonceSweep& sweep) override;
     // http://127.0.0.1 endpoints too, for a test's server on this PC.
     void allowLocalHttpForTest();

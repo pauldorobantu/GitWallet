@@ -42,7 +42,8 @@ enum Role {
     kSubRole,   // the line under the name
     kAssetRole, // a row of a coin
     kWalletRole, // a row of a wallet
-    kHoldsRole,  // known to hold something, or not known to hold nothing
+    kHoldsRole,  // a key looks at it, and it holds something or is not known to hold nothing
+    kWatchedRole, // a key looks at it
 };
 
 enum class Kind { Coins, WalletsOfCoin, AssetsOfAddress };
@@ -51,31 +52,6 @@ using figures::atLeast;
 using figures::dash;
 using figures::formatCount;
 using figures::formatUsd;
-
-// Why a figure is not final, and how current what is known of it is.
-QString noteOf(const WalletController* controller, const Holding& holding)
-{
-    const wallet::AssetInfo& info = wallet::assetInfo(holding.asset);
-    const wallet::NetworkInfo& network = wallet::networkInfo(info.network);
-    if (!holding.watched)
-        return trText(QStringLiteral("No wallet has a key on %1")).arg(network.name);
-    QStringList parts;
-    if (holding.pending > 0)
-        parts << trText(holding.pending == 1 ? QStringLiteral("%1 address not checked yet") : QStringLiteral("%1 addresses not checked yet"))
-                     .arg(formatCount(holding.pending));
-    if (controller->addressLimitReached())
-        parts << trText(QStringLiteral("address limit reached"));
-    const wallet::NetworkStatus status = controller->networkStatus(info.network);
-    if ((status.wrongChain || status.failing || status.connecting) && status.balancesAt.isValid())
-        parts << trText(QStringLiteral("as of %1")).arg(status.balancesAt.toLocalTime().toString(QStringLiteral("d MMM HH:mm")));
-    else if (status.wrongChain)
-        parts << trText(QStringLiteral("server on another chain"));
-    else if (status.failing)
-        parts << trText(QStringLiteral("lookups failing"));
-    else if (holding.complete && status.scanning)
-        parts << (controller->showingSaved() ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning")));
-    return parts.join(QStringLiteral(" · "));
-}
 
 // One row of the table: the figures of a moment, so that sorting and painting read no model.
 struct Line {
@@ -151,7 +127,7 @@ public:
             case ColAmount: return h.amountText();
             case ColValue: return h.usdText();
             case ColShare: return line.share >= 0.0 ? QStringLiteral("%1%").arg(line.share * 100.0, 0, 'f', 1) : dash();
-            case ColAddresses: return h.watched ? formatCount(h.holders) : dash();
+            case ColAddresses: return h.holdersText();
             case ColGo: return line.chosen ? QStringLiteral("›") : QString();
             default: return {};
             }
@@ -164,8 +140,11 @@ public:
         case kWalletRole:
             return line.wallet;
         case kHoldsRole:
-            // Only a figure that answered says "nothing": "—" is no zero.
-            return h.holds() || !h.complete || !h.watched;
+            // Only a figure that answered says "nothing": "—" is no zero. With no key there is nothing
+            // to hold or to wait for.
+            return h.watched && (h.holds() || !h.complete);
+        case kWatchedRole:
+            return h.watched;
         case kSortRole:
             switch (column) {
             case ColName: return line.name;
@@ -206,8 +185,8 @@ private:
     QList<Line> lines_;
 };
 
-// The rows known to hold nothing go, unless that is all there is: a page with nothing on it says
-// nothing, and a coin not yet answered for is no zero.
+// The rows known to hold nothing go, and those no key looks at, unless that is all there is: a page
+// with nothing on it says nothing, and a coin not yet answered for is no zero.
 class HoldingsFilter : public QSortFilterProxyModel
 {
 public:
@@ -225,6 +204,13 @@ public:
     void linesChanged()
     {
         beginFilterChange();
+        anyHolds_ = false;
+        anyWatched_ = false;
+        const QAbstractItemModel* source = sourceModel();
+        for (int row = 0; source && row < source->rowCount(); ++row) {
+            anyHolds_ = anyHolds_ || source->index(row, 0).data(kHoldsRole).toBool();
+            anyWatched_ = anyWatched_ || source->index(row, 0).data(kWatchedRole).toBool();
+        }
         endFilterChange(Direction::Rows);
     }
 
@@ -234,17 +220,18 @@ protected:
         const QAbstractItemModel* source = sourceModel();
         if (!hide_ || !source)
             return true;
-        if (source->index(row, 0, parent).data(kHoldsRole).toBool())
+        const QModelIndex first = source->index(row, 0, parent);
+        if (first.data(kHoldsRole).toBool())
             return true;
-        for (int other = 0; other < source->rowCount(parent); ++other) {
-            if (source->index(other, 0, parent).data(kHoldsRole).toBool())
-                return false;
-        }
-        return true;
+        if (anyHolds_)
+            return false;
+        return first.data(kWatchedRole).toBool() || !anyWatched_;
     }
 
 private:
     bool hide_ = false;
+    bool anyHolds_ = false;
+    bool anyWatched_ = false;
 };
 
 // A mark and two lines of text in one cell.
@@ -321,10 +308,61 @@ Coverage coverageOf(const WalletController* controller, wallet::Network network,
 
 // ---------------------------------------------------------------- the figures ----
 
+QString holdingNote(const WalletController* controller, const Holding& holding)
+{
+    const wallet::AssetInfo& info = wallet::assetInfo(holding.asset);
+    const wallet::NetworkInfo& network = wallet::networkInfo(info.network);
+    if (!holding.watched)
+        return (holding.oneWallet ? trText(QStringLiteral("This wallet has no key on %1")) : trText(QStringLiteral("No wallet has a key on %1"))).arg(network.name);
+    QStringList parts;
+    if (controller->loadingSaved())
+        parts << trText(QStringLiteral("saved figures still being read"));
+    if (holding.pending > 0)
+        parts << trText(holding.pending == 1 ? QStringLiteral("%1 address not checked yet") : QStringLiteral("%1 addresses not checked yet"))
+                     .arg(formatCount(holding.pending));
+    else if (holding.missing)
+        parts << trText(QStringLiteral("not all checked yet"));
+    if (holding.unread)
+        parts << trText(QStringLiteral("a key this version cannot read"));
+    if (controller->addressLimitReached())
+        parts << trText(QStringLiteral("address limit reached"));
+    const wallet::NetworkStatus status = controller->networkStatus(info.network);
+    if ((status.wrongChain || status.failing || status.connecting) && status.balancesAt.isValid())
+        parts << trText(QStringLiteral("as of %1")).arg(status.balancesAt.toLocalTime().toString(QStringLiteral("d MMM HH:mm")));
+    else if (status.wrongChain)
+        parts << trText(QStringLiteral("server on another chain"));
+    else if (status.failing)
+        parts << trText(QStringLiteral("lookups failing"));
+    else if (holding.complete && status.scanning)
+        parts << (controller->showingSaved() ? trText(QStringLiteral("saved, being checked")) : trText(QStringLiteral("still scanning")));
+    return parts.join(QStringLiteral(" · "));
+}
+
+Holding holdingAt(const WalletController* controller, const wallet::AddressRow& row, wallet::Asset asset)
+{
+    Holding h;
+    const wallet::AssetInfo& info = wallet::assetInfo(asset);
+    h.asset = asset;
+    h.amount = row.amount(asset);
+    h.watched = true;
+    h.oneWallet = true;
+    h.complete = row.checked;
+    h.pending = row.checked ? 0 : 1;
+    h.holders = h.holds() ? 1 : 0;
+    h.price = controller && controller->prices() ? controller->prices()->usd(asset) : 0.0;
+    try {
+        h.usd = h.amount.toDouble(info.decimals) * h.price;
+    } catch (const std::exception&) {
+        h.readable = false;
+    }
+    return h;
+}
+
 Holding holdingOf(const WalletController* controller, wallet::Asset asset, quint32 wallet)
 {
     Holding h;
     h.asset = asset;
+    h.oneWallet = wallet != 0;
     const wallet::WalletModel* model = controller ? controller->model() : nullptr;
     if (!model)
         return h;
@@ -332,8 +370,11 @@ Holding holdingOf(const WalletController* controller, wallet::Asset asset, quint
     const Coverage coverage = coverageOf(controller, info.network, wallet);
     h.watched = coverage.watched;
     h.pending = wallet != 0 ? model->uncheckedOn(info.network, wallet) : model->uncheckedOn(info.network);
-    h.complete = h.watched && h.pending == 0 && !coverage.missing && !controller->addressLimitReached() && !controller->loadingSaved()
-                 && !controller->hasUnreadKeys();
+    h.missing = coverage.missing;
+    // A key of one wallet that this version cannot read says nothing of another wallet's figures.
+    const wallet::WalletEntry* entry = wallet != 0 ? controller->store().find(wallet) : nullptr;
+    h.unread = wallet != 0 ? (entry && !entry->keptAccounts.isEmpty()) : controller->hasUnreadKeys();
+    h.complete = h.watched && h.pending == 0 && !coverage.missing && !controller->addressLimitReached() && !controller->loadingSaved() && !h.unread;
     h.holders = wallet != 0 ? model->holders(asset, wallet) : model->holders(asset);
     h.price = controller->prices() ? controller->prices()->usd(asset) : 0.0;
     h.amount = wallet != 0 ? model->total(asset, wallet) : model->total(asset);
@@ -367,6 +408,14 @@ QString Holding::usdText() const
     if (!watched || !readable || price <= 0.0 || (!complete && !holds()))
         return figures::dash();
     const QString shown = figures::formatUsd(usd);
+    return complete ? shown : figures::atLeast(shown);
+}
+
+QString Holding::holdersText() const
+{
+    if (!watched || (!complete && holders == 0))
+        return figures::dash();
+    const QString shown = figures::formatCount(holders);
     return complete ? shown : figures::atLeast(shown);
 }
 
@@ -478,6 +527,7 @@ struct HoldingsTable::Ui : QObject
     quint32 wallet = 0;
     wallet::Asset asset{};
     wallet::AddressRow row;
+    bool sharesKnown = false; // every figure is final and priced: what a share is of is known
 };
 
 HoldingsTable::HoldingsTable(WalletController* controller, QWidget* parent)
@@ -524,9 +574,6 @@ HoldingsTable::HoldingsTable(WalletController* controller, QWidget* parent)
     });
 
     const auto open = [this](const QModelIndex& index) {
-        // What opened this list was a click, and maybe the first of two.
-        if (sinceOpened_.isValid() && sinceOpened_.elapsed() < QApplication::doubleClickInterval())
-            return;
         const QModelIndex source = ui_->filter->mapToSource(index);
         if (!source.isValid() || source.row() >= ui_->model->lines().size())
             return;
@@ -567,7 +614,6 @@ void HoldingsTable::queueRefresh()
 
 void HoldingsTable::opened()
 {
-    sinceOpened_.start();
     applyKind();
     refresh();
     ui_->filter->sort(ColValue, Qt::DescendingOrder);
@@ -629,18 +675,25 @@ int HoldingsTable::rowsShown() const
 int HoldingsTable::rowsHolding() const
 {
     const QList<Line>& lines = ui_->model->lines();
-    return int(std::count_if(lines.cbegin(), lines.cend(), [](const Line& line) { return line.holding.holds(); }));
+    return int(std::count_if(lines.cbegin(), lines.cend(), [](const Line& line) { return line.holding.watched && line.holding.holds(); }));
+}
+
+bool HoldingsTable::allFinal() const
+{
+    const QList<Line>& lines = ui_->model->lines();
+    return std::all_of(lines.cbegin(), lines.cend(), [](const Line& line) { return !line.holding.watched || line.holding.complete; });
 }
 
 int HoldingsTable::rowsTotal() const
 {
-    return int(ui_->model->lines().size());
+    const QList<Line>& lines = ui_->model->lines();
+    return int(std::count_if(lines.cbegin(), lines.cend(), [](const Line& line) { return line.holding.watched; }));
 }
 
 QList<AllocationBar::Part> HoldingsTable::parts() const
 {
     QList<AllocationBar::Part> out;
-    if (ui_->kind == Kind::WalletsOfCoin)
+    if (ui_->kind == Kind::WalletsOfCoin || !ui_->sharesKnown)
         return out;
     for (const Line& line : ui_->model->lines())
         out.append({coinColor(wallet::assetInfo(line.asset)), line.holding.usd, line.name});
@@ -665,7 +718,6 @@ void HoldingsTable::refresh()
             line.sub = entry.fromKeys ? trText(QStringLiteral("Public keys")) : trText(QStringLiteral("Seed"));
             line.icon = nameIcon(entry.label);
             line.holding = holdingOf(controller_, info.asset, entry.id);
-            line.note = noteOf(controller_, line.holding);
             line.chosen = line.holding.watched;
             lines.append(line);
         }
@@ -677,7 +729,6 @@ void HoldingsTable::refresh()
             line.sub = info.standard.isEmpty() ? info.symbol : QStringLiteral("%1 · %2").arg(info.symbol, info.standard);
             line.icon = coinIcon(info);
             line.holding = holdingOf(controller_, info.asset, ui_->wallet);
-            line.note = noteOf(controller_, line.holding);
             line.chosen = line.holding.watched;
             lines.append(line);
         }
@@ -696,32 +747,25 @@ void HoldingsTable::refresh()
                 line.sub = info.standard.isEmpty() ? info.symbol : QStringLiteral("%1 · %2").arg(info.symbol, info.standard);
                 line.icon = coinIcon(info);
                 line.chosen = false;
-                Holding& h = line.holding;
-                h.asset = asset;
-                h.amount = row.amount(asset);
-                h.watched = true;
-                h.complete = row.checked;
-                h.pending = row.checked ? 0 : 1;
-                h.holders = h.holds() ? 1 : 0;
-                h.price = controller_->prices() ? controller_->prices()->usd(asset) : 0.0;
-                try {
-                    h.usd = h.amount.toDouble(info.decimals) * h.price;
-                } catch (const std::exception&) {
-                    h.readable = false;
-                }
-                line.note = noteOf(controller_, h);
+                line.holding = holdingAt(controller_, row, asset);
                 lines.append(line);
             }
         }
     }
+    // A share is of a whole: it takes every figure final, and a price for all that is held.
     double all = 0.0;
     bool every = true;
-    for (const Line& line : std::as_const(lines)) {
-        all += line.holding.usd;
-        every = every && (!line.holding.holds() || line.holding.price > 0.0);
-    }
     for (Line& line : lines) {
-        if (all > 0.0 && every && line.holding.watched)
+        all += line.holding.usd;
+        every = every && (!line.holding.watched || (line.holding.complete && line.holding.readable && (!line.holding.holds() || line.holding.price > 0.0)));
+        // What keeps it from final can be read without hovering, under its name.
+        line.note = holdingNote(controller_, line.holding);
+        if (!line.note.isEmpty() && line.holding.watched)
+            line.sub += QStringLiteral(" · ") + line.note;
+    }
+    ui_->sharesKnown = all > 0.0 && every;
+    for (Line& line : lines) {
+        if (ui_->sharesKnown && line.holding.watched)
             line.share = line.holding.usd / all;
     }
     ui_->model->setLines(std::move(lines));

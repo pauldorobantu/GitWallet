@@ -552,8 +552,31 @@ void HistoryPage::updateState()
             said << trText(QStringLiteral("waiting for a server"));
     } else if (hasWallet && total > 0 && sum.refused == 0 && sum.unproven == 0 && sum.differing == 0 && controller_->figuresCurrent()) {
         // Only of what the servers have said: while they have not, or not of every address, it would
-        // claim what nobody knows yet.
-        said << trText(QStringLiteral("Every transaction is read, and what is in a block has its proof checked on this PC"));
+        // claim what nobody knows yet. And only of the networks that have a history at all.
+        QStringList read;
+        const QList<wallet::UtxoHistory*> histories = controller_->histories();
+        for (const wallet::UtxoHistory* history : histories) {
+            if (history->running())
+                read << wallet::networkInfo(history->network()).name;
+        }
+        said << trText(QStringLiteral("Every %1 transaction is read, and what is in a block has its proof checked on this PC")).arg(read.join(QStringLiteral(", ")));
+    }
+    // A key on a network with no history yet has transactions nobody here has read.
+    QStringList unread;
+    if (hasWallet) {
+        const quint32 scope = ui_->inPlace ? ui_->model->filter().wallet : 0;
+        for (const wallet::NetworkInfo& network : wallet::networks()) {
+            if (controller_->historyOf(network.network) || (ui_->network && *ui_->network != network.network))
+                continue;
+            for (const wallet::WalletEntry& entry : controller_->store().wallets) {
+                if ((scope == 0 || entry.id == scope) && std::any_of(entry.accounts.cbegin(), entry.accounts.cend(), [&network](const wallet::AccountKey& key) { return key.serves(network.network); })) {
+                    unread << network.name;
+                    break;
+                }
+            }
+        }
+        if (!unread.isEmpty())
+            said << trText(QStringLiteral("The history of %1 is not read yet")).arg(unread.join(QStringLiteral(", ")));
     }
     if (sum.refused > 0) {
         said << trText(QStringLiteral("%1 addresses could not be read whole from this server")).arg(grouped(sum.refused));
@@ -571,8 +594,20 @@ void HistoryPage::updateState()
     setTone(ui_->status, tone);
     ui_->status->setVisible(!said.isEmpty());
 
-    // A network with no book: nothing below could say anything of it.
-    const bool notRead = ui_->network && controller_ && !controller_->historyOf(*ui_->network);
+    // Only a network with no book in what the place covers: nothing below could say anything of it.
+    bool anyBook = false;
+    if (hasWallet) {
+        const quint32 scope = ui_->inPlace ? ui_->model->filter().wallet : 0;
+        for (const wallet::UtxoHistory* history : controller_->histories()) {
+            if (ui_->network && history->network() != *ui_->network)
+                continue;
+            for (const wallet::WalletEntry& entry : controller_->store().wallets) {
+                if ((scope == 0 || entry.id == scope) && std::any_of(entry.accounts.cbegin(), entry.accounts.cend(), [history](const wallet::AccountKey& key) { return key.serves(history->network()); }))
+                    anyBook = true;
+            }
+        }
+    }
+    const bool notRead = ui_->inPlace && hasWallet && !anyBook && !unread.isEmpty();
     ui_->notRead->setVisible(notRead);
     for (QWidget* control : std::initializer_list<QWidget*>{ui_->search, ui_->type, ui_->state, ui_->period, ui_->count})
         control->setVisible(!notRead && (control != ui_->count || hasWallet));
@@ -589,7 +624,8 @@ void HistoryPage::updateState()
     QWidget* empty = hasWallet ? ui_->waiting : ui_->noWallet;
     (hasWallet ? ui_->noWallet : ui_->waiting)->hide();
     const HistoryTableModel::Filter& filter = ui_->model->filter();
-    const bool narrowed = filter.wallet != 0 || filter.kind >= 0 || filter.state >= 0 || filter.from > 0;
+    // Only what the reader can change is a filter: not what the place came up on.
+    const bool narrowed = (filter.wallet != 0 && !ui_->inPlace) || filter.kind >= 0 || filter.state >= 0 || filter.from > 0;
     page::showListState(ui_->view, empty, ui_->noResults, shown, hasWallet ? filter.query : QString(), hasWallet && narrowed && total > 0);
 }
 

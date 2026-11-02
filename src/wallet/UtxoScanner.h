@@ -75,7 +75,7 @@ public:
     void stop() override;
     // A round begins now, if none is under way: what is followed live needs no asking.
     void refreshNow() override;
-    void noteIssued(const AccountKey& key) override;
+    void noteGiven(const AccountKey& key, quint32 index) override;
     void restoreTimes(const QDateTime& balancesAt, const QDateTime& noncesAt, const NonceSweep& sweep) override;
 
     bool hasAccounts() const override { return !accounts_.isEmpty(); }
@@ -113,7 +113,8 @@ private:
         int next = 0;         // next index to derive (or adopt from the model)
         int lastUsed = -1;    // highest index this run has seen used
         int savedUsed = -1;   // highest index the rows in the model say is used: only says what to follow first
-        int issued = 0;       // rows below this were given out: a payment comes to those, so they count as used
+        GivenOut given;       // receive rows given out: a payment comes to those
+        int issued = 0;       // one past the highest of them: they count as used for the window
         bool reuse = true;    // the rows already in the model came from this xpub
 
         int window() const;   // max(floor, the later of lastUsed + 1 and issued, + gap); may exceed what may be derived
@@ -198,6 +199,7 @@ private:
     void rebalanceLive();             // every row's place, once, when who deserves one changed
     int hotAhead(const Chain& c) const; // unused addresses after the last used one a chain keeps live
     bool isNext(const Chain& c, int index) const; // one of those
+    bool waitingForPayment(const Chain& c, int index, const AddressRow& row) const; // given out, and no history yet
     bool wantsLive(const Chain& c, int index, const AddressRow& row) const;
     bool mayGoLive(Tracked& tracked, const Chain& c, int index); // there is a place for it: takes it
     void placeRow(const QString& scripthash, const Chain& c, int index, const AddressRow& row);

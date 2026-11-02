@@ -8,6 +8,7 @@
 
 class QLabel;
 class QPushButton;
+class QTimer;
 class QVBoxLayout;
 class QStackedWidget;
 
@@ -52,6 +53,7 @@ public:
     PlaceBar* placeBar() const { return placeBar_; }
 
 protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
     bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
     void changeEvent(QEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
@@ -100,6 +102,7 @@ private:
     void leavePlace();         // the pages are no longer narrowed to one
     void openRoot(Place::Root root);
     void editAddressLabel(const QString& address);
+    void swallowSecondClick(); // a click just opened something: a second one so soon was not for that
     void afterWalletChange();  // what the reader was on may be gone
     void openImportDialog(bool many); // `many`: on the list of seeds rather than one seed
     void loadWallet();
@@ -133,6 +136,7 @@ private:
     QStringList toastQueue_; // keys of the notices the next toast is about
     bool toastPosted_ = false;
     bool loadAttempted_ = false;
+    QTimer* clickGuard_ = nullptr;
 };
 
 } // namespace app::ui

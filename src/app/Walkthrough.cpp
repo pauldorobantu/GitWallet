@@ -546,10 +546,12 @@ void Walkthrough::buildSteps()
         {QStringLiteral("portfolio"),
          [this] {
              window_->showPage(QStringLiteral("portfolio"));
-             if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")))
+             if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero"))) {
+                 hideZeroWas_ = hide->isChecked();
                  hide->setChecked(false);
+             }
          },
-         nullptr, 1000,
+         [controller] { return ui::totalOf(controller()).complete; }, 15000,
          [this, coinTable, controller] {
              expect(coinTable()->model()->rowCount() == wallet::assets().size(), QStringLiteral("the Portfolio has a row per coin"));
              auto* total = window_->findChild<QLabel*>(QStringLiteral("heroValue"));
@@ -559,10 +561,15 @@ void Walkthrough::buildSteps()
              expect(findButton(window_, QStringLiteral("Receive")) != nullptr, QStringLiteral("and Receive at hand"));
              const int bitcoin = rowNamed(coinTable(), QStringLiteral("Bitcoin"));
              expect(bitcoin >= 0, QStringLiteral("Bitcoin is one of them"));
+             // Of one moment: a price may come in between.
+             window_->findChild<ui::PortfolioPage*>()->table()->refresh();
              double sum = 0.0;
              for (const ui::AllocationBar::Part& part : window_->findChild<ui::PortfolioPage*>()->table()->parts())
                  sum += part.usd;
              expect(qAbs(sum - controller()->totalUsd()) < 0.01, QStringLiteral("what it is made of adds up to it"));
+             // One setting per Windows user: as it was found.
+             if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")))
+                 hide->setChecked(hideZeroWas_);
          },
          nullptr},
         {QStringLiteral("coin"),
@@ -680,13 +687,22 @@ void Walkthrough::buildSteps()
              window_->showPage(QStringLiteral("receive"));
              receivePage()->showFor(controller()->store().wallets.first().id, wallet::findAsset(QStringLiteral("bitcoin/btc"))->asset);
          },
-         nullptr, 1000,
+         [controller] { return controller()->nextReceive(controller()->store().wallets.first().id, wallet::findNetwork(QStringLiteral("bitcoin"))->network, chain::ScriptType::P2WPKH).state == wallet::ReceiveOffer::State::Ready; }, 15000,
          [this, receivePage, controller] {
              const quint32 id = controller()->store().wallets.first().id;
              const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
              const wallet::ReceiveOffer offer = controller()->nextReceive(id, bitcoin, chain::ScriptType::P2WPKH);
              expect(offer.state == wallet::ReceiveOffer::State::Ready, QStringLiteral("Receive has an address to offer"));
              expect(receivePage()->shownAddress() == offer.address, QStringLiteral("the next unused one: %1").arg(offer.path));
+             // For decoders that have nothing to do with the app, with what it says on screen.
+             auto* picture = receivePage()->findChild<QLabel*>(QStringLiteral("receiveQr"));
+             const QString shownQr = outDir_ + QStringLiteral("/qr-on-screen");
+             QDir().mkpath(shownQr);
+             if (picture && picture->pixmap().save(shownQr + QStringLiteral("/receive.png"))) {
+                 QFile manifest(shownQr + QStringLiteral("/samples.json"));
+                 if (manifest.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                     manifest.write(QJsonDocument(QJsonArray{QJsonObject{{QStringLiteral("file"), QStringLiteral("receive.png")}, {QStringLiteral("text"), offer.address}, {QStringLiteral("version"), 3}, {QStringLiteral("level"), 1}, {QStringLiteral("mask"), 0}}}).toJson());
+             }
              const int position = controller()->model()->find(id, bitcoin, chain::ScriptType::P2WPKH, 0, 0, offer.index);
              expect(position >= 0 && !controller()->model()->at(position).used, QStringLiteral("no server knows of any use of it"));
              expect(receivePage()->shownPayload() == offer.address, QStringLiteral("and its QR code says just that"));
@@ -699,7 +715,7 @@ void Walkthrough::buildSteps()
         {QStringLiteral("receive-copied"),
          [this, receivePage, clickLater] {
              if (auto* label = receivePage()->findChild<QLineEdit*>(QStringLiteral("receiveLabel")))
-                 label->setText(QStringLiteral("Order 1001"));
+                 label->insert(QStringLiteral("Order 1001")); // as typing does
              clickLater(findButton(receivePage(), QStringLiteral("Copy address")));
          },
          nullptr, 1000,
@@ -728,8 +744,9 @@ void Walkthrough::buildSteps()
              coin->setCurrentIndex(coin->findData(int(wallet::findAsset(QStringLiteral("ethereum/usdt"))->asset)));
          },
          nullptr, 1000,
-         [this, receivePage] {
-             expect(receivePage()->shownAddress().startsWith(QLatin1String("0x")), QStringLiteral("a token comes in on its network's address: %1").arg(receivePage()->shownAddress()));
+         [this, receivePage, controller] {
+             expect(receivePage()->shownAddress() == controller()->nextReceive(controller()->store().wallets.first().id, wallet::findNetwork(QStringLiteral("ethereum"))->network, chain::ScriptType::EthAccount).address,
+                    QStringLiteral("a token comes in on its network's next address: %1").arg(receivePage()->shownAddress()));
              expect(visibleText(receivePage()).contains(QLatin1String("Ethereum network")), QStringLiteral("and it says on which network"));
              auto* coin = receivePage()->findChild<QComboBox*>(QStringLiteral("receiveCoin"));
              coin->setCurrentIndex(coin->findData(int(wallet::findAsset(QStringLiteral("bitcoin/btc"))->asset)));
@@ -1164,8 +1181,10 @@ void Walkthrough::buildSteps()
              const wallet::WalletEntry* first = controller()->store().wallets.isEmpty() ? nullptr : &controller()->store().wallets.first();
              const wallet::Network bitcoin = wallet::findNetwork(QStringLiteral("bitcoin"))->network;
              const QList<wallet::AccountKey> keys = first ? controller()->receiveKeys(first->id, bitcoin) : QList<wallet::AccountKey>();
-             expect(!keys.isEmpty() && keys.first().issued > givenOutIndex_, QStringLiteral("what was given out is still written down (%1)").arg(keys.isEmpty() ? 0 : keys.first().issued));
+             expect(!keys.isEmpty() && keys.first().given.contains(givenOutIndex_), QStringLiteral("what was given out is still written down"));
              expect(controller()->addressLabel(givenOutAddress_) == QLatin1String("Order 1001"), QStringLiteral("with its label"));
+             const wallet::ReceiveOffer offer = controller()->nextReceive(first ? first->id : 0, bitcoin, chain::ScriptType::P2WPKH);
+             expect(offer.address != givenOutAddress_, QStringLiteral("and it is not offered again"));
          },
          nullptr},
         {QStringLiteral("reopened-checked"), nullptr,

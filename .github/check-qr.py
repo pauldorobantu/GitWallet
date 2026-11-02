@@ -11,6 +11,8 @@ import zxingcpp
 folder = pathlib.Path(sys.argv[1])
 samples = json.loads((folder / 'samples.json').read_text(encoding='utf-8'))
 LARGEST_THE_APP_SHOWS = 10
+at_least = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+masks_wanted = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
 wrong = []
 zxing_read = 0
@@ -36,6 +38,10 @@ for sample in samples:
             wrong.append('OpenCV: %s (version %d, level %d, mask %d): %r' % (sample['file'], sample['version'], sample['level'], sample['mask'], text[:40]))
 
 print('%d codes, %d masks: ZXing read %d, OpenCV read %d (%d of them up to version %d, where it has to)' % (len(samples), len(masks), zxing_read, opencv_read, opencv_asked, LARGEST_THE_APP_SHOWS))
+if len(samples) < at_least:
+    wrong.append('only %d codes to read, not %d' % (len(samples), at_least))
+if len(masks) < masks_wanted:
+    wrong.append('only %d masks among them, not %d' % (len(masks), masks_wanted))
 for line in wrong[:40]:
     print('FAIL', line)
 sys.exit(1 if wrong else 0)

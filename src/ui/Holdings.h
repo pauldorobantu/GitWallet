@@ -5,7 +5,6 @@
 #include "wallet/Types.h"
 
 #include <QColor>
-#include <QElapsedTimer>
 #include <QList>
 #include <QWidget>
 
@@ -32,12 +31,20 @@ struct Holding {
     bool readable = true;   // chain:: could convert it
     int holders = 0;        // addresses holding some
     int pending = 0;        // addresses of its network without an answer yet
+    bool missing = false;   // an account has no rows yet
+    bool unread = false;    // a key of a kind this version cannot read
+    bool oneWallet = false; // of one wallet, rather than of them all
 
     bool holds() const { return !amount.isZero(); }
-    QString amountText() const; // "0.5 BTC", "≥ 0.5 BTC", "—"
-    QString usdText() const;    // "$1.00", "≥ $1.00", "—"
+    QString amountText() const;  // "0.5 BTC", "≥ 0.5 BTC", "—"
+    QString usdText() const;     // "$1.00", "≥ $1.00", "—"
+    QString holdersText() const; // "3", "≥ 3", "—"
 };
 Holding holdingOf(const WalletController* controller, wallet::Asset asset, quint32 wallet = 0);
+// The same of one address.
+Holding holdingAt(const WalletController* controller, const wallet::AddressRow& row, wallet::Asset asset);
+// Why a figure is not final, and how current what is known of it is. Empty: nothing to say.
+QString holdingNote(const WalletController* controller, const Holding& holding);
 
 // The sum of a scope in USD. Something held without a price would make it silently too low, so
 // then there is no sum.
@@ -89,8 +96,9 @@ public:
 
     QTableView* view() const;
     int rowsShown() const;
-    int rowsHolding() const;
-    int rowsTotal() const;
+    int rowsHolding() const; // of those a key looks at
+    int rowsTotal() const;   // those a key looks at
+    bool allFinal() const;   // every figure among those has answered
     void refresh();
 
     // What each coin comes to now, for an AllocationBar.
@@ -108,11 +116,10 @@ private:
     struct Ui;
     void applyKind();
     void queueRefresh();
-    void opened(); // a page just came up: the second click of a double click is not for it
+    void opened(); // it came up on something else
 
     WalletController* controller_ = nullptr;
     Ui* ui_ = nullptr;
-    QElapsedTimer sinceOpened_;
 };
 
 } // namespace app::ui

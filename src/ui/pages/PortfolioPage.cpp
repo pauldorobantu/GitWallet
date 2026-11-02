@@ -360,7 +360,8 @@ void PortfolioPage::refreshView()
     const bool saved = controller_->showingSaved();
     const bool loading = controller_->loadingSaved(); // part of what the database kept
     const bool unread = controller_->hasUnreadKeys(); // a key's coins are in no figure
-    QString staleCaption; // under the total, and on the chip for a failed refresh
+    QStringList staleCaptions; // under the total
+    QString staleCaption;      // the first of them, on the chip for a failed refresh
     bool anyWrongChain = false;
     bool anyFailing = false;
     bool anyScanning = false;
@@ -373,12 +374,14 @@ void PortfolioPage::refreshView()
             wrongChainText = trText(QStringLiteral("%1 endpoint answers for another network")).arg(network.name);
         }
         anyFailing = anyFailing || st.failing;
-        if ((st.wrongChain || st.failing || (st.connecting && !saved && st.balancesAt.isValid())) && staleCaption.isEmpty()) {
+        if (st.wrongChain || st.failing || (st.connecting && !saved && st.balancesAt.isValid())) {
             const QString coin = wallet::assetInfo(network.coin).symbol;
-            staleCaption = st.balancesAt.isValid()
-                               ? trText(QStringLiteral("%1 balances from %2")).arg(coin, shownTime(st.balancesAt, today))
-                           : st.wrongChain ? wrongChainText
-                                           : trText(QStringLiteral("%1 lookups failing")).arg(coin);
+            staleCaptions << (st.balancesAt.isValid()
+                                  ? trText(QStringLiteral("%1 balances from %2")).arg(coin, shownTime(st.balancesAt, today))
+                              : st.wrongChain ? trText(QStringLiteral("%1 endpoint answers for another network")).arg(network.name)
+                                              : trText(QStringLiteral("%1 lookups failing")).arg(coin));
+            if (staleCaption.isEmpty())
+                staleCaption = staleCaptions.last();
         }
     }
 
@@ -402,8 +405,8 @@ void PortfolioPage::refreshView()
         caption << trText(QStringLiteral("Not all accounts checked yet"));
     if (limit)
         caption << trText(QStringLiteral("Address limit reached"));
-    if (!staleCaption.isEmpty())
-        caption << staleCaption;
+    if (!staleCaptions.isEmpty())
+        caption << staleCaptions;
     else if (caption.isEmpty() && anyScanning)
         caption << trText(QStringLiteral("Still scanning"));
     caption << controller_->pricesLine();

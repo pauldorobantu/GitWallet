@@ -153,14 +153,18 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
     margins->addWidget(tabs_);
 
     connect(copy_, &QPushButton::clicked, this, [this] {
-        if (!place_.address)
+        if (!place_.address || !controller_)
             return;
-        // What may go to someone who is to pay: what the key gives, not what is kept.
-        const QString address = controller_ ? controller_->checkedAddress(*place_.address) : QString();
-        if (address.isEmpty())
+        // What may go to someone who is to pay: what the key gives, not what is kept, and marked.
+        const wallet::AddressRow row = currentRow();
+        const QString address = controller_->checkedAddress(row);
+        if (address.isEmpty()) {
             Feedback::show(copy_, Feedback::Type::Error, trText(QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.")));
-        else
-            copyTextToClipboard(copy_, address, trText(QStringLiteral("Address copied")));
+            return;
+        }
+        QString error;
+        controller_->markGivenOut(row, &error); // what fails is said on its own, and tried again
+        copyTextToClipboard(copy_, address, trText(QStringLiteral("Address copied")));
     });
     connect(explorer_, &QPushButton::clicked, this, [this] {
         if (!place_.address)
@@ -196,6 +200,13 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
         connect(controller_, &WalletController::labelsChanged, this, queue);
         connect(controller_, &WalletController::walletChanged, this, queue);
     }
+    if (controller_) {
+        // The last step may be its name.
+        connect(controller_, &WalletController::labelsChanged, this, [this] {
+            if (isVisible() && place_.address)
+                rebuildPath();
+        });
+    }
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this] {
         if (!isVisible())
             return;
@@ -228,7 +239,7 @@ QStringList PlaceBar::pathTexts() const
     for (int i = 0; i < path_->count(); ++i) {
         const QWidget* widget = path_->itemAt(i)->widget();
         if (const auto* button = qobject_cast<const QPushButton*>(widget))
-            out << button->text();
+            out << QString(button->text()).replace(QStringLiteral("&&"), QStringLiteral("&"));
         else if (const auto* label = qobject_cast<const QLabel*>(widget); label && label->objectName() == QLatin1String("pathHere"))
             out << label->text();
     }
@@ -249,7 +260,8 @@ void PlaceBar::addStep(const QString& text, const std::function<void()>& open)
         path_->addWidget(here);
         return;
     }
-    auto* link = new QPushButton(text, this);
+    // A wallet's name is no mnemonic.
+    auto* link = new QPushButton(QString(text).replace(QLatin1Char('&'), QStringLiteral("&&")), this);
     link->setObjectName(QStringLiteral("pathLink"));
     link->setCursor(Qt::PointingHandCursor);
     link->setFlat(true);
@@ -356,6 +368,14 @@ void PlaceBar::rebuildTabs(Place::Tab tab)
     tabs_->setCurrentIndex(at >= 0 ? int(at) : 0);
 }
 
+wallet::AddressRow PlaceBar::currentRow() const
+{
+    const wallet::AddressRow& opened = *place_.address;
+    const wallet::WalletModel* model = controller_->model();
+    const int position = model->find(opened.wallet, opened.network, opened.type, opened.account, opened.change, opened.index);
+    return position >= 0 ? model->at(position) : opened;
+}
+
 void PlaceBar::refresh()
 {
     refresh_->stop();
@@ -373,33 +393,30 @@ void PlaceBar::refresh()
     QString title;
     QStringList detail;
     if (atAddress) {
-        const wallet::AddressRow& opened = *place_.address;
-        const wallet::WalletModel* model = controller_->model();
-        const int position = model->find(opened.wallet, opened.network, opened.type, opened.account, opened.change, opened.index);
-        const wallet::AddressRow row = position >= 0 ? model->at(position) : opened;
+        const wallet::AddressRow row = currentRow();
         const QString label = controller_->addressLabel(row.address);
         icon = coinIcon(wallet::assetInfo(wallet::networkInfo(row.network).coin));
         title = label.isEmpty() ? row.address : QStringLiteral("%1 · %2").arg(label, row.address);
         detail << row.path();
         if (const wallet::WalletEntry* own = controller_->store().find(row.wallet))
             detail << own->label;
-        try {
-            double usd = 0.0;
-            bool priced = true;
-            for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
-                const wallet::AssetInfo& info = wallet::assetInfo(asset);
-                const chain::Amount amount = row.amount(asset);
-                if (amount.isZero() && asset != wallet::networkInfo(row.network).coin)
-                    continue;
-                detail << figures::formatAmount(amount, info) + QLatin1Char(' ') + info.symbol;
-                const double price = controller_->prices()->usd(asset);
-                priced = priced && (price > 0.0 || amount.isZero());
-                usd += amount.toDouble(info.decimals) * price;
+        // The same figures as the table under it: an address nobody answered for holds no zero.
+        double usd = 0.0;
+        bool priced = true;
+        bool any = false;
+        for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
+            const Holding holding = holdingAt(controller_, row, asset);
+            if (holding.holds() || (row.checked && asset == wallet::networkInfo(row.network).coin)) {
+                detail << holding.amountText();
+                any = true;
             }
-            if (priced)
-                detail << figures::formatUsd(usd);
-        } catch (const std::exception&) {
+            priced = priced && holding.readable && (holding.price > 0.0 || !holding.holds());
+            usd += holding.usd;
         }
+        if (!row.checked && !any)
+            detail << trText(QStringLiteral("Not checked yet"));
+        else if (priced && any)
+            detail << (row.checked ? figures::formatUsd(usd) : figures::atLeast(figures::formatUsd(usd)));
     } else if (place_.asset) {
         const wallet::AssetInfo& info = wallet::assetInfo(*place_.asset);
         const Holding holding = holdingOf(controller_, *place_.asset, place_.wallet);
@@ -410,13 +427,19 @@ void PlaceBar::refresh()
             detail << QStringLiteral("1 %1 = %2").arg(info.symbol, figures::formatUsd(holding.price));
         if (entry && !place_.onlyWallet)
             detail << entry->label;
-        detail << trText(holding.holders == 1 ? QStringLiteral("%1 address holds it") : QStringLiteral("%1 addresses hold it")).arg(figures::formatCount(holding.holders));
+        if (holding.watched && (holding.complete || holding.holders > 0))
+            detail << trText(holding.complete && holding.holders == 1 ? QStringLiteral("%1 address holds it") : QStringLiteral("%1 addresses hold it")).arg(holding.holdersText());
+        const QString note = holdingNote(controller_, holding);
+        if (!note.isEmpty())
+            detail << note;
     } else if (entry) {
         icon = nameIcon(entry->label);
         title = totalOf(controller_, entry->id).text();
         detail << entry->label;
         const wallet::WalletCounts counts = controller_->model()->counts(entry->id);
         detail << trText(QStringLiteral("%1 funded of %2 addresses")).arg(figures::formatCount(counts.funded), figures::formatCount(counts.rows));
+        if (counts.checked < counts.rows)
+            detail << trText(counts.rows - counts.checked == 1 ? QStringLiteral("%1 address not checked yet") : QStringLiteral("%1 addresses not checked yet")).arg(figures::formatCount(counts.rows - counts.checked));
     }
     mark_->setPixmap(icon.pixmap(QSize(kMarkSize, kMarkSize)));
     static_cast<MiddleLabel*>(title_)->setFull(title);

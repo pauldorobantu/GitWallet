@@ -65,6 +65,7 @@ signals:
 private:
     void rebuildPath();
     void rebuildTabs(Place::Tab tab);
+    wallet::AddressRow currentRow() const; // the place's address as it stands now
     void addStep(const QString& text, const std::function<void()>& open);
 
     WalletController* controller_ = nullptr;

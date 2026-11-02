@@ -48,7 +48,13 @@ void HoldingsPage::showEvent(QShowEvent* event)
 
 void HoldingsPage::updateCount()
 {
-    count_->setText(trText(QStringLiteral("%1 of %2 hold something")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal())));
+    // No count of nothing while nothing has answered.
+    if (!table_->allFinal() && table_->rowsHolding() == 0)
+        count_->clear();
+    else if (table_->allFinal())
+        count_->setText(trText(QStringLiteral("%1 of %2 hold something")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal())));
+    else
+        count_->setText(trText(QStringLiteral("%1 hold something so far")).arg(figures::formatCount(table_->rowsHolding())));
 }
 
 } // namespace app::ui

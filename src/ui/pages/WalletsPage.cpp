@@ -598,6 +598,10 @@ void WalletsPage::confirmRemoveSelected()
                    ? QStringLiteral(" Its %1 labels and notes go too, for good: only this PC has them, and no seed brings "
                                     "them back. Keep a copy first, under Labels and notes in Settings.")
                          .arg(controller_->labelCount(id))
+                   : QString())
+            + (controller_->givenOutWaiting(id) > 0
+                   ? QStringLiteral(" %1 of the addresses it gave out have had nothing come in yet. If its seed is added again, they will be offered to someone else: only this PC knows they were given out.")
+                         .arg(controller_->givenOutWaiting(id))
                    : QString()));
     QPushButton* remove = box->addButton(QStringLiteral("Remove wallet"), QMessageBox::DestructiveRole);
     remove->setObjectName(QStringLiteral("dangerButton"));

@@ -24,6 +24,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QApplication>
 #include <QDateTime>
 #include <QDebug>
 #include <QEvent>
@@ -294,7 +295,11 @@ void MainWindow::buildUi()
 
     connect(portfolio_, &PortfolioPage::importRequested, this, [this] { openImportDialog(false); });
     connect(portfolio_, &PortfolioPage::importManyRequested, this, [this] { openImportDialog(true); });
+    clickGuard_ = new QTimer(this);
+    clickGuard_->setSingleShot(true);
+    connect(clickGuard_, &QTimer::timeout, this, [this] { qApp->removeEventFilter(this); });
     connect(portfolio_, &PortfolioPage::coinChosen, this, [this](wallet::Asset asset) {
+        swallowSecondClick();
         Place place;
         place.root = Place::Root::Portfolio;
         place.asset = asset;
@@ -302,11 +307,13 @@ void MainWindow::buildUi()
     });
     connect(portfolio_, &PortfolioPage::receiveRequested, this, [this] { openPage(PageReceive); });
     connect(holdings_->table(), &HoldingsTable::coinChosen, this, [this](wallet::Asset asset) {
+        swallowSecondClick();
         Place place = placeBar_->place();
         place.asset = asset;
         goTo(place, Place::Tab::Addresses);
     });
     connect(holdings_->table(), &HoldingsTable::walletChosen, this, [this](quint32 wallet) {
+        swallowSecondClick();
         Place place = placeBar_->place();
         place.wallet = wallet;
         goTo(place, Place::Tab::Addresses);
@@ -322,7 +329,11 @@ void MainWindow::buildUi()
         if (!place.address)
             return;
         openPage(PageReceive);
-        receive_->showAddress(*place.address);
+        // As it stands now, not as it stood when it was opened.
+        const wallet::WalletModel* model = controller_->model();
+        const wallet::AddressRow& opened = *place.address;
+        const int position = model->find(opened.wallet, opened.network, opened.type, opened.account, opened.change, opened.index);
+        receive_->showAddress(position >= 0 ? model->at(position) : opened);
     });
     connect(placeBar_, &PlaceBar::labelRequested, this, &MainWindow::editAddressLabel);
     connect(receive_, &ReceivePage::openAddressRequested, this, [this](const wallet::AddressRow& row) {
@@ -439,6 +450,29 @@ void MainWindow::openPage(int pageId)
     stack_->setCurrentIndex(pageId);
     if (pageId == PageReceive)
         receive_->showFor(0, std::nullopt); // what is next, rather than the one last looked at
+}
+
+void MainWindow::swallowSecondClick()
+{
+    clickGuard_->start(QApplication::doubleClickInterval());
+    qApp->installEventFilter(this); // for that long only; again is harmless
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    switch (event->type()) {
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick:
+        if (clickGuard_->isActive()) {
+            if (const auto* widget = qobject_cast<QWidget*>(watched); widget && stack_->isAncestorOf(widget))
+                return true;
+        }
+        break;
+    default:
+        break;
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void MainWindow::leavePlace()
@@ -637,6 +671,12 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
         n.headline = trText(QStringLiteral("The labels and notes of an older file have yet to come over"));
         n.depends = 0;
         break;
+    case wallet::Problem::GivenOutNotKept:
+        n.key = QStringLiteral("given-out-not-kept");
+        n.headline = trText(QStringLiteral("An address given out could not be written down"));
+        n.severity = kSeverityWarning;
+        n.depends = 0;
+        break;
     case wallet::Problem::FilesLeft:
         n.key = QStringLiteral("files-left");
         n.headline = trText(QStringLiteral("Some files could not be deleted"));
@@ -751,6 +791,8 @@ bool MainWindow::pruneNotices()
             return controller_->keepingSaved();
         if (n.key == QLatin1String("labels-owed"))
             return !controller_->labelsOwed();
+        if (n.key == QLatin1String("given-out-not-kept"))
+            return !controller_->givenOutOwed();
         if (was.wallet != now.wallet)
             return true; // another wallet, or none
         const bool btcGaps = was.receiveGap != now.receiveGap || was.changeGap != now.changeGap;

@@ -197,6 +197,41 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
         if (table && table->model()->rowCount() != model->size())
             report += QStringLiteral("FAIL  all rows are %1, not %2\n").arg(table->model()->rowCount()).arg(model->size());
     }
+    if (page && table) {
+        // A place narrows it in one pass, and leaving lets go of that as the page next shows.
+        const wallet::Asset token = wallet::findNetwork(QStringLiteral("ethereum"))->tokens.first();
+        int holding = 0;
+        for (int i = 0; i < model->size(); ++i) {
+            if (model->at(i).wallet == 1 && !model->at(i).amount(token).isZero())
+                ++holding;
+        }
+        clock.restart();
+        page->showPlace(1, token);
+        settle();
+        const qint64 narrowing = clock.elapsed();
+        say(QStringLiteral("opening a coin of a wallet on its addresses"), narrowing);
+        if (narrowing > 10000)
+            report += QStringLiteral("FAIL  a place took %1 ms\n").arg(narrowing);
+        if (table->model()->rowCount() != holding)
+            report += QStringLiteral("FAIL  the place shows %1 rows, not %2\n").arg(table->model()->rowCount()).arg(holding);
+        clock.restart();
+        window->showPage(QStringLiteral("settings"));
+        page->clearPlace();
+        settle();
+        const qint64 leaving = clock.elapsed();
+        say(QStringLiteral("leaving it for another page"), leaving);
+        if (leaving > 1000)
+            report += QStringLiteral("FAIL  leaving a place for another page took %1 ms\n").arg(leaving);
+        clock.restart();
+        window->showPage(QStringLiteral("addresses"));
+        settle();
+        const qint64 whole = clock.elapsed();
+        say(QStringLiteral("coming back to all of them"), whole);
+        if (whole > 10000)
+            report += QStringLiteral("FAIL  coming back took %1 ms\n").arg(whole);
+        if (table->model()->rowCount() != model->size())
+            report += QStringLiteral("FAIL  all rows are %1, not %2, after a place\n").arg(table->model()->rowCount()).arg(model->size());
+    }
     if (page) {
         const QString path = window->controller()->store().dataDir() + QStringLiteral("/scale-export.csv");
         QString error;

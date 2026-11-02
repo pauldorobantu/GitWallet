@@ -449,7 +449,10 @@ void UtxoScanner::start()
             c.account = acct.account;
             c.change = change;
             c.gap = change == 0 ? receiveGap_ : changeGap_;
-            c.issued = change == 0 ? int(std::min<quint32>(acct.issued, quint32(kMaxChainRows))) : 0;
+            if (change == 0) {
+                c.given = acct.given;
+                c.issued = int(std::min<quint32>(acct.given.end(), quint32(kMaxChainRows)));
+            }
             try {
                 c.node = accountNode.deriveChild(change);
             } catch (const std::exception& e) {
@@ -583,7 +586,24 @@ void UtxoScanner::adoptModelRows()
             placeRow(sh, c, int(row.index), row);
         }
     }
-    // The addresses a payment comes to next first, as far as the rows say which they are.
+    // What was given out and not paid yet goes first, the latest first, wherever it lies: one of those
+    // is what a payment comes to.
+    for (int ci = 0; ci < chains_.size(); ++ci) {
+        const Chain& c = chains_.at(ci);
+        if (!c.reuse) continue;
+        for (auto run = c.given.runs.crbegin(); run != c.given.runs.crend(); ++run) {
+            for (quint32 index = run->to; index > run->from; --index) {
+                const int pos = model_->find(c.wallet, network_, c.type, c.account, c.change, index - 1);
+                if (pos < 0 || model_->at(pos).used) continue;
+                const AddressRow& row = model_->at(pos);
+                const QString sh = row.scripthash.toLower();
+                if (sh.isEmpty() || tracked_.contains(sh)) continue;
+                tracked_.insert(sh, Tracked());
+                placeRow(sh, c, int(index - 1), row);
+            }
+        }
+    }
+    // The addresses a payment comes to next, as far as the rows say which they are.
     for (int ci = 0; ci < chains_.size(); ++ci) {
         const Chain& c = chains_.at(ci);
         if ((c.savedUsed < 0 && c.issued == 0) || !c.reuse) continue;
@@ -1067,15 +1087,20 @@ bool UtxoScanner::isNext(const Chain& c, int index) const
     return index > last && index <= std::max(last, c.issued - 1) + hotAhead(c);
 }
 
+bool UtxoScanner::waitingForPayment(const Chain& c, int index, const AddressRow& row) const
+{
+    return !row.used && c.given.contains(quint32(index));
+}
+
 bool UtxoScanner::wantsLive(const Chain& c, int index, const AddressRow& row) const
 {
-    return !tiered() || isNext(c, index) || row.confirmed != 0 || row.unconfirmed != 0;
+    return !tiered() || isNext(c, index) || row.confirmed != 0 || row.unconfirmed != 0 || waitingForPayment(c, index, row);
 }
 
 bool UtxoScanner::mayGoLive(Tracked& tracked, const Chain& c, int index)
 {
     if (tracked.viaRead || liveCount_ >= placesNow()) return false;
-    if (!tiered() || isNext(c, index)) return true;
+    if (!tiered() || isNext(c, index) || c.given.contains(quint32(index))) return true;
     // Holding coins: within what the next unused addresses leave, however many hold some.
     if (coinPlaces_ >= placesNow() - hotPlaces()) return false;
     ++coinPlaces_;
@@ -1782,18 +1807,21 @@ void UtxoScanner::noteUsed(int chainIndex, int index)
     if (c.next < c.window()) scheduleDerive();
 }
 
-void UtxoScanner::noteIssued(const AccountKey& key)
+void UtxoScanner::noteGiven(const AccountKey& key, quint32 index)
 {
     if (!running_) return; // the next start() reads it from the key
     const int ci = chainByKey_.value(ChainKey{key.wallet, key.account, quint8(key.type), 0}, -1);
     if (ci < 0) return;
     Chain& c = chains_[ci];
-    const int issued = int(std::min<quint32>(key.issued, quint32(kMaxChainRows)));
-    if (issued <= c.issued) return;
+    c.given = key.given;
     const int oldEnd = std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c);
-    c.issued = issued;
+    c.issued = std::max(c.issued, int(std::min<quint32>(key.given.end(), quint32(kMaxChainRows))));
     noteTiered();
-    if (tiered()) reconsiderRange(ci, oldEnd + 1, std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c));
+    if (tiered()) {
+        // That one, wherever it lies, then those the next unused addresses moved on to.
+        reconsiderRange(ci, int(std::min<quint32>(index, quint32(kMaxChainRows))), int(std::min<quint32>(index, quint32(kMaxChainRows))));
+        reconsiderRange(ci, oldEnd + 1, std::max(std::max(c.lastUsed, c.savedUsed), c.issued - 1) + hotAhead(c));
+    }
     if (c.next < c.window()) scheduleDerive();
 }
 

@@ -40,7 +40,7 @@ namespace wallet {
 
 namespace {
 
-constexpr int kFormatVersion = 3;
+constexpr int kFormatVersion = 4; // what was given out: a build that does not know it would write it away
 constexpr int kLegacyFormatVersion = 1;    // one wallet: "label" + "accounts" at the top
 constexpr qint64 kMaxFileBytes = 16 << 20; // room for the account keys of every network kMaxWallets may hold
 constexpr qsizetype kMaxXpubChars = 128;   // a serialized extended key is 111 chars
@@ -363,9 +363,11 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
                 a.insert(QStringLiteral("network"), networkInfo(k.network).id);
             a.insert(QStringLiteral("account"), static_cast<qint64>(k.account));
             a.insert(QStringLiteral("xpub"), k.xpub);
-            if (k.issued > 0) {
-                a.insert(QStringLiteral("issued"), static_cast<qint64>(k.issued));
-                a.insert(QStringLiteral("issuedFrom"), static_cast<qint64>(k.issuedFrom));
+            if (!k.given.isEmpty()) {
+                QJsonArray runs;
+                for (const GivenOut::Run& run : k.given.runs)
+                    runs.append(QJsonArray{static_cast<qint64>(run.from), static_cast<qint64>(run.to)});
+                a.insert(QStringLiteral("given"), runs);
             }
             list.append(a);
         }
@@ -432,9 +434,20 @@ bool readAccounts(const QJsonValue& value, quint32 wallet, bool keepUnknown, QLi
         if (!readAccountIndex(o.value(QStringLiteral("account")), &k.account))
             return fail(why, QStringLiteral("an account has an invalid number"));
         k.xpub = o.value(QStringLiteral("xpub")).toString();
-        if ((o.contains(QStringLiteral("issued")) && !readAccountIndex(o.value(QStringLiteral("issued")), &k.issued))
-            || (o.contains(QStringLiteral("issuedFrom")) && !readAccountIndex(o.value(QStringLiteral("issuedFrom")), &k.issuedFrom)))
-            return fail(why, QStringLiteral("an account has an invalid number"));
+        if (o.contains(QStringLiteral("given"))) {
+            // In order, none empty, none touching the next: what add() makes.
+            quint32 last = 0;
+            const QJsonArray runs = o.value(QStringLiteral("given")).toArray();
+            for (const QJsonValue& value : runs) {
+                const QJsonArray pair = value.toArray();
+                GivenOut::Run run;
+                if (pair.size() != 2 || !readAccountIndex(pair.at(0), &run.from) || !readAccountIndex(pair.at(1), &run.to) || run.from >= run.to
+                    || (!k.given.isEmpty() && run.from <= last))
+                    return fail(why, QStringLiteral("an account has an invalid number"));
+                k.given.runs.append(run);
+                last = run.to;
+            }
+        }
         out->append(k);
     }
     return true;
@@ -491,7 +504,7 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
                 return damaged(QStringLiteral("a wallet has an invalid number"));
             w.label = labelOrDefault(o.value(QStringLiteral("label")).toString());
             w.fromKeys = o.value(QStringLiteral("fromKeys")).toBool();
-            if (!readAccounts(o.value(QStringLiteral("accounts")), w.id, version.toDouble() >= kFormatVersion, &w.accounts,
+            if (!readAccounts(o.value(QStringLiteral("accounts")), w.id, version.toDouble() >= 3, &w.accounts,
                               &w.keptAccounts, &why))
                 return damaged(why);
             nextId = std::max(nextId, w.id + 1);

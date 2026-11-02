@@ -48,7 +48,7 @@ public:
     void start(); // the networks with accounts; none: no connections at all
     void stop();
     void refreshNow();
-    void noteIssued(const AccountKey& key); // see ChainScanner::noteIssued()
+    void noteGiven(const AccountKey& key, quint32 index); // see ChainScanner::noteGiven()
     // What the database kept of the last run, before start().
     void restoreTimes(Network network, const QDateTime& balancesAt, const QDateTime& noncesAt, const NonceSweep& sweep);
     bool running() const { return running_; }
