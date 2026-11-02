@@ -92,7 +92,8 @@ ActionBar makeActionBar(QWidget* parent);
 // The count of a bar with a search: its text ends in "…" when it does not fit.
 QLabel* makeBarCount(QWidget* parent);
 // The end of the left side of such a bar, once the search and any filters are in it. On
-// a narrow window the search gives way first, then the count, and never a button.
+// a narrow window the search gives way first, and when that is not enough the count and the
+// buttons go on a row of their own: none of them is cut.
 void finishBarLeft(const ActionBar& bar, QLineEdit* search, QLabel* count);
 
 // Formular standard: etichete stânga + centrate vertical pe câmp, spațiere

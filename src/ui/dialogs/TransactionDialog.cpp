@@ -207,6 +207,13 @@ TransactionDialog::TransactionDialog(WalletController* controller, HistoryTableM
         discarding_ = true;
         reject();
     });
+    // What it said was of what was there then.
+    const auto editing = [this] {
+        notKept_->hide();
+        discard_->hide();
+    };
+    connect(label_, &QLineEdit::textEdited, this, editing);
+    connect(note_, &QPlainTextEdit::textChanged, this, editing);
 
     follow_ = new QTimer(this);
     follow_->setSingleShot(true);

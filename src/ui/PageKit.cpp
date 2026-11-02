@@ -10,6 +10,7 @@
 #include <QAction>
 #include <QBoxLayout>
 #include <QDialog>
+#include <QEvent>
 #include <QApplication>
 #include <QAbstractSpinBox>
 #include <QComboBox>
@@ -77,10 +78,89 @@ void applyPageLayout(QVBoxLayout* root)
     root->setSpacing(kPageSpacing);
 }
 
+namespace {
+
+// A bar is one row while both its sides fit, and two when they do not: the search and the filters
+// above, the count and the buttons below, rather than any of them cut, on a narrow window or in a
+// language with longer words.
+class ActionBarWidget : public QWidget
+{
+public:
+    using QWidget::QWidget;
+
+    void setParts(QBoxLayout* row, QBoxLayout* left, QBoxLayout* right)
+    {
+        row_ = row;
+        left_ = left;
+        right_ = right;
+    }
+    void setCount(QLabel* count)
+    {
+        count_ = count;
+        fit();
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override
+    {
+        QWidget::resizeEvent(event);
+        fit();
+    }
+    bool event(QEvent* event) override
+    {
+        // A control came, went or changed its text.
+        if (event->type() == QEvent::LayoutRequest)
+            fit();
+        return QWidget::event(event);
+    }
+
+private:
+    void fit()
+    {
+        if (!row_ || !left_ || !right_)
+            return;
+        // The search at its least, the count whole. Measured the same wherever the count is now, or
+        // the bar would go back and forth at the very width where it just fits.
+        const bool shown = count_ && !count_->isHidden();
+        const int count = shown ? count_->sizeHint().width() : 0;
+        int left = left_->minimumSize().width();
+        int right = right_->sizeHint().width();
+        if (shown) {
+            if (stacked_)
+                right -= count + right_->spacing();
+            else
+                left -= count_->minimumWidth() + left_->spacing();
+        }
+        const bool fits = left + count + row_->spacing() + right <= width();
+        if (fits != stacked_)
+            return;
+        stacked_ = !fits;
+        row_->setDirection(stacked_ ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
+        if (!count_)
+            return;
+        if (stacked_) {
+            left_->removeWidget(count_);
+            right_->insertWidget(0, count_);
+        } else {
+            right_->removeWidget(count_);
+            left_->insertWidget(left_->count() - 1, count_); // before what parts it from the buttons
+        }
+    }
+
+    QBoxLayout* row_ = nullptr;
+    QBoxLayout* left_ = nullptr;
+    QBoxLayout* right_ = nullptr;
+    QLabel* count_ = nullptr;
+    bool stacked_ = false;
+};
+
+} // namespace
+
 ActionBar makeActionBar(QWidget* parent)
 {
     ActionBar bar;
-    bar.widget = new QWidget(parent);
+    auto* host = new ActionBarWidget(parent);
+    bar.widget = host;
     bar.widget->setObjectName(QStringLiteral("pageActionBar"));
     bar.widget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     // Aceeași înălțime pe toate paginile, chiar dacă bara are doar un count.
@@ -94,9 +174,11 @@ ActionBar makeActionBar(QWidget* parent)
     bar.right = new QHBoxLayout;
     bar.right->setContentsMargins(0, 0, 0, 0);
     bar.right->setSpacing(kToolbarSpacing);
+    bar.right->addStretch(1); // on a row of their own they stay to the right
     row->addLayout(bar.left);
     row->addStretch(1);
     row->addLayout(bar.right);
+    host->setParts(row, bar.left, bar.right);
     return bar;
 }
 
@@ -140,6 +222,7 @@ void finishBarLeft(const ActionBar& bar, QLineEdit* search, QLabel* count)
     auto* row = static_cast<QHBoxLayout*>(bar.widget->layout());
     row->setStretch(0, 1);
     row->setStretch(1, 0);
+    static_cast<ActionBarWidget*>(bar.widget)->setCount(count);
 }
 
 void applyFormLayout(QFormLayout* form)
