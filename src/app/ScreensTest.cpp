@@ -55,6 +55,7 @@
 #include <QTableWidget>
 
 #include <array>
+#include <cstdio>
 #include <functional>
 
 namespace app {
@@ -2626,6 +2627,9 @@ StoreTestResult runScreensTestAlone()
 {
     StoreTestResult result;
     const Check check = [&result](bool ok, const QString& what) {
+        // A run that falls over never gets to its report: the last line here says how far it got.
+        std::fprintf(stderr, "%s %s\n", ok ? "ok  " : "FAIL", what.toUtf8().constData());
+        std::fflush(stderr);
         ++result.total;
         if (ok)
             ++result.passed;
