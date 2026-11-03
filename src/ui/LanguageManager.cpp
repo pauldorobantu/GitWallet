@@ -570,6 +570,8 @@ const Tr kTr[] = {
     { "Not fully scanned", "No escaneado del todo", "Analyse incomplète", "Nicht vollständig gescannt", "Сканирование неполное" },
     { "Checking %1 of %2", "Comprobando %1 de %2", "Vérification de %1 sur %2", "Prüfe %1 von %2", "Проверка %1 из %2" },
     { "%1 wallet added since is not in it.", "%1 billetera añadida después no está en ella.", "%1 portefeuille ajouté depuis n'y figure pas.", "%1 danach hinzugefügtes Wallet ist nicht darin.", "%1 кошелёк, добавленный позже, в неё не входит." },
+    { "Latest payments", "Últimos pagos", "Derniers paiements", "Letzte Zahlungen", "Последние платежи" },
+    { "All payments", "Todos los pagos", "Tous les paiements", "Alle Zahlungen", "Все платежи" },
     { "Network, currency and appearance.", "Red, moneda y apariencia.", "Réseau, devise et apparence.", "Netzwerk, Währung und Darstellung.", "Сеть, валюта и оформление." },
 };
 

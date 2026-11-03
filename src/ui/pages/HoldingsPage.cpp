@@ -23,7 +23,8 @@ HoldingsPage::HoldingsPage(WalletController* controller, QWidget* parent)
     page::applyPageLayout(root);
     table_ = new HoldingsTable(controller_, this);
     table_->setObjectName(QStringLiteral("placeHoldings"));
-    root->addWidget(table_, 1);
+    root->addWidget(table_);
+    root->addStretch(1);
 
     const page::ActionBar bar = page::makeActionBar(this);
     view_ = page::makeViewMenu(bar.widget).button;

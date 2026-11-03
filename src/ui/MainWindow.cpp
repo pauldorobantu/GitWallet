@@ -369,6 +369,11 @@ void MainWindow::buildUi()
         goTo(place, Place::Tab::Holdings);
     });
     connect(portfolio_, &PortfolioPage::receiveRequested, this, [this] { openPage(PageReceive); });
+    connect(portfolio_, &PortfolioPage::paymentsRequested, this, &MainWindow::openPayments);
+    connect(portfolio_, &PortfolioPage::paymentChosen, this, [this](const wallet::Payment& payment) {
+        swallowSecondClick();
+        openPaymentAddress(payment);
+    });
     connect(holdings_->table(), &HoldingsTable::coinChosen, this, [this](wallet::Asset asset) {
         swallowSecondClick();
         Place place = placeBar_->place();
@@ -654,6 +659,26 @@ void MainWindow::openPayments()
     });
     // open(), not exec(): the scanners go on, and so does the list.
     dialog->open();
+}
+
+void MainWindow::openPaymentAddress(const wallet::Payment& payment)
+{
+    const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
+    if (!info)
+        return;
+    const wallet::WalletModel* rows = controller_->model();
+    for (int row = 0; row < rows->size(); ++row) {
+        const wallet::AddressRow& it = rows->at(row);
+        if (it.network == info->network && it.wallet == payment.wallet && it.address == payment.address) {
+            Place place;
+            place.root = Place::Root::Addresses;
+            place.address = it;
+            // A network with no history yet opens on what the address holds.
+            goTo(place, controller_->historyOf(it.network) ? Place::Tab::History : Place::Tab::Holdings);
+            return;
+        }
+    }
+    Feedback::show(this, Feedback::Type::Info, trText(QStringLiteral("That address is not among those followed now")));
 }
 
 namespace {

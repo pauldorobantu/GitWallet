@@ -60,6 +60,7 @@ public:
     PlaceBar* placeBar() const { return placeBar_; }
     TitleBar* titleBar() const { return title_; }
     void openPayments(); // the list of what came in
+    void openPaymentAddress(const wallet::Payment& payment);
     QString lastPaymentAlert() const { return lastPaymentAlert_; } // for tests
     QString lastPaymentNotification() const { return lastPaymentNotification_; } // for tests
     bool trayShown() const;                                        // for a check on the real platform

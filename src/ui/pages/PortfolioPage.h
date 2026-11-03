@@ -7,10 +7,15 @@
 
 class QAction;
 class QCheckBox;
+class QTableView;
 class QLabel;
 class QPushButton;
 class QStackedLayout;
 class QTimer;
+
+namespace wallet {
+struct Payment;
+}
 
 namespace app {
 class WalletController;
@@ -20,6 +25,7 @@ namespace app::ui {
 
 class AllocationBar;
 class HoldingsTable;
+class PaymentsModel;
 
 // The page the app opens on. Without a wallet: an empty state with an "Add wallet" primary button
 // and "Add many" beside it (importRequested, importManyRequested). With wallets: the grand total in
@@ -40,6 +46,8 @@ signals:
     void importManyRequested();
     void coinChosen(wallet::Asset asset);
     void receiveRequested();
+    void paymentsRequested();
+    void paymentChosen(const wallet::Payment& payment);
 
 protected:
     void showEvent(QShowEvent* event) override; // the box follows the one on the pages below
@@ -51,6 +59,7 @@ private:
     void scheduleRefresh(); // one refreshView() per burst of totals / status signals
     void refreshView();
     void refreshCount();
+    void refreshLatest();
 
     WalletController* controller_ = nullptr;
     QStackedLayout* states_ = nullptr;
@@ -63,6 +72,9 @@ private:
     QAction* hideZero_ = nullptr;
     QAction* hideDust_ = nullptr;
     QLabel* countLabel_ = nullptr;
+    QWidget* latestTitle_ = nullptr;
+    QTableView* latest_ = nullptr;
+    PaymentsModel* latestModel_ = nullptr;
     QString countText_;
     QWidget* details_ = nullptr;
     QPushButton* detailsButton_ = nullptr;

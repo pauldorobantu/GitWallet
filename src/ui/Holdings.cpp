@@ -683,6 +683,10 @@ HoldingsTable::HoldingsTable(WalletController* controller, QWidget* parent)
     header->setSortIndicator(ColValue, Qt::DescendingOrder);
     header->setSectionResizeMode(QHeaderView::ResizeToContents);
     header->setSectionResizeMode(ColName, QHeaderView::Stretch);
+    // A card ends with its last row: empty room under it reads as something still loading.
+    view->setSizeAdjustPolicy(QAbstractScrollArea::AdjustToContents);
+    view->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
     root->addWidget(view);
 
     ui_->refresh = new QTimer(this);

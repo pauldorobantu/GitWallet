@@ -2574,6 +2574,16 @@ bool writeScreenPictures(const QString& folder)
 
     // What came in: payments on three wallets, as they would come.
     wallet::PaymentBook::setPauseForTest(10);
+    // Nothing over the pictures: what comes in is on lines of its own.
+    const QString alertsWere = SettingsRepo().get(QStringLiteral("ui.paymentAlerts"));
+    SettingsRepo().set(QStringLiteral("ui.paymentAlerts"), QStringLiteral("0"));
+    {
+        QStringList read;
+        const wallet::Network ether = wallet::findNetwork(QStringLiteral("ethereum"))->network;
+        for (const wallet::Asset asset : wallet::networkInfo(ether).assets)
+            read.append(wallet::assetInfo(asset).key);
+        controller->payments()->noteAnswered(ether, 0, {}, read);
+    }
     wallet::HistoryBook* book = controller->historyOf(bitcoin)->book();
     const auto payBitcoin = [&](quint32 wallet, quint32 index, qint64 satoshi, int height, uint32_t nonce) {
         const wallet::AccountKey* key = nullptr;
@@ -2625,6 +2635,12 @@ bool writeScreenPictures(const QString& folder)
     holdOnEthereum(shop, 5, "ethereum/usdc", 420500000ULL);
     payBitcoin(shop, 9, 185000, 0, 3);
     pause(100);
+    int order = 1044;
+    const QList<wallet::Payment> toName = controller->payments()->all();
+    for (const wallet::Payment& payment : toName) {
+        if (payment.hasTx && payment.wallet == shop)
+            controller->setAddressLabel(payment.address, QStringLiteral("Order %1").arg(order++), &error);
+    }
     window.openPayments();
     pause(300);
     if (auto* payments = window.findChild<ui::PaymentsDialog*>()) {
@@ -2636,6 +2652,9 @@ bool writeScreenPictures(const QString& folder)
     }
     pause(100);
     wallet::PaymentBook::setPauseForTest(1000);
+    SettingsRepo().set(QStringLiteral("ui.paymentAlerts"), alertsWere);
+    window.showPage(QStringLiteral("portfolio"));
+    all = picture(QStringLiteral("portfolio-latest")) && all;
 
     // The pages as the sidebar opens them.
     for (const char* name : {"wallets", "addresses", "history", "send"}) {

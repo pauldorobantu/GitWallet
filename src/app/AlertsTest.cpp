@@ -1076,14 +1076,19 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
             QTableView* list = dialog->view();
             check(list->model()->rowCount() == scene.payments(), QStringLiteral("with all of them"));
             check(list->model()->index(0, 1).data().toString() == QStringLiteral("+10.00 USDT"), QStringLiteral("the latest first: %1").arg(list->model()->index(0, 1).data().toString()));
-            check(list->model()->index(0, 3).data().toString() == QStringLiteral("Shop"), QStringLiteral("named by its wallet"));
-            check(list->model()->index(0, 5).data().toString() == QStringLiteral("Balance went up"), QStringLiteral("saying what that rests on"));
+            check(list->model()->index(0, 4).data().toString() == QStringLiteral("Shop"), QStringLiteral("named by its wallet"));
+            check(list->model()->index(0, 6).data().toString() == QStringLiteral("Balance went up"), QStringLiteral("saying what that rests on"));
             const int lastRow = list->model()->rowCount() - 1;
-            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Pending"), QStringLiteral("a transaction by how it stands: %1").arg(list->model()->index(lastRow, 5).data().toString()));
+            check(list->model()->index(lastRow, 6).data().toString() == QStringLiteral("Pending"), QStringLiteral("a transaction by how it stands: %1").arg(list->model()->index(lastRow, 6).data().toString()));
             scene.book->setHeight(first, 900000);
-            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Verifying"), QStringLiteral("on a server's word: %1").arg(list->model()->index(lastRow, 5).data().toString()));
+            check(list->model()->index(lastRow, 6).data().toString() == QStringLiteral("Verifying"), QStringLiteral("on a server's word: %1").arg(list->model()->index(lastRow, 6).data().toString()));
             scene.book->setProven(first, true);
-            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Confirmed") || list->model()->index(lastRow, 5).data().toString().contains(QLatin1String("confirmation")), QStringLiteral("proven: %1").arg(list->model()->index(lastRow, 5).data().toString()));
+            check(list->model()->index(lastRow, 6).data().toString() == QStringLiteral("Confirmed") || list->model()->index(lastRow, 6).data().toString().contains(QLatin1String("confirmation")), QStringLiteral("proven: %1").arg(list->model()->index(lastRow, 6).data().toString()));
+            // Who it was for.
+            QString labelError;
+            const QString firstAddress = model->at(scene.rowOf(1)).address;
+            check(controller->setAddressLabel(firstAddress, QStringLiteral("Order 1042"), &labelError), QStringLiteral("(a label: %1)").arg(labelError));
+            check(list->model()->index(lastRow, 3).data().toString() == QStringLiteral("Order 1042"), QStringLiteral("a line names who paid by the address's label: %1").arg(list->model()->index(lastRow, 3).data().toString()));
             check(list->model()->index(0, 1).data(Qt::FontRole).value<QFont>().weight() > QFont::Normal, QStringLiteral("what has not been looked at is bold"));
             const int shownNow = list->model()->rowCount();
             setToken(9, 10000000);
@@ -1103,6 +1108,19 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         // A new one after that counts alone.
         setToken(10, 10000000);
         check(payments->unread() == 1 && title->unreadPayments() == 1, QStringLiteral("what comes next counts from one"));
+        // The first screen has it too, without opening anything.
+        scene.window->showPage(QStringLiteral("portfolio"));
+        pause(50);
+        auto* portfolioPage = scene.window->findChild<ui::PortfolioPage*>();
+        auto* latest = portfolioPage->findChild<QTableView*>(QStringLiteral("latestPayments"));
+        check(latest && latest->isVisible() && latest->model()->rowCount() > 0 && latest->model()->rowCount() <= 50, QStringLiteral("the Portfolio shows the latest payments"));
+        if (latest) {
+            check(latest->model()->index(0, 1).data().toString() == QStringLiteral("+10.00 USDT"), QStringLiteral("the latest first: %1").arg(latest->model()->index(0, 1).data().toString()));
+            check(payments->unread() == 1, QStringLiteral("and showing them marks nothing as looked at"));
+            emit latest->clicked(latest->model()->index(0, 1));
+            check(scene.window->placeBar()->place().address.has_value(), QStringLiteral("one click opens the address it came to"));
+            scene.window->showPage(QStringLiteral("portfolio"));
+        }
         told.clear();
         pause(50);
 

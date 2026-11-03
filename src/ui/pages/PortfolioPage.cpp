@@ -1,5 +1,9 @@
 #include "ui/pages/PortfolioPage.h"
 
+#include "ui/HoverRowTable.h"
+#include "ui/PaymentsModel.h"
+#include "wallet/Payments.h"
+
 #include "app/WalletController.h"
 #include "chain/Address.h"
 #include "chain/Amount.h"
@@ -22,6 +26,8 @@
 #include <QDate>
 #include <QDateTime>
 #include <QFormLayout>
+#include <QHeaderView>
+#include <QTableView>
 #include <QFrame>
 #include <QHash>
 #include <QHBoxLayout>
@@ -229,8 +235,55 @@ QWidget* PortfolioPage::buildWalletState()
     table_ = new HoldingsTable(controller_, host);
     table_->setObjectName(QStringLiteral("portfolioCoins"));
     table_->showCoins();
-    root->addWidget(table_, 1);
+    // Many coins later they scroll inside it, and do not push who just paid off the page.
+    constexpr int kMostCoinRows = 6;
+    table_->view()->setMaximumHeight(table_->view()->horizontalHeader()->sizeHint().height() + kMostCoinRows * 52 + 2);
+    root->addWidget(table_);
     connect(table_, &HoldingsTable::coinChosen, this, &PortfolioPage::coinChosen);
+
+    auto* latestRow = new QWidget(host);
+    latestTitle_ = latestRow;
+    latestRow->setObjectName(QStringLiteral("latestPaymentsTitle"));
+    auto* latestLine = new QHBoxLayout(latestRow);
+    latestLine->setContentsMargins(0, page::kFormVSpacing, 0, 0);
+    latestLine->setSpacing(page::kToolbarSpacing);
+    auto* latestTitle = new QLabel(QStringLiteral("Latest payments"), latestRow);
+    latestTitle->setObjectName(QStringLiteral("sectionTitle"));
+    latestLine->addWidget(latestTitle);
+    latestLine->addStretch(1);
+    auto* allPayments = new QPushButton(QStringLiteral("All payments"), latestRow);
+    allPayments->setObjectName(QStringLiteral("pathLink"));
+    connect(allPayments, &QPushButton::clicked, this, &PortfolioPage::paymentsRequested);
+    latestLine->addWidget(allPayments);
+    root->addWidget(latestRow);
+
+    latestModel_ = new PaymentsModel(controller_, 50, this);
+    auto* latest = new HoverRowTableView(host);
+    latest_ = latest;
+    latest->setObjectName(QStringLiteral("latestPayments"));
+    latest->setModel(latestModel_);
+    page::configureTable(latest);
+    latest->setMouseTracking(true);
+    latest->setWordWrap(false);
+    latest->setSelectionMode(QAbstractItemView::NoSelection);
+    latest->setFocusPolicy(Qt::StrongFocus);
+    latest->viewport()->setCursor(Qt::PointingHandCursor);
+    QHeaderView* latestHeader = latest->horizontalHeader();
+    latestHeader->setStretchLastSection(false);
+    latestHeader->setResizeContentsPrecision(0);
+    latestHeader->setSectionResizeMode(QHeaderView::ResizeToContents);
+    latestHeader->setSectionResizeMode(PaymentsModel::ColLabel, QHeaderView::Stretch);
+    latest->setColumnHidden(PaymentsModel::ColAddress, true);
+    root->addWidget(latest, 1000);
+    root->addStretch(1);
+    connect(latest, &QAbstractItemView::clicked, this, [this](const QModelIndex& index) {
+        if (const wallet::Payment* payment = latestModel_->at(index.row()))
+            emit paymentChosen(*payment);
+    });
+    connect(controller_->payments(), &wallet::PaymentBook::changed, this, &PortfolioPage::refreshLatest);
+    connect(controller_, &WalletController::historyProgress, latestModel_, &PaymentsModel::refreshStates);
+    connect(controller_, &WalletController::labelsChanged, latestModel_, &PaymentsModel::refreshLabels);
+    refreshLatest();
     connect(table_, &HoldingsTable::refreshed, this, [this] {
         allocation_->setParts(table_->parts());
         refreshCount();
@@ -480,6 +533,14 @@ void PortfolioPage::refreshView()
                               : trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
                                     .arg(formatCount(walletCount), figures::countSoFar(model ? model->fundedCount() : 0, allAnswered), formatCount(derived));
     refreshCount();
+}
+
+void PortfolioPage::refreshLatest()
+{
+    latestModel_->refresh();
+    const bool any = latestModel_->rowCount() > 0;
+    latestTitle_->setVisible(any);
+    latest_->setVisible(any);
 }
 
 void PortfolioPage::refreshCount()

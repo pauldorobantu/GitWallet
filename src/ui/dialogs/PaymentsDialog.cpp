@@ -8,6 +8,7 @@
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
+#include "ui/PaymentsModel.h"
 #include "ui/design/Style.h"
 #include "wallet/History.h"
 #include "wallet/Payments.h"
@@ -30,185 +31,6 @@
 
 namespace app::ui {
 
-namespace {
-
-enum Column { ColWhen, ColAmount, ColUsd, ColWallet, ColAddress, ColState, ColumnCount };
-
-class PaymentsModel : public QAbstractTableModel
-{
-public:
-    explicit PaymentsModel(WalletController* controller, QObject* parent) : QAbstractTableModel(parent), controller_(controller) {}
-
-    // The latest first: a row's place moves with each that comes, so it is all told again.
-    void refresh()
-    {
-        beginResetModel();
-        shown_ = int(controller_->payments()->all().size());
-        endResetModel();
-    }
-    // How a payment stands now can move with nothing new having come.
-    void refreshStates()
-    {
-        if (rowCount() > 0)
-            emit dataChanged(index(0, ColState), index(rowCount() - 1, ColState));
-    }
-    const wallet::Payment* at(int row) const
-    {
-        const QList<wallet::Payment>& all = controller_->payments()->all();
-        const int at = shown_ - 1 - row;
-        return row >= 0 && at >= 0 && at < all.size() ? &all.at(at) : nullptr;
-    }
-
-    int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : shown_; }
-    int columnCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : ColumnCount; }
-
-    QVariant headerData(int section, Qt::Orientation orientation, int role) const override
-    {
-        if (orientation != Qt::Horizontal)
-            return QAbstractTableModel::headerData(section, orientation, role);
-        if (role == Qt::TextAlignmentRole && (section == ColAmount || section == ColUsd))
-            return QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
-        if (role == Qt::ToolTipRole && section == ColUsd)
-            return trText(QStringLiteral("At the price when it came"));
-        if (role != Qt::DisplayRole)
-            return {};
-        switch (section) {
-        case ColWhen: return trText(QStringLiteral("When"));
-        case ColAmount: return trText(QStringLiteral("Amount"));
-        case ColUsd: return QStringLiteral("USD");
-        case ColWallet: return trText(QStringLiteral("Wallet"));
-        case ColAddress: return trText(QStringLiteral("Address"));
-        case ColState: return trText(QStringLiteral("State"));
-        default: return {};
-        }
-    }
-
-    QVariant data(const QModelIndex& index, int role) const override
-    {
-        const wallet::Payment* payment = at(index.row());
-        if (!payment || index.parent().isValid())
-            return {};
-        switch (role) {
-        case Qt::DisplayRole:
-            switch (index.column()) {
-            case ColWhen: {
-                static const QLocale english(QLocale::English, QLocale::UnitedStates);
-                return english.toString(QDateTime::fromMSecsSinceEpoch(payment->at), QStringLiteral("d MMM HH:mm"));
-            }
-            case ColAmount: return amountText(*payment);
-            case ColUsd: return payment->usd > 0.0 ? figures::formatUsd(payment->usd) : figures::dash();
-            case ColWallet: {
-                const wallet::WalletEntry* entry = controller_->store().find(payment->wallet);
-                return entry ? entry->label : figures::dash();
-            }
-            case ColAddress:
-                return payment->addresses > 1 ? trText(QStringLiteral("%1 and %2 more")).arg(payment->address).arg(payment->addresses - 1) : payment->address;
-            case ColState: return stateText(*payment);
-            default: return {};
-            }
-        case Qt::FontRole:
-            if (!payment->read) {
-                QFont bold;
-                bold.setWeight(QFont::DemiBold);
-                return bold;
-            }
-            return {};
-        case Qt::ForegroundRole:
-            if (index.column() == ColState) {
-                const QString state = stateKey(*payment);
-                if (state == QLatin1String("block"))
-                    return toneColor(Tone::Success);
-                if (state == QLatin1String("pending"))
-                    return toneColor(Tone::Warning);
-                if (state == QLatin1String("gone"))
-                    return toneColor(Tone::Error);
-                return toneColor(Tone::Muted);
-            }
-            return {};
-        case Qt::TextAlignmentRole:
-            if (index.column() == ColAmount || index.column() == ColUsd)
-                return QVariant::fromValue(Qt::Alignment(Qt::AlignRight | Qt::AlignVCenter));
-            return {};
-        case Qt::ToolTipRole:
-            if (index.column() == ColWhen && payment->whileClosed)
-                return trText(QStringLiteral("It came while GitWallet was closed: this is when it was noticed"));
-            if (index.column() == ColState && !payment->hasTx)
-                return trText(QStringLiteral("This network has no history here yet: the balance went up by this much"));
-            if (index.column() == ColState && stateKey(*payment) == QLatin1String("pending"))
-                return trText(QStringLiteral("It can still be replaced: do not count it as paid yet"));
-            return {};
-        default:
-            return {};
-        }
-    }
-
-private:
-    static QString amountText(const wallet::Payment& payment)
-    {
-        const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
-        if (!info)
-            return payment.asset;
-        try {
-            return QLatin1Char('+') + figures::formatAmount(payment.amount, *info) + QLatin1Char(' ') + info->symbol;
-        } catch (const std::exception&) {
-            return figures::dash();
-        }
-    }
-
-    const wallet::TxRecord* recordOf(const wallet::Payment& payment) const
-    {
-        const wallet::AssetInfo* info = payment.hasTx ? wallet::findAsset(payment.asset) : nullptr;
-        const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
-        const int position = history ? history->book()->find(payment.txid) : -1;
-        return position >= 0 ? &history->book()->at(position) : nullptr;
-    }
-
-    bool proofFailed(const wallet::Payment& payment) const
-    {
-        const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
-        const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
-        return history && history->proofFailed(payment.txid);
-    }
-
-    QString stateKey(const wallet::Payment& payment) const
-    {
-        if (!payment.hasTx)
-            return QStringLiteral("balance");
-        const wallet::TxRecord* tx = recordOf(payment);
-        if (!tx)
-            return QStringLiteral("gone");
-        if (tx->seen != wallet::TxSeen::Alive || (tx->height > 0 && !tx->proven && proofFailed(payment)))
-            return QStringLiteral("gone");
-        return tx->height > 0 && tx->proven ? QStringLiteral("block") : QStringLiteral("pending");
-    }
-
-    QString stateText(const wallet::Payment& payment) const
-    {
-        if (!payment.hasTx)
-            return trText(QStringLiteral("Balance went up"));
-        const wallet::TxRecord* tx = recordOf(payment);
-        if (!tx)
-            return figures::dash();
-        if (tx->seen == wallet::TxSeen::Replaced)
-            return trText(QStringLiteral("Replaced"));
-        if (tx->seen == wallet::TxSeen::Dropped)
-            return trText(QStringLiteral("Dropped"));
-        if (tx->height <= 0)
-            return trText(QStringLiteral("Pending"));
-        if (tx->proven) {
-            const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
-            const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
-            return figures::confirmations(history ? qMax(1, history->tip() - tx->height + 1) : 1);
-        }
-        return proofFailed(payment) ? trText(QStringLiteral("Not verified")) : trText(QStringLiteral("Verifying"));
-    }
-
-    WalletController* controller_ = nullptr;
-    int shown_ = 0;
-};
-
-} // namespace
-
 PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     : QDialog(parent), controller_(controller)
 {
@@ -218,8 +40,7 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     auto* root = new QVBoxLayout(this);
     page::applyDialogLayout(root);
 
-    auto* model = new PaymentsModel(controller_, this);
-    model->refresh();
+    auto* model = new PaymentsModel(controller_, 0, this);
     lastAtOpen_ = controller_->payments()->lastId();
     auto* view = new HoverRowTableView(this);
     view_ = view;
@@ -235,7 +56,7 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     // What is on screen sets the widths: measuring a thousand rows at each change holds up the scanners too.
     header->setResizeContentsPrecision(0);
     header->setSectionResizeMode(QHeaderView::ResizeToContents);
-    header->setSectionResizeMode(ColAddress, QHeaderView::Stretch);
+    header->setSectionResizeMode(PaymentsModel::ColAddress, QHeaderView::Stretch);
     root->addWidget(view, 1);
 
     nothing_ = page::makeEmptyState(this, int(icon::Kind::Bell), QStringLiteral("No payment yet"),
@@ -276,6 +97,7 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
         updateState();
     });
     connect(controller_, &WalletController::historyProgress, model, &PaymentsModel::refreshStates);
+    connect(controller_, &WalletController::labelsChanged, model, &PaymentsModel::refreshLabels);
 
     page::fitDialog(this, page::DialogSize::Wide);
     updateState();
