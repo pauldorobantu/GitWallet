@@ -12,6 +12,7 @@
 #include "ui/PlaceBar.h"
 #include "ui/QrCode.h"
 #include "ui/TableUtil.h"
+#include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
 #include "ui/pages/HoldingsPage.h"
@@ -2414,6 +2415,20 @@ bool writeScreenPictures(const QString& folder)
     window.show();
     WalletController* controller = window.controller();
     offline(controller);
+    pause(300);
+    bool shownFirst = window.grab().save(folder + QStringLiteral("/first-run.png"));
+    {
+        ui::ImportSeedDialog one(controller, &window, false);
+        one.show();
+        pause(300);
+        shownFirst = one.grab().save(folder + QStringLiteral("/add-wallet.png")) && shownFirst;
+        one.reject();
+        ui::ImportSeedDialog many(controller, &window, true);
+        many.show();
+        pause(300);
+        shownFirst = many.grab().save(folder + QStringLiteral("/add-many.png")) && shownFirst;
+        many.reject();
+    }
     controller->setStatusForTest([](wallet::NetworkStatus& status) {
         status.connecting = false;
         status.scanning = false;
@@ -2515,7 +2530,7 @@ bool writeScreenPictures(const QString& folder)
         pause(500);
         return window.grab().save(folder + QLatin1Char('/') + name + QStringLiteral(".png"));
     };
-    bool all = true;
+    bool all = shownFirst;
     window.showPage(QStringLiteral("portfolio"));
     window.findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
     all = picture(QStringLiteral("portfolio")) && all;
@@ -2604,6 +2619,14 @@ bool writeScreenPictures(const QString& folder)
     }
     pause(100);
     wallet::PaymentBook::setPauseForTest(1000);
+
+    // The pages as the sidebar opens them.
+    for (const char* name : {"wallets", "addresses", "history", "send"}) {
+        window.showPage(QString::fromLatin1(name));
+        all = picture(QString::fromLatin1(name)) && all;
+    }
+    window.showPage(QStringLiteral("settings"));
+    all = picture(QStringLiteral("settings-top")) && all;
 
     // Settings, down where the password and the backup are, and the lock itself.
     window.showPage(QStringLiteral("settings"));
