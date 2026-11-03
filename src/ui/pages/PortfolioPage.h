@@ -31,8 +31,7 @@ class PaymentsModel;
 // and "Add many" beside it (importRequested, importManyRequested). With wallets: the grand total in
 // USD and what it is made of, then one row per coin, which opens to that coin. A figure reads plain
 // only once every balance behind it has answered; until then it reads "—" (nothing known yet) or
-// "≥ X" (what is known so far), and the line under the total says why. How the scan stands and on
-// which servers is under Details, as is usual: detail stays hidden until asked for.
+// "≥ X" (what is known so far), and the line under the total says why.
 class PortfolioPage : public QWidget
 {
     Q_OBJECT
@@ -76,17 +75,8 @@ private:
     QTableView* latest_ = nullptr;
     PaymentsModel* latestModel_ = nullptr;
     QString countText_;
-    QWidget* details_ = nullptr;
-    QPushButton* detailsButton_ = nullptr;
     // Chip: "Connecting…" / "Address limit reached" / "Ethereum endpoint answers for
     // another network" / "ETH balances from 14:02" / "Scanning…" / "Incomplete" / "Up to date"
-    QLabel* scanLabel_ = nullptr;
-    QLabel* walletsLabel_ = nullptr;
-    QLabel* scannedLabel_ = nullptr;
-    QLabel* usedLabel_ = nullptr;
-    QLabel* fundedLabel_ = nullptr;
-    QList<QLabel*> serverLabels_; // one per wallet::networks() entry, in that order
-    QPushButton* refreshButton_ = nullptr;
     QTimer* rowsTimer_ = nullptr; // a scan signals per address; the figures follow a few times a second
     bool refreshPending_ = false;
 };

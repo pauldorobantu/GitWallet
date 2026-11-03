@@ -15,6 +15,7 @@
 #include "ui/Figures.h"
 #include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/dialogs/PaymentsDialog.h"
+#include "ui/dialogs/StatusDialog.h"
 #include "ui/TableUtil.h"
 #include "ui/pages/WalletsPage.h"
 #include "ui/pages/AddressesPage.h"
@@ -47,6 +48,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QResizeEvent>
+#include <QShortcut>
 #include <QShowEvent>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
@@ -438,16 +440,50 @@ void MainWindow::buildUi()
         isMaximized() ? showNormal() : showMaximized();
     });
     connect(title_, &TitleBar::closed, this, &QWidget::close);
-    connect(title_, &TitleBar::menuToggled, this,
-            [this] { nav_->setCollapsed(!nav_->isCollapsed()); });
     connect(title_, &TitleBar::languageSelected, this,
             [](const QString& code) { LanguageManager::instance()->setLanguage(code); });
-    connect(title_, &TitleBar::settingsRequested, this, [this] { openPage(PageSettings); });
     connect(title_, &TitleBar::paymentsRequested, this, &MainWindow::openPayments);
+    connect(title_, &TitleBar::statusRequested, this, &MainWindow::openStatus);
+    connect(title_, &TitleBar::refreshRequested, this, &MainWindow::refreshNow);
+    refreshCooldown_ = new QTimer(this);
+    refreshCooldown_->setSingleShot(true);
+    refreshCooldown_->setInterval(3000);
+    connect(refreshCooldown_, &QTimer::timeout, this, [this] { title_->setRefreshEnabled(true); });
 
     connect(nav_, &SideNav::navigate, this, [this](int pageId, int) { openPage(pageId); });
-    connect(nav_, &SideNav::toggleRequested, this,
-            [this] { nav_->setCollapsed(!nav_->isCollapsed()); });
+    const auto foldNav = [this] {
+        navByHand_ = !nav_->isCollapsed();
+        nav_->setCollapsed(navByHand_);
+        theme::ThemeManager* themes = theme::ThemeManager::instance();
+        theme::Appearance look = themes->appearance();
+        look.navCollapsed = navByHand_;
+        themes->updateAppearance(look);
+    };
+    connect(nav_, &SideNav::toggleRequested, this, foldNav);
+    navByHand_ = theme::ThemeManager::instance()->appearance().navCollapsed;
+    nav_->setCollapsed(navByHand_, false);
+
+    // What the sidebar's and the title bar's tooltips promise.
+    const auto shortcut = [this](const QKeySequence& keys, const std::function<void()>& action) {
+        connect(new QShortcut(keys, this), &QShortcut::activated, this, [this, action] {
+            if (!locked_)
+                action();
+        });
+    };
+    shortcut(QKeySequence(Qt::CTRL | Qt::Key_M), foldNav);
+    shortcut(QKeySequence(Qt::Key_F5), [this] { refreshNow(); });
+    shortcut(QKeySequence::Find, [this] {
+        if (QWidget* page = stack_->currentWidget()) {
+            const QList<QLineEdit*> searches = page->findChildren<QLineEdit*>(QStringLiteral("mimSearch"));
+            for (QLineEdit* search : searches) {
+                if (search->isVisible()) {
+                    search->setFocus();
+                    search->selectAll();
+                    return;
+                }
+            }
+        }
+    });
 
     nav_->select(PagePortfolio);
 }
@@ -659,6 +695,25 @@ void MainWindow::openPayments()
     });
     // open(), not exec(): the scanners go on, and so does the list.
     dialog->open();
+}
+
+void MainWindow::openStatus()
+{
+    if (locked_)
+        return;
+    auto* dialog = new StatusDialog(controller_, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->open();
+}
+
+void MainWindow::refreshNow()
+{
+    if (locked_ || !controller_->hasWallet() || refreshCooldown_->isActive())
+        return;
+    controller_->refresh();
+    Feedback::show(this, Feedback::Type::Info, trText(QStringLiteral("Refreshing prices and balances")));
+    title_->setRefreshEnabled(false);
+    refreshCooldown_->start();
 }
 
 void MainWindow::openPaymentAddress(const wallet::Payment& payment)
@@ -1179,9 +1234,28 @@ void MainWindow::refreshStatus()
     // signals, so this is where notices about the old inputs go.
     if (pruneNotices())
         renderNotices();
+    // A lookup that failed and has since been made good needs nobody's attention: the figures say
+    // so by being current. Marked, not dropped, so a repeat within kToastRepeatMs stays quiet.
+    if (controller_->figuresCurrent()) {
+        bool cleared = false;
+        for (Notice& n : notices_) {
+            if (!n.seen && n.key.startsWith(QLatin1String("failure:"))) {
+                n.seen = true;
+                cleared = true;
+            }
+        }
+        if (cleared)
+            renderNotices();
+    }
     // The controller's line says by itself when a balance is missing or stale;
     // dismissing the notices does not hide that.
-    title_->setStatus(locked_ ? trText(QStringLiteral("Locked")) : controller_->statusText());
+    if (locked_) {
+        title_->setStatus(trText(QStringLiteral("Locked")), QString(), toneColor(Tone::Muted));
+    } else {
+        const Tone tones[] = {Tone::Success, Tone::Accent, Tone::Warning, Tone::Error, Tone::Muted};
+        title_->setStatus(controller_->statusLead(), controller_->statusText() + QLatin1Char('\n') + trText(QStringLiteral("Click for the scan status and servers")), toneColor(tones[int(controller_->statusTone())]));
+    }
+    title_->setRefreshAvailable(controller_->hasWallet());
 }
 
 void MainWindow::onWalletError(wallet::Problem kind, const QString& message, const QString& serverDetail)
@@ -1414,6 +1488,13 @@ void MainWindow::resizeEvent(QResizeEvent* event)
 {
     QWidget::resizeEvent(event);
     refreshFrame();
+    // A narrow window goes to the rail for the room, and back to what was chosen.
+    constexpr int kNarrowBelow = 1200;
+    const bool narrow = width() < kNarrowBelow;
+    if (narrow != wasNarrow_ && nav_) {
+        wasNarrow_ = narrow;
+        nav_->setCollapsed(narrow || navByHand_, false);
+    }
 }
 
 void MainWindow::showEvent(QShowEvent* event)

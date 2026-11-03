@@ -11,7 +11,6 @@
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QRegularExpression>
 #include <QToolButton>
 #include <QVector>
 
@@ -71,7 +70,7 @@ QIcon bellIcon(const QColor& color, const QColor& accent, int unread, qreal dpr)
     return QIcon(out);
 }
 
-QPixmap statusDotPixmap(bool active, qreal dpr)
+QPixmap statusDotPixmap(const QColor& color, qreal dpr)
 {
     const int d = 8;
     QPixmap pm(qRound(d * dpr), qRound(d * dpr));
@@ -80,8 +79,7 @@ QPixmap statusDotPixmap(bool active, qreal dpr)
     QPainter p(&pm);
     p.setRenderHint(QPainter::Antialiasing);
     p.setPen(Qt::NoPen);
-    p.setBrush(active ? theme::ThemeManager::instance()->color(QStringLiteral("accent"))
-                      : theme::ThemeManager::instance()->color(QStringLiteral("muted")));
+    p.setBrush(color);
     p.drawEllipse(QRectF(0.5, 0.5, d - 1, d - 1));
     p.end();
     return pm;
@@ -149,7 +147,7 @@ TitleBar::TitleBar(QWidget* window, QWidget* parent)
         tm->updateAppearance(app); // salvează + aplică instant
     });
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this,
-            [this]() { refreshThemeIcon(); refreshStatusDot(); });
+            [this]() { refreshThemeIcon(); });
     layout->addWidget(themeBtn_, 0, Qt::AlignVCenter);
 
     // Settings + About — utilitățile stau în bara de sus, nu în sidebar.
@@ -168,20 +166,18 @@ TitleBar::TitleBar(QWidget* window, QWidget* parent)
     lockBtn_ = makeUtilityBtn(QString());
     lockBtn_->setObjectName(QStringLiteral("tbLock"));
     lockBtn_->hide();
-    settingsBtn_ = makeUtilityBtn(QStringLiteral("Settings"));
-    aboutBtn_ = makeUtilityBtn(QStringLiteral("About"));
+    refreshBtn_ = makeUtilityBtn(QString());
+    refreshBtn_->setObjectName(QStringLiteral("tbRefresh"));
+    refreshBtn_->hide();
     refreshUtilityIcons();
     connect(bellBtn_, &QToolButton::clicked, this, &TitleBar::paymentsRequested);
     connect(lockBtn_, &QToolButton::clicked, this, &TitleBar::lockRequested);
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this]() { refreshUtilityIcons(); });
-    connect(settingsBtn_, &QToolButton::clicked, this, &TitleBar::settingsRequested);
-    connect(aboutBtn_, &QToolButton::clicked, this, &TitleBar::aboutRequested);
+    connect(refreshBtn_, &QToolButton::clicked, this, &TitleBar::refreshRequested);
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this,
             [this]() { refreshUtilityIcons(); });
     layout->addWidget(bellBtn_, 0, Qt::AlignVCenter);
     layout->addWidget(lockBtn_, 0, Qt::AlignVCenter);
-    layout->addWidget(settingsBtn_, 0, Qt::AlignVCenter);
-    layout->addWidget(aboutBtn_, 0, Qt::AlignVCenter);
     layout->addSpacing(8);
 
     // Status live: chip pill cu punct colorat + text (page · running · proxy).
@@ -197,9 +193,12 @@ TitleBar::TitleBar(QWidget* window, QWidget* parent)
     chipLayout->addWidget(statusDot_, 0, Qt::AlignVCenter);
     chipLayout->addWidget(statusText_, 0, Qt::AlignVCenter);
     statusChip_->hide();
+    statusChip_->setCursor(Qt::PointingHandCursor);
+    statusChip_->installEventFilter(this);
 
     layout->addSpacing(10);
     layout->addWidget(statusChip_, 0, Qt::AlignVCenter);
+    layout->addWidget(refreshBtn_, 0, Qt::AlignVCenter);
     layout->addSpacing(6);
 
     auto* minBtn = makeWindowButton(static_cast<int>(icon::Kind::Minimize), "tbMin");
@@ -225,10 +224,20 @@ TitleBar::TitleBar(QWidget* window, QWidget* parent)
 void TitleBar::setUtilityButtonsVisible(bool on)
 {
     utilityVisible_ = on;
-    for (QToolButton* b : { settingsBtn_, aboutBtn_, bellBtn_ })
-        if (b)
-            b->setVisible(on);
+    bellBtn_->setVisible(on);
+    refreshBtn_->setVisible(on && refreshAvailable_);
     lockBtn_->setVisible(on && lockAvailable_);
+}
+
+void TitleBar::setRefreshAvailable(bool available)
+{
+    refreshAvailable_ = available;
+    refreshBtn_->setVisible(utilityVisible_ && available);
+}
+
+void TitleBar::setRefreshEnabled(bool enabled)
+{
+    refreshBtn_->setEnabled(enabled);
 }
 
 void TitleBar::setUnreadPayments(int unread)
@@ -243,29 +252,18 @@ void TitleBar::setLockAvailable(bool available)
     lockBtn_->setVisible(utilityVisible_ && available);
 }
 
-void TitleBar::setStatus(const QString& text)
+void TitleBar::setStatus(const QString& lead, const QString& whole, const QColor& dot)
 {
     if (!statusChip_ || !statusText_)
         return;
-    if (text.trimmed().isEmpty()) {
+    if (lead.trimmed().isEmpty()) {
         statusChip_->hide();
         return;
     }
-    statusText_->setText(text);
-    refreshStatusDot();
+    statusText_->setText(lead);
+    statusChip_->setToolTip(whole);
+    statusDot_->setPixmap(statusDotPixmap(dot, devicePixelRatioF()));
     statusChip_->show();
-}
-
-void TitleBar::refreshStatusDot()
-{
-    if (!statusDot_)
-        return;
-    const QString text = statusText_ ? statusText_->text() : QString();
-    // "N running" (N > 0) → active green; otherwise gray.
-    const bool active = QRegularExpression(QStringLiteral("\\b[1-9]\\d* running"))
-                            .match(text)
-                            .hasMatch();
-    statusDot_->setPixmap(statusDotPixmap(active, devicePixelRatioF()));
 }
 
 void TitleBar::refreshThemeIcon()
@@ -283,10 +281,10 @@ void TitleBar::refreshThemeIcon()
 void TitleBar::refreshUtilityIcons()
 {
     const QColor c = theme::ThemeManager::instance()->color(QStringLiteral("textSoft"));
-    if (settingsBtn_)
-        settingsBtn_->setIcon(makeIcon(icon::Kind::Settings, c, 17, 1.8));
-    if (aboutBtn_)
-        aboutBtn_->setIcon(makeIcon(icon::Kind::Shield, c, 17, 1.8));
+    if (refreshBtn_) {
+        refreshBtn_->setIcon(makeIcon(icon::Kind::Refresh, c, 17, 1.8));
+        refreshBtn_->setToolTip(trText(QStringLiteral("Fetch prices and read the balances that are not followed live, now (F5)")));
+    }
     if (bellBtn_) {
         bellBtn_->setIcon(bellIcon(c, theme::ThemeManager::instance()->color(QStringLiteral("accent")), unreadPayments_, devicePixelRatioF()));
         bellBtn_->setToolTip(unreadPayments_ > 0 ? trText(QStringLiteral("Incoming payments: %1 not looked at yet")).arg(unreadPayments_) : trText(QStringLiteral("Incoming payments")));
@@ -358,6 +356,10 @@ void TitleBar::refreshMaxButton()
 
 bool TitleBar::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == statusChip_ && event->type() == QEvent::MouseButtonRelease) {
+        emit statusRequested();
+        return true;
+    }
     // Window state change (maximize/restore) → matching glyph.
     if (watched == window_ && event->type() == QEvent::WindowStateChange)
         refreshMaxButton();

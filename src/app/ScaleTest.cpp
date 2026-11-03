@@ -176,6 +176,11 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
             if (table->model()->rowCount() != expected)
                 report += QStringLiteral("FAIL  %1 shows %2 rows, not %3\n").arg(what).arg(table->model()->rowCount()).arg(expected);
         };
+        // Over all of them, not only those in use: what a search does with what a clear brings back.
+        if (auto* every = page ? page->findChild<QComboBox*>(QStringLiteral("stateFilter")) : nullptr) {
+            every->setCurrentIndex(1);
+            settle();
+        }
         timed(QStringLiteral("x250x"), QStringLiteral("searching what few rows match"));
         timed(QString(), QStringLiteral("clearing the search"));
         timed(QStringLiteral("7"), QStringLiteral("searching what a third of the rows match"));

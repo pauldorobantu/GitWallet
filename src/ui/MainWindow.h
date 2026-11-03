@@ -60,6 +60,8 @@ public:
     PlaceBar* placeBar() const { return placeBar_; }
     TitleBar* titleBar() const { return title_; }
     void openPayments(); // the list of what came in
+    void openStatus();   // how the scan stands, and on which servers
+    void refreshNow();   // prices and what is not followed live; not twice in a moment
     void openPaymentAddress(const wallet::Payment& payment);
     QString lastPaymentAlert() const { return lastPaymentAlert_; } // for tests
     QString lastPaymentNotification() const { return lastPaymentNotification_; } // for tests
@@ -163,6 +165,9 @@ private:
     LockPage* lockPage_ = nullptr;
     bool locked_ = false;
     QTimer* idleCheck_ = nullptr;
+    QTimer* refreshCooldown_ = nullptr;
+    bool navByHand_ = false;      // the sidebar was folded on purpose
+    bool wasNarrow_ = false;
     QElapsedTimer idleClock_;     // since the last key or mouse move anywhere in the app
     int idleLimitForTestMs_ = 0;
     QStackedWidget* stack_ = nullptr;

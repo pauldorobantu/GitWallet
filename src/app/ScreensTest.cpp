@@ -1309,7 +1309,7 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
     window.resize(1024, 800);
     pause(100);
     check(addressLine->text().startsWith(row.address.left(4)) && addressLine->text().endsWith(row.address.right(4)), QStringLiteral("and on a smaller screen with both its ends: %1").arg(addressLine->text()));
-    check(bar->width() <= 1024 - 188 && buttonNamed(bar, QStringLiteral("Show QR")) && buttonNamed(bar, QStringLiteral("Show QR"))->width() >= buttonNamed(bar, QStringLiteral("Show QR"))->sizeHint().width(), QStringLiteral("its buttons whole"));
+    check(bar->width() <= 1024 && buttonNamed(bar, QStringLiteral("Show QR")) && buttonNamed(bar, QStringLiteral("Show QR"))->width() >= buttonNamed(bar, QStringLiteral("Show QR"))->sizeHint().width(), QStringLiteral("its buttons whole"));
     window.resize(1280, 800);
     check(controller->setAddressLabel(row.address, QStringLiteral("Till 4"), &error), QStringLiteral("a label for it"));
     check(waitFor([&] { return addressLine->toolTip().startsWith(QLatin1String("Till 4")); }, 2000), QStringLiteral("shows"));

@@ -48,7 +48,6 @@ namespace {
 
 // Manual refreshes go to public Ethereum endpoints that rate-limit; a pause
 // between clicks keeps a burst of them from getting the app throttled.
-constexpr int kRefreshCooldownMs = 3000;
 // How often the page looks at how old what it shows has become.
 constexpr int kAgeCheckMs = 60 * 1000;
 // A scan signals per address: the page follows that many times a second at most.
@@ -81,27 +80,6 @@ QString shownTime(const QDateTime& when, const QDate& today)
     if (local.date() == today)
         return local.toString(QStringLiteral("HH:mm"));
     return QLocale(QLocale::English).toString(local, QStringLiteral("d MMM HH:mm"));
-}
-
-constexpr qint64 kNoncesOldSeconds = 6 * 3600;
-
-// A server row: its name, or a muted "Not connected" while there is none, and how far
-// behind a long round can leave what is not followed live.
-void setServer(QLabel* label, const wallet::NetworkStatus& status)
-{
-    QString text = status.server.isEmpty() ? trText(QStringLiteral("Not connected")) : status.server;
-    if (status.tiers.rounds > 0) {
-        const int minutes = qMax(1, status.tiers.roundSeconds / 60);
-        text += QStringLiteral(" · ")
-                + trText(QStringLiteral("%1 live, %2 read every %3 min"))
-                      .arg(formatCount(status.tiers.live), formatCount(status.tiers.rounds), formatCount(minutes));
-    }
-    // Nonces are read now and then, and all they can add is a rare address. Long overdue, the
-    // figures are as right as ever, but what lies past those windows is not looked at.
-    if (status.noncesAt.isValid() && status.noncesAt.secsTo(QDateTime::currentDateTime()) > kNoncesOldSeconds)
-        text += QStringLiteral(" · ") + trText(QStringLiteral("new addresses last looked for %1")).arg(shownTime(status.noncesAt, QDate::currentDate()));
-    label->setText(text);
-    setTone(label, status.server.isEmpty() ? Tone::Muted : Tone::Neutral);
 }
 
 } // namespace
@@ -289,33 +267,6 @@ QWidget* PortfolioPage::buildWalletState()
         refreshCount();
     });
 
-    const page::Section status = page::makeSection(host, QStringLiteral("Status"));
-    details_ = status.card;
-    QFormLayout* form = page::addSectionForm(status);
-    // Every value label starts with text, and the chip as a chip: rows laid
-    // out for an empty, unstyled label grow once the first values arrive, one
-    // event-loop pass per enclosing layout, and the chip showed clipped meanwhile.
-    scanLabel_ = new QLabel(status.card);
-    setChip(scanLabel_, trText(QStringLiteral("Scanning…")), Tone::Accent);
-    // A chip hugs its text; grown to the field's width it would paint a bar.
-    scanLabel_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
-    form->addRow(QStringLiteral("Scan"), scanLabel_);
-    const auto addValueRow = [&](const QString& label) {
-        auto* value = new QLabel(dash(), status.card);
-        value->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        form->addRow(label, value);
-        return value;
-    };
-    walletsLabel_ = addValueRow(QStringLiteral("Wallets"));
-    scannedLabel_ = addValueRow(QStringLiteral("Addresses scanned"));
-    usedLabel_ = addValueRow(QStringLiteral("Used addresses"));
-    fundedLabel_ = addValueRow(QStringLiteral("Funded addresses"));
-    for (const wallet::NetworkInfo& network : wallet::networks())
-        serverLabels_.append(addValueRow(QStringLiteral("%1 server").arg(network.name)));
-    page::finishForms({form});
-    root->addWidget(status.card);
-    details_->hide();
-
     const page::ActionBar bar = page::makeActionBar(host);
     const page::ViewMenu viewMenu = page::makeViewMenu(bar.widget);
     hideZero_ = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide zero balances"), "hideZero", SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
@@ -343,32 +294,6 @@ QWidget* PortfolioPage::buildWalletState()
     bar.left->addWidget(countLabel_);
     bar.left->addStretch(1);
 
-    detailsButton_ = new QPushButton(QStringLiteral("Details"), bar.widget);
-    detailsButton_->setCheckable(true);
-    detailsButton_->setToolTip(QStringLiteral("How the scan stands, and on which servers"));
-    connect(detailsButton_, &QPushButton::toggled, details_, &QWidget::setVisible);
-    bar.right->addWidget(detailsButton_);
-    refreshButton_ = new QPushButton(QStringLiteral("Refresh"), bar.widget);
-    refreshButton_->setToolTip(
-        QStringLiteral("Fetch prices and read the balances that are not followed live, now."));
-    const auto tintRefresh = [button = refreshButton_] {
-        page::setLabeledIcon(button, makeIcon(icon::Kind::Refresh, page::text(), 15));
-    };
-    tintRefresh();
-    // The glyph is a pixmap in the text colour of the theme it was drawn for.
-    connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, refreshButton_,
-            tintRefresh);
-    connect(refreshButton_, &QPushButton::clicked, this, [this] {
-        if (!controller_)
-            return;
-        controller_->refresh();
-        Feedback::show(refreshButton_, Feedback::Type::Info,
-                       trText(QStringLiteral("Refreshing prices and balances")));
-        refreshButton_->setEnabled(false);
-        QTimer::singleShot(kRefreshCooldownMs, refreshButton_,
-                           [button = refreshButton_] { button->setEnabled(true); });
-    });
-    bar.right->addWidget(refreshButton_);
     root->addWidget(bar.widget);
     return host;
 }
@@ -427,37 +352,24 @@ void PortfolioPage::refreshView()
         states.insert(network.network, controller_->networkStatus(network.network));
     const bool limit = controller_->addressLimitReached();
     const bool saved = controller_->showingSaved();
-    const bool loading = controller_->loadingSaved(); // part of what the database kept
     const bool unread = controller_->hasUnreadKeys(); // a key's coins are in no figure
     QStringList staleCaptions; // under the total
-    QString staleCaption;      // the first of them, on the chip for a failed refresh
-    bool anyWrongChain = false;
-    bool anyFailing = false;
     bool anyScanning = false;
-    QString wrongChainText;
     for (const wallet::NetworkInfo& network : wallet::networks()) {
         const wallet::NetworkStatus& st = states[network.network];
         anyScanning = anyScanning || st.scanning;
-        if (st.wrongChain && !anyWrongChain) {
-            anyWrongChain = true;
-            wrongChainText = trText(QStringLiteral("%1 endpoint answers for another network")).arg(network.name);
-        }
-        anyFailing = anyFailing || st.failing;
         if (st.wrongChain || st.failing || (st.connecting && !saved && st.balancesAt.isValid())) {
             const QString coin = wallet::assetInfo(network.coin).symbol;
             staleCaptions << (st.balancesAt.isValid()
                                   ? trText(QStringLiteral("%1 balances from %2")).arg(coin, shownTime(st.balancesAt, today))
                               : st.wrongChain ? trText(QStringLiteral("%1 endpoint answers for another network")).arg(network.name)
                                               : trText(QStringLiteral("%1 lookups failing")).arg(coin));
-            if (staleCaption.isEmpty())
-                staleCaption = staleCaptions.last();
         }
     }
 
     const ScopeTotal total = totalOf(controller_);
     totalLabel_->setText(total.text());
     allocation_->setParts(table_->parts());
-    const bool anyIncomplete = !total.complete;
 
     // Under the total: where the figures come from, why they are not final yet, if they
     // are not, then the prices and how old those are.
@@ -484,51 +396,10 @@ void PortfolioPage::refreshView()
     caption << controller_->pricesLine();
     pricesLabel_->setText(caption.join(QStringLiteral(" · ")));
 
-    // The controller's title-bar status, in this page's words and in its
-    // order: what keeps a balance missing or stale for good comes before
-    // "Scanning…", which a window cut at the limit would otherwise show for
-    // ever. A network followed live over Electrum with a connection lost after the
-    // scan finished is retried inside the client with nothing pending in the scanner,
-    // so without a server the chip must not claim "Up to date" either. Nor may it
-    // while a balance has no answer and nothing is scanning for it.
-    const bool anyConnecting = std::any_of(states.cbegin(), states.cend(),
-                                           [](const wallet::NetworkStatus& st) { return st.connecting; });
-    if (loading)
-        setChip(scanLabel_, trText(QStringLiteral("Loading saved balances…")), Tone::Accent);
-    else if (anyConnecting)
-        setChip(scanLabel_, trText(QStringLiteral("Connecting…")), Tone::Warning);
-    else if (limit)
-        setChip(scanLabel_, trText(QStringLiteral("Address limit reached")), Tone::Error);
-    else if (anyWrongChain)
-        setChip(scanLabel_, wrongChainText, Tone::Error);
-    else if (anyFailing)
-        setChip(scanLabel_, staleCaption, Tone::Warning);
-    else if (anyScanning)
-        setChip(scanLabel_, saved ? trText(QStringLiteral("Checking saved balances…")) : trText(QStringLiteral("Scanning…")),
-                Tone::Accent);
-    else if (anyIncomplete)
-        setChip(scanLabel_, trText(QStringLiteral("Incomplete")), Tone::Warning);
-    else if (inDoubt > 0)
-        setChip(scanLabel_, trText(QStringLiteral("Balances in doubt")), Tone::Warning);
-    else
-        setChip(scanLabel_, trText(QStringLiteral("Up to date")), Tone::Success);
     const int derived = model ? model->size() : 0;
     const int checked = model ? model->checkedCount() : 0;
     const int walletCount = int(controller_->store().wallets.size());
-    walletsLabel_->setText(formatCount(walletCount));
-    // Until the servers have answered, what a row says it knows is from an earlier run.
-    scannedLabel_->setText(saved ? trText(QStringLiteral("%1 saved")).arg(formatCount(derived))
-                           : checked >= derived
-                               ? formatCount(derived)
-                               : trText(QStringLiteral("%1 of %2"))
-                                     .arg(formatCount(checked), formatCount(derived)));
-    usedLabel_->setText(formatCount(model ? model->usedCount() : 0));
     const bool allAnswered = derived > 0 && checked >= derived;
-    fundedLabel_->setText(figures::countSoFar(model ? model->fundedCount() : 0, allAnswered));
-    const QList<wallet::NetworkInfo>& networkList = wallet::networks();
-    for (qsizetype i = 0; i < networkList.size() && i < serverLabels_.size(); ++i)
-        setServer(serverLabels_.at(i), states[networkList.at(i).network]);
-
     countText_ = derived == 0 ? trText(QStringLiteral("%1 wallets")).arg(formatCount(walletCount))
                               : trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
                                     .arg(formatCount(walletCount), figures::countSoFar(model ? model->fundedCount() : 0, allAnswered), formatCount(derived));

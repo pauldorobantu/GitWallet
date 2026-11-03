@@ -1244,6 +1244,47 @@ QString WalletController::statusText() const
     return QStringLiteral("Up to date · %1 · %2 funded").arg(rows, grouped(model_->fundedCount()));
 }
 
+QString WalletController::statusLead() const
+{
+    switch (status()) {
+    case Status::NoWallet: return ui::trText(QStringLiteral("No wallet"));
+    case Status::Loading: return ui::trText(QStringLiteral("Loading saved balances…"));
+    case Status::Connecting: return ui::trText(QStringLiteral("Connecting…"));
+    case Status::Limit: return ui::trText(QStringLiteral("Address limit reached"));
+    case Status::WrongChain: return ui::trText(QStringLiteral("Wrong network"));
+    case Status::Stale: return ui::trText(QStringLiteral("Balances not current"));
+    case Status::Scanning: return showingSaved_ ? ui::trText(QStringLiteral("Checking saved balances…")) : ui::trText(QStringLiteral("Scanning…"));
+    case Status::Unchecked: return ui::trText(QStringLiteral("Balances incomplete"));
+    case Status::Unscanned: return ui::trText(QStringLiteral("Not fully scanned"));
+    case Status::DoNotAddUp: return ui::trText(QStringLiteral("Balances in doubt"));
+    case Status::UpToDate: break;
+    }
+    return ui::trText(QStringLiteral("Up to date"));
+}
+
+WalletController::StatusTone WalletController::statusTone() const
+{
+    switch (status()) {
+    case Status::NoWallet:
+        return StatusTone::Quiet;
+    case Status::Loading:
+    case Status::Scanning:
+        return StatusTone::Working;
+    case Status::Connecting:
+    case Status::Stale:
+    case Status::Unchecked:
+    case Status::Unscanned:
+    case Status::DoNotAddUp:
+        return StatusTone::Warning;
+    case Status::Limit:
+    case Status::WrongChain:
+        return StatusTone::Bad;
+    case Status::UpToDate:
+        break;
+    }
+    return StatusTone::Good;
+}
+
 QString WalletController::priceNote(wallet::Asset asset) const
 {
     if (prices_->inDoubt(asset))

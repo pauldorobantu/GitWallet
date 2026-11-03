@@ -16,6 +16,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDate>
 #include <QDateTime>
 #include <QDir>
@@ -429,6 +430,12 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     column->addWidget(backup.card);
     connect(ui_->makeBackup, &QPushButton::clicked, this, &SettingsPage::chooseBackupFile);
     connect(ui_->restoreBackup, &QPushButton::clicked, this, &SettingsPage::chooseRestoreFile);
+
+    auto* aboutLine = new QLabel(QStringLiteral("GitWallet %1 · MIT · Icons: Lucide").arg(QCoreApplication::applicationVersion()), content);
+    aboutLine->setObjectName(QStringLiteral("aboutLine"));
+    aboutLine->setTextFormat(Qt::PlainText);
+    setTone(aboutLine, Tone::Muted);
+    column->addWidget(aboutLine);
 
     column->addStretch(1);
     scroll->setWidget(content);

@@ -572,6 +572,11 @@ const Tr kTr[] = {
     { "%1 wallet added since is not in it.", "%1 billetera añadida después no está en ella.", "%1 portefeuille ajouté depuis n'y figure pas.", "%1 danach hinzugefügtes Wallet ist nicht darin.", "%1 кошелёк, добавленный позже, в неё не входит." },
     { "Latest payments", "Últimos pagos", "Derniers paiements", "Letzte Zahlungen", "Последние платежи" },
     { "All payments", "Todos los pagos", "Tous les paiements", "Alle Zahlungen", "Все платежи" },
+    { "Wrong network", "Red equivocada", "Mauvais réseau", "Falsches Netzwerk", "Не та сеть" },
+    { "Balances not current", "Saldos no actuales", "Soldes pas à jour", "Guthaben nicht aktuell", "Балансы неактуальны" },
+    { "Click for the scan status and servers", "Haz clic para ver el estado del escaneo y los servidores", "Cliquez pour l'état de l'analyse et les serveurs", "Klicken für Scan-Status und Server", "Нажмите, чтобы увидеть статус сканирования и серверы" },
+    { "Scan status and servers", "Estado del escaneo y servidores", "État de l'analyse et serveurs", "Scan-Status und Server", "Статус сканирования и серверы" },
+    { "Fetch prices and read the balances that are not followed live, now (F5)", "Obtener precios y leer ahora los saldos que no se siguen en directo (F5)", "Récupérer les prix et lire maintenant les soldes non suivis en direct (F5)", "Preise holen und jetzt die nicht live verfolgten Guthaben lesen (F5)", "Получить цены и прочитать сейчас балансы, которые не отслеживаются вживую (F5)" },
     { "Network, currency and appearance.", "Red, moneda y apariencia.", "Réseau, devise et apparence.", "Netzwerk, Währung und Darstellung.", "Сеть, валюта и оформление." },
 };
 

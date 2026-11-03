@@ -20,11 +20,12 @@ class TitleBar : public QWidget
 public:
     explicit TitleBar(QWidget* window, QWidget* parent = nullptr);
 
-    void setStatus(const QString& text); // "page · N running · proxy :port"
-    // Settings / About buttons — hidden on the sign-in window, where there is
-    // nothing to configure yet (language + theme stay). The account lives in
-    // the sidebar's profile section (ProfileChip).
+    // A few words, the whole of it as a tooltip, and a dot in the colour of what that means.
+    void setStatus(const QString& lead, const QString& whole, const QColor& dot);
+    // The bell and Refresh: hidden behind the lock, where nothing of it shows.
     void setUtilityButtonsVisible(bool on);
+    void setRefreshAvailable(bool available);
+    void setRefreshEnabled(bool enabled);
     // What came in and has not been looked at, on the bell.
     void setUnreadPayments(int unread);
     int unreadPayments() const { return unreadPayments_; }
@@ -35,12 +36,11 @@ signals:
     void minimised();
     void maximised();
     void closed();
-    void menuToggled();
     void languageSelected(const QString& code);
-    void settingsRequested();
     void paymentsRequested();
     void lockRequested();
-    void aboutRequested();
+    void statusRequested();
+    void refreshRequested();
 
 protected:
     void mousePressEvent(QMouseEvent* event) override;
@@ -51,10 +51,9 @@ protected:
 
 private:
     QToolButton* makeWindowButton(int iconKind, const char* objectName);
-    void refreshStatusDot();
     void refreshMaxButton(); // glyph Maximize ↔ Restore după starea ferestrei
     void refreshThemeIcon(); // sun/moon după tema curentă
-    void refreshUtilityIcons(); // Settings / About
+    void refreshUtilityIcons(); // the bell, the lock and Refresh
     void refreshLangButton(); // codul limbii curente (EN/ES/FR/DE/RU)
 
     QWidget* window_ = nullptr;
@@ -64,12 +63,13 @@ private:
     QToolButton* maxBtn_ = nullptr;
     QToolButton* themeBtn_ = nullptr;
     QToolButton* langBtn_ = nullptr;
-    QToolButton* settingsBtn_ = nullptr;
-    QToolButton* aboutBtn_ = nullptr;
+    QToolButton* refreshBtn_ = nullptr;
     QToolButton* bellBtn_ = nullptr;
     QToolButton* lockBtn_ = nullptr;
     int unreadPayments_ = 0;
     bool lockAvailable_ = false;
+    bool refreshAvailable_ = false;
+    QColor statusDotColor_;
     bool utilityVisible_ = true;
     QVector<QPair<QToolButton*, QIcon>> closeButtons_; // icon alb la hover (Win11)
     bool dragging_ = false;

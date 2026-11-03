@@ -13,7 +13,7 @@ ordinary wallets stop scanning after the first gap and miss funds further down.
 > history, many more coins and spending, is in [docs/ROADMAP.md](docs/ROADMAP.md). Spending is tested on
 > test networks before it touches real funds.
 
-![Portfolio: the total, and a row per coin](docs/screenshot-portfolio.png)
+![Portfolio: the total, a row per coin, and who just paid](docs/screenshot-portfolio.png)
 
 ![A coin opens to each wallet, each wallet to its addresses, with a path above](docs/screenshot-coin-wallet.png)
 
@@ -138,7 +138,7 @@ something is still being read a figure says so: "≥" for what is known so far, 
 connection's live places on a small wallet, so nothing changes there. Past 40,000
 Bitcoin addresses, the next unused addresses of each chain stay followed live, and up to
 10,000 of those holding coins; the rest are read again and again in long rounds, about 30
-minutes at that size, and Refresh starts one if none is under way; Details on the Portfolio says
+minutes at that size, and Refresh starts one if none is under way; the status in the title bar says
 how long, and says so if a round fails or runs far past that. An address a server refuses to
 follow is read the same way, and a server that refuses everything is left for the next. On
 Ethereum, a pass that takes longer than the refresh lets the next unused addresses and those

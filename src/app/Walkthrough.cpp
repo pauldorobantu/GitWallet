@@ -793,7 +793,7 @@ void Walkthrough::buildSteps()
              expect(tableRows() == controller()->model()->counts(id).rows,
                     QStringLiteral("View addresses narrows the table to that wallet (%1 rows)").arg(tableRows()));
              expect(wholeButtons(window_->findChild<ui::AddressesPage*>(),
-                                 {QStringLiteral("Export CSV"), QStringLiteral("Refresh")}),
+                                 {QStringLiteral("Export CSV")}),
                     QStringLiteral("and the buttons of its bar have their whole width"));
          },
          nullptr},

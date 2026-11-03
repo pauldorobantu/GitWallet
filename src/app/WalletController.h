@@ -182,6 +182,10 @@ public:
     bool balancesComplete() const;
     // What is shown is as current as it gets, a key this version does not read aside.
     bool figuresCurrent() const;
+    // The first thing statusText() says, in the language in use, and how that reads.
+    QString statusLead() const;
+    enum class StatusTone { Good, Working, Warning, Bad, Quiet };
+    StatusTone statusTone() const;
     bool hasUnreadKeys() const; // a wallet has a key of a kind or network this version does not know
     // One short line for the title bar chip. "Up to date" only when
     // balancesComplete(); otherwise it leads with what keeps it from that.

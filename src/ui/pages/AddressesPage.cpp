@@ -79,7 +79,6 @@ protected:
 
 // Refresh calls CoinGecko and the public RPC endpoints, which rate-limit;
 // the same pause as the Overview page's button.
-constexpr int kRefreshCooldownMs = 3000;
 // Past this many rows a change of filter rebuilds the list and search waits for the
 // typing to stop: each costs too much to do row by row or key by key.
 constexpr int kRebuildAbove = 50000;
@@ -285,12 +284,6 @@ int fundedAmong(const wallet::WalletModel* model, int rows)
     return funded;
 }
 
-// The glyph is a pixmap in the text colour of the theme it was drawn for.
-QIcon refreshIcon()
-{
-    return makeIcon(icon::Kind::Refresh, page::text(), 15);
-}
-
 } // namespace
 
 // How long search waits for the next key, on a list this large.
@@ -311,7 +304,6 @@ struct AddressesPage::Ui : QObject
     page::ColumnChoice* columns = nullptr;
     QLabel* count = nullptr;
     QPushButton* exportCsv = nullptr;
-    QPushButton* refresh = nullptr;
     QPushButton* history = nullptr;
     QPushButton* label = nullptr;
     QPushButton* copy = nullptr;
@@ -321,7 +313,6 @@ struct AddressesPage::Ui : QObject
     QWidget* noResults = nullptr;
     QTimer* update = nullptr;    // batches recounts while a scan streams rows in
     QTimer* searchPause = nullptr; // on a large list, the query waits for the typing to stop
-    QTimer* cooldown = nullptr;  // Refresh stays disabled while it runs
     QWidget* nothingHere = nullptr; // a place where no address holds what it is about
     QWidget* onlyDust = nullptr;    // every row that would show is under the limit
     QWidget* noneInUse = nullptr;   // every row has answered, and none has been used or given out
@@ -434,10 +425,6 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->exportCsv->setToolTip(QStringLiteral("Save these addresses to a spreadsheet file, dust included, so that its balances add up to the total. It is not encrypted: "
                                               "anyone who reads it sees these addresses and balances."));
     bar.right->addWidget(ui_->exportCsv);
-    ui_->refresh = new QPushButton(QStringLiteral("Refresh"), bar.widget);
-    ui_->refresh->setToolTip(QStringLiteral("Fetch prices and read the balances that are not followed live, now"));
-    page::setLabeledIcon(ui_->refresh, refreshIcon());
-    bar.right->addWidget(ui_->refresh);
     ui_->copy = new QPushButton(QStringLiteral("Copy address"), bar.widget);
     ui_->copy->setToolTip(trText(QStringLiteral("Copies the address chosen, and counts it as given out")));
     bar.right->addWidget(ui_->copy);
@@ -454,10 +441,6 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->update->setSingleShot(true);
     ui_->update->setInterval(100);
     connect(ui_->update, &QTimer::timeout, this, &AddressesPage::updateState);
-    ui_->cooldown = new QTimer(this);
-    ui_->cooldown->setSingleShot(true);
-    ui_->cooldown->setInterval(kRefreshCooldownMs);
-    connect(ui_->cooldown, &QTimer::timeout, this, &AddressesPage::updateState);
 
     ui_->searchPause = new QTimer(this);
     ui_->searchPause->setSingleShot(true);
@@ -487,15 +470,6 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
         ui_->filter->setState(index);
         updateState();
     });
-    connect(ui_->refresh, &QPushButton::clicked, this, [this] {
-        if (!controller_)
-            return;
-        controller_->refresh();
-        Feedback::show(ui_->refresh, Feedback::Type::Info,
-                       trText(QStringLiteral("Refreshing prices and balances")));
-        ui_->cooldown->start();
-        ui_->refresh->setEnabled(false);
-    });
     connect(ui_->exportCsv, &QPushButton::clicked, this, &AddressesPage::chooseExportFile);
     connect(view, &QAbstractItemView::doubleClicked, this, &AddressesPage::openAddressOf);
     connect(ui_->history, &QPushButton::clicked, this, [this] {
@@ -518,7 +492,6 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
             [this](const QModelIndex&, int first, int last) { keepTopRow(first, last); });
 
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this, [this] {
-        page::setLabeledIcon(ui_->refresh, refreshIcon());
         applyColumnWidths(); // the font size may have changed
     });
     // Header titles and the count are runtime text (trText).
@@ -910,7 +883,6 @@ void AddressesPage::updateState()
     ui_->wallet->setEnabled(hasWallet);
     ui_->chain->setEnabled(hasWallet);
     ui_->state->setEnabled(hasWallet);
-    ui_->refresh->setEnabled(hasWallet && !ui_->cooldown->isActive());
     const bool chosen = !ui_->view->selectionModel()->selectedRows().isEmpty();
     ui_->history->setEnabled(chosen);
     ui_->label->setEnabled(chosen);
