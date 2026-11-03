@@ -697,13 +697,26 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         QObject::connect(payments, &wallet::PaymentBook::told, payments, [&told2](const QList<wallet::Payment>& some) { told2.append(some); });
         pause(50);
         check(told2.isEmpty(), QStringLiteral("and none is told again"));
-        // Told of before this start, gone from the history since, and listed again.
+        // Told of before this start, far back by now, gone from the history since, and listed again.
+        QList<wallet::Payment> since;
+        for (int i = 0; i < 100; ++i) {
+            wallet::Payment later;
+            later.id = payments->all().constLast().id + 1 + i;
+            later.at = later.id;
+            later.asset = QStringLiteral("bitcoin/btc");
+            later.amount = chain::Amount::fromU64(5000);
+            later.read = true;
+            since.append(later);
+        }
+        payments->addSaved(since);
+        const int countNow = scene.payments();
         const chain::Transaction listedAgain = transaction({somewhere(30)}, {{scene.scriptOf(17), 40000}}, 30);
         check(scene.book->find(listedAgain.txid) < 0, QStringLiteral("(not in the history)"));
         scene.book->setStatus(scene.model->at(scene.rowOf(17)).scripthash, scene.model->at(scene.rowOf(17)).status);
         scene.paid(17, QStringLiteral("x3"), 0, 40000);
         scene.add(listedAgain);
-        check(scene.book->find(listedAgain.txid) >= 0 && scene.payments() == count, QStringLiteral("nor counted twice"));
+        check(scene.book->find(listedAgain.txid) >= 0 && scene.payments() == countNow, QStringLiteral("nor counted twice"));
+        Q_UNUSED(count);
 
         // The latest so many stay.
         QList<wallet::Payment> many;

@@ -330,8 +330,9 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
             check(!ok->isEnabled(), QStringLiteral("and it has to be understood that nobody can get it back"));
             understood->setChecked(true);
             check(ok->isEnabled(), QStringLiteral("then it can be set"));
+            const QPointer<ui::PasswordDialog> still(dialog);
             ok->click();
-            check(waitFor([&] { return shown.controller->hasPassword() && !dialog->isVisible(); }, 15000), QStringLiteral("it is set, and the dialog goes"));
+            check(waitFor([&] { return shown.controller->hasPassword() && (!still || !still->isVisible()); }, 15000), QStringLiteral("it is set, and the dialog goes"));
         }
         check(wallet::WalletStore::readRawForTest(&error).contains("gitwallet-sealed"), QStringLiteral("and the file is under it"));
         check(shown.window->titleBar()->findChild<QWidget*>(QStringLiteral("tbLock"))->isVisible(), QStringLiteral("the title bar can lock it now"));
@@ -474,13 +475,16 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         if (dialog) {
             auto* current = dialog->findChild<QLineEdit*>(QStringLiteral("passwordCurrent"));
             auto* ok = dialog->findChild<QPushButton*>(QStringLiteral("dangerButton"));
+            const QPointer<ui::PasswordDialog> still(dialog);
             current->setText(QString::fromLatin1(kPassword));
             ok->click();
-            check(waitFor([&] { return ok->isEnabled(); }, 10000) && dialog->isVisible() && shown.controller->hasPassword(), QStringLiteral("the wrong one takes nothing off, and the dialog says so"));
-            check(dialog->findChild<QLabel*>(QStringLiteral("passwordStatus"))->text().contains(QLatin1String("not the password")), QStringLiteral("in those words"));
-            current->setText(QString::fromLatin1(kOtherPassword));
-            ok->click();
-            check(waitFor([&] { return !shown.controller->hasPassword(); }, 10000), QStringLiteral("the right one does"));
+            check(waitFor([&] { return !still || ok->isEnabled(); }, 10000) && still && still->isVisible() && shown.controller->hasPassword(), QStringLiteral("the wrong one takes nothing off, and the dialog says so"));
+            if (still) {
+                check(still->findChild<QLabel*>(QStringLiteral("passwordStatus"))->text().contains(QLatin1String("not the password")), QStringLiteral("in those words"));
+                current->setText(QString::fromLatin1(kOtherPassword));
+                ok->click();
+                check(waitFor([&] { return !shown.controller->hasPassword(); }, 10000), QStringLiteral("the right one does"));
+            }
         }
         check(!wallet::WalletStore::readRawForTest(&error).contains("gitwallet-sealed"), QStringLiteral("the file is as it was before"));
         check(!shown.window->titleBar()->findChild<QWidget*>(QStringLiteral("tbLock"))->isVisible(), QStringLiteral("and there is nothing to lock with"));
@@ -639,8 +643,9 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
             check(!ok->isEnabled(), QStringLiteral("and that nobody can get it back be understood"));
             asking->findChild<QCheckBox*>(QStringLiteral("passwordUnderstood"))->setChecked(true);
             check(ok->isEnabled(), QStringLiteral("then it can be made"));
+            const QPointer<ui::PasswordDialog> still(asking);
             ok->click();
-            check(waitFor([&] { return QFile::exists(viaPage) && !asking->isVisible(); }, 15000), QStringLiteral("it is there, and the dialog goes"));
+            check(waitFor([&] { return QFile::exists(viaPage) && (!still || !still->isVisible()); }, 15000), QStringLiteral("it is there, and the dialog goes"));
         }
 
         // A second wallet after it: the page says the backup does not hold it.
@@ -753,6 +758,45 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         check(probe.load(&error) && !probe.hasPassword(), QStringLiteral("a file here has no password but its own: %1").arg(error));
 
         check(shown.controller->removeAllWallets(&error) || waitFor([&] { return shown.controller->removeAllWallets(&error); }, 15000), QStringLiteral("all removed: %1").arg(error));
+    }
+
+    // The same wallet on another PC, which has given out addresses of its own: both count.
+    {
+        Window shown;
+        shown.open();
+        offline(shown.controller);
+        check(shown.controller->addKeysWallet(added, QStringLiteral("Till"), &error), QStringLiteral("the same keys under another name: %1").arg(error));
+        check(waitFor([&] { return !shown.controller->loadingSaved(); }, 15000), QStringLiteral("(ready)"));
+        wallet::WalletModel* model = shown.controller->model();
+        const quint32 own = shown.controller->store().wallets.value(0).id;
+        check(waitFor([&] { return model->find(own, bitcoin, btc.type, 0, 0, 9) >= 0; }, 15000), QStringLiteral("(its rows)"));
+        wallet::AddressRow row = model->at(model->find(own, bitcoin, btc.type, 0, 0, 9));
+        row.checked = true;
+        model->upsert(row);
+        check(shown.controller->markGivenOut(row, &error), QStringLiteral("(one given out here: %1)").arg(error));
+        WalletController::RestoreReport report;
+        bool over = false;
+        shown.controller->restoreBackup(path, QString::fromLatin1(kPassword), shown.window.get(), [&](const WalletController::RestoreReport& came) {
+            report = came;
+            over = true;
+        });
+        check(waitFor([&] { return over; }, 30000) && report.error.isEmpty(), QStringLiteral("a backup of what is here: %1").arg(report.error));
+        check(report.walletsHere == 1 && report.walletsAdded == 0 && report.givenOut == 2, QStringLiteral("says it joined the two it gave out: %1 here, %2 added, %3 given out").arg(report.walletsHere).arg(report.walletsAdded).arg(report.givenOut));
+        const auto keyHere = [&](const wallet::WalletStore& store) {
+            wallet::GivenOut given;
+            for (const wallet::AccountKey& key : store.wallets.value(0).accounts) {
+                if (key.type == btc.type)
+                    given = key.given;
+            }
+            return given;
+        };
+        const wallet::GivenOut joined = keyHere(shown.controller->store());
+        check(joined.contains(2) && joined.contains(3) && joined.contains(9), QStringLiteral("what the backup gave out, and what this one did"));
+        check(shown.controller->store().wallets.value(0).label == QLatin1String("Till"), QStringLiteral("under the name it has here"));
+        wallet::WalletStore written;
+        check(written.load(&error) && keyHere(written).contains(2) && keyHere(written).contains(9), QStringLiteral("written down: %1").arg(error));
+        check(shown.controller->nextReceive(own, bitcoin, btc.type).index != 2, QStringLiteral("and none of it is offered again"));
+        check(waitFor([&] { QString why; return shown.controller->removeAllWallets(&why); }, 15000), QStringLiteral("all removed"));
     }
 
     // Under an app password of its own, a name already taken, and a seed in a label of a made-up file.
