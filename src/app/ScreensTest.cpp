@@ -2400,13 +2400,13 @@ void runScreensTest(const Check& check, QString* report, const QList<wallet::Acc
     testQr(check, report);
     testGivenOutRuns(check);
     testGivenOutFile(check, someKeys);
-    testGivenOut(check, someKeys);
     // Leaves the box as it found it: this is one setting per Windows user.
     const QString hideZero = SettingsRepo().get(QStringLiteral("ui.hideZero"));
     const QString hideDust = SettingsRepo().get(QStringLiteral("ui.hideDust"));
     const QString alerts = SettingsRepo().get(QStringLiteral("ui.paymentAlerts"));
     // These go by every row: what dust does to a list has checks of its own.
     SettingsRepo().set(QStringLiteral("ui.hideDust"), QStringLiteral("0"));
+    testGivenOut(check, someKeys);
     testFiguresHonest(check, someKeys);
     testScreens(check, someKeys);
     testHandingOut(check, someKeys);

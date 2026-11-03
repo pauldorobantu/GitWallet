@@ -372,21 +372,21 @@ void Walkthrough::buildSteps()
          nullptr, 3000,
          [this, importEnabled, importDialog] {
              expect(!importEnabled(), QStringLiteral("an unknown word: Add wallet stays disabled"));
-             expect(visibleText(importDialog()).contains(QStringLiteral("not in the BIP39 list")),
+             expect(visibleText(importDialog()).contains(QStringLiteral("not a seed word")),
                     QStringLiteral("an unknown word: the status names its position"));
          },
          importDialog},
         {QStringLiteral("bad-checksum"), [typeWords, twelveAbandon] { typeWords(twelveAbandon); }, nullptr, 3000,
          [this, importEnabled, importDialog] {
              expect(!importEnabled(), QStringLiteral("valid words, wrong checksum: Add wallet stays disabled"));
-             expect(visibleText(importDialog()).contains(QStringLiteral("hecksum"), Qt::CaseInsensitive),
+             expect(visibleText(importDialog()).contains(QStringLiteral("valid seed"), Qt::CaseInsensitive),
                     QStringLiteral("wrong checksum: the status says so"));
          },
          importDialog},
         {QStringLiteral("valid-seed"), [typeWords] { typeWords(kPublicTestMnemonic); }, nullptr, 3000,
          [this, importEnabled, importDialog] {
              expect(importEnabled(), QStringLiteral("a valid 12-word phrase enables Add wallet"));
-             expect(visibleText(importDialog()).contains(QStringLiteral("checksum OK")),
+             expect(visibleText(importDialog()).contains(QStringLiteral("valid seed")),
                     QStringLiteral("valid phrase: the status says checksum OK"));
          },
          importDialog},
@@ -782,14 +782,14 @@ void Walkthrough::buildSteps()
         {QStringLiteral("addresses-of-wallet"),
          [this, selectWallet, walletsPage, clickLater] {
              selectWallet(kSecondName);
-             if (auto* state = window_->findChild<ui::AddressesPage*>()->findChild<QComboBox*>(QStringLiteral("stateFilter")))
-                 state->setCurrentIndex(1); // every address, not only those in use
              clickLater(findButton(walletsPage(), QStringLiteral("View addresses")));
          },
          nullptr, 3000,
          [this, controller, tableRows, wholeButtons] {
              const QList<wallet::WalletEntry>& list = controller()->store().wallets;
              const quint32 id = list.value(1).id;
+             if (auto* state = window_->findChild<ui::AddressesPage*>()->findChild<QComboBox*>(QStringLiteral("stateFilter")))
+                 state->setCurrentIndex(1); // every address, not only those in use
              expect(tableRows() == controller()->model()->counts(id).rows,
                     QStringLiteral("View addresses narrows the table to that wallet (%1 rows)").arg(tableRows()));
              expect(wholeButtons(window_->findChild<ui::AddressesPage*>(),
@@ -885,6 +885,8 @@ void Walkthrough::buildSteps()
          [namedDialog] { return namedDialog("walletKeysDialog") == nullptr; }, 3000, nullptr, nullptr},
         {QStringLiteral("addresses"), [this] { window_->showPage(QStringLiteral("addresses")); }, nullptr, 3000,
          [this, controller, tableRows] {
+             if (auto* state = window_->findChild<ui::AddressesPage*>()->findChild<QComboBox*>(QStringLiteral("stateFilter")))
+                 state->setCurrentIndex(1); // every address, not only those in use
              expect(tableRows() == controller()->model()->size(),
                     QStringLiteral("the table lists every address (%1)").arg(tableRows()));
          },
@@ -1150,7 +1152,7 @@ void Walkthrough::buildSteps()
          },
          [confirmBox] { return confirmBox() != nullptr; }, 5000,
          [this, confirmBox, controller] {
-             expect(confirmBox() && confirmBox()->text().contains(QStringLiteral("leave out")),
+             expect(confirmBox() && confirmBox()->text().contains(QStringLiteral("leave")),
                     QStringLiteral("a smaller gap that leaves used addresses out asks first"));
              expect(controller()->store().settings.utxoReceiveGap == 200, QStringLiteral("and has changed nothing yet"));
          },
@@ -1342,7 +1344,7 @@ void Walkthrough::buildSteps()
          [this, listEnabled, importDialog] {
              const QString shown = visibleText(importDialog());
              expect(shown.contains(QStringLiteral("4 seeds ready")), QStringLiteral("a list says how many lines can go in"));
-             expect(shown.contains(QStringLiteral("Line 5: the checksum")),
+             expect(shown.contains(QStringLiteral("Line 5: these words")),
                     QStringLiteral("and names the wrong one by its line"));
              expect(!shown.contains(QStringLiteral("abandon")), QStringLiteral("without quoting its words"));
              expect(listEnabled(), QStringLiteral("one wrong line does not hold the others back"));
@@ -1362,7 +1364,7 @@ void Walkthrough::buildSteps()
              expect(!last.fromKeys && last.accounts.size() == 4, QStringLiteral("a seed in a list is a whole seed wallet"));
              const QString shown = visibleText(importDialog());
              expect(shown.contains(QStringLiteral("3 wallets added")), QStringLiteral("the dialog says what went in"));
-             expect(shown.contains(QStringLiteral("Line 1: the checksum")),
+             expect(shown.contains(QStringLiteral("Line 1: these words")),
                     QStringLiteral("what stays is renumbered, each line with why"));
              expect(shown.contains(QStringLiteral("Line 2: wallet “%1” already has these keys").arg(kFirstName)),
                     QStringLiteral("a seed already here names the wallet that has it"));

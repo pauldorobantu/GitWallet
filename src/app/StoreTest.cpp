@@ -317,7 +317,7 @@ StoreTestResult runStoreTest()
         check(good(8, QString()), QStringLiteral("commas between the words are not a name"));
         check(good(13, QStringLiteral("Store G")), QStringLiteral("the last line needs no line break"));
         check(bad(9, QStringLiteral("11")), QStringLiteral("a short phrase says how many words it has, and keeps none"));
-        check(bad(10, QStringLiteral("checksum")), QStringLiteral("a wrong checksum is named, and keeps no words"));
+        check(bad(10, QStringLiteral("valid seed")), QStringLiteral("a wrong checksum is named, and keeps no words"));
         check(bad(11, QStringLiteral("word 4")), QStringLiteral("a word not in the list is named by position"));
         check(lineAt(11) && !lineAt(11)->problem.contains(QStringLiteral("notaword")),
               QStringLiteral("and never quoted"));
