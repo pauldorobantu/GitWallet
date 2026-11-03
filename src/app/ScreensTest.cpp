@@ -2577,13 +2577,15 @@ bool writeScreenPictures(const QString& folder)
         put(nonce, 4);
         chain::Transaction tx;
         chain::parseTransaction(raw, &tx);
-        book->setHeight(book->add(tx, height, QDateTime::currentSecsSinceEpoch(), [&](const QString& scripthash) {
+        const int position = book->add(tx, height, QDateTime::currentSecsSinceEpoch(), [&](const QString& scripthash) {
             const int at = model->findByScripthash(bitcoin, scripthash);
             if (at < 0)
                 return false;
             book->describeAddress(scripthash, model->at(at).wallet, model->at(at).address);
             return true;
-        }), height);
+        });
+        book->setHeight(position, height);
+        book->setProven(position, height > 0);
     };
     payBitcoin(partner, 5, 2750000, 900000, 1);
     holdOnEthereum(warehouse, 2, "ethereum/usdt", 1250000000ULL);
