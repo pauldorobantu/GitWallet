@@ -962,7 +962,7 @@ void testFiguresHonest(const Check& check, const QList<wallet::AccountKey>& keys
         auto* history = window.findChild<ui::HistoryPage*>();
         const auto saysNotRead = [&] {
             for (const QLabel* label : history->findChildren<QLabel*>()) {
-                if (label->isVisible() && label->text().contains(QLatin1String("Not read yet")))
+                if (label->isVisible() && label->text().contains(QLatin1String("No history on this network yet")))
                     return true;
             }
             return false;
@@ -1322,7 +1322,7 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
     check(stack->currentWidget() == history && bar->tab() == ui::Place::Tab::History, QStringLiteral("its History tab opens"));
     bool saysSo = false;
     for (const QLabel* label : history->findChildren<QLabel*>())
-        saysSo = saysSo || (label->isVisible() && label->text().contains(QLatin1String("Not read yet")));
+        saysSo = saysSo || (label->isVisible() && label->text().contains(QLatin1String("No history on this network yet")));
     check(saysSo, QStringLiteral("and on a network with no history yet it says so"));
     check(!history->findChild<QTableView*>()->isVisible(), QStringLiteral("instead of an empty list"));
     window.showPage(QStringLiteral("history"));
@@ -1331,7 +1331,7 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
     check(history->tableModel()->filter().scripthash.isEmpty() && history->tableModel()->filter().wallet == 0 && history->tableModel()->filter().network < 0, QStringLiteral("with nothing of the place left in its filter"));
     saysSo = false;
     for (const QLabel* label : history->findChildren<QLabel*>())
-        saysSo = saysSo || (label->isVisible() && label->text().contains(QLatin1String("Not read yet")));
+        saysSo = saysSo || (label->isVisible() && label->text().contains(QLatin1String("No history on this network yet")));
     check(!saysSo, QStringLiteral("and leaving it, that goes"));
 
     // Receive: what is on the page is what the key gives, as text and as a code.
@@ -1508,7 +1508,7 @@ void testScreens(const Check& check, const QList<wallet::AccountKey>& keys)
         pause(50);
         bool noticed = false;
         for (const QLabel* each : window.findChildren<QLabel*>())
-            noticed = noticed || (each->isVisible() && each->text().contains(QLatin1String("could not be written down")) && each != owed);
+            noticed = noticed || (each->isVisible() && each->text().contains(QLatin1String("could not be saved")) && each != owed);
         check(noticed, QStringLiteral("and the notice above every page says so too"));
         {
             QFile file(path);
@@ -1716,7 +1716,7 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
     auto* holdingsPage = window.findChild<ui::HoldingsPage*>();
     const auto countUnder = [&] {
         for (const QLabel* each : holdingsPage->findChildren<QLabel*>()) {
-            if (each->isVisible() && each->text().contains(QLatin1String("hold something")))
+            if (each->isVisible() && each->text().contains(QLatin1String("hold a balance")))
                 return each->text();
         }
         return QString();
@@ -1729,7 +1729,7 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
     pause(50);
     holdingsPage->table()->refresh();
     check(holdingsPage->table()->rowsShown() == 1 && holdingsPage->table()->rowsHolding() == 0, QStringLiteral("what it has a key for stays, known to hold nothing (%1)").arg(holdingsPage->table()->rowsShown()));
-    check(countUnder() == QStringLiteral("0 of 1 hold something"), QStringLiteral("with a count that says so: %1").arg(countUnder()));
+    check(countUnder() == QStringLiteral("0 of 1 hold a balance"), QStringLiteral("with a count that says so: %1").arg(countUnder()));
 
     // An old price says it is old, wherever it makes a figure.
     {
@@ -1767,7 +1767,7 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
         goToWallet(warehouse);
         auto* title = bar->findChild<QLabel*>(QStringLiteral("placeTitle"));
         check(title->text() == QStringLiteral("$50,000.00"), QStringLiteral("a wallet's page has its own total, not all of them: %1").arg(title->text()));
-        check(countUnder() == QStringLiteral("1 of 1 hold something"), QStringLiteral("and its own count: %1").arg(countUnder()));
+        check(countUnder() == QStringLiteral("1 of 1 hold a balance"), QStringLiteral("and its own count: %1").arg(countUnder()));
         ui::Place place;
         place.asset = btc;
         window.goTo(place, ui::Place::Tab::Holdings);
@@ -2047,7 +2047,7 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
         check(holdings->table()->rowsTotal() == 0, QStringLiteral("and the table under it has none"));
         bool counted = false;
         for (const QLabel* each : holdings->findChildren<QLabel*>())
-            counted = counted || (each->isVisible() && each->text().contains(QLatin1String("hold something")));
+            counted = counted || (each->isVisible() && each->text().contains(QLatin1String("hold a balance")));
         check(!counted, QStringLiteral("nor a count of nothing"));
         window.showPage(QStringLiteral("receive"));
         receive->showAddress(gone);
@@ -2107,12 +2107,12 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
     {
         controller->setShowingSavedForTest(true);
         receive->showAddress(rowOf(shop, 0));
-        check(line->text().contains(QLatin1String("as far as was saved")), QStringLiteral("what holds something says it was saved: %1").arg(line->text()));
+        check(line->text().contains(QLatin1String("when last saved")), QStringLiteral("what holds something says it was saved: %1").arg(line->text()));
         wallet::AddressRow emptied = rowOf(shop, 0);
         emptied.confirmed = 0;
         model->upsert(emptied);
         pause(500);
-        check(line->text().contains(QLatin1String("as far as was saved")) && !line->text().contains(QLatin1String("now")), QStringLiteral("what held nothing has no \"now\": %1").arg(line->text()));
+        check(line->text().contains(QLatin1String("when last saved")) && !line->text().contains(QLatin1String("now")), QStringLiteral("what held nothing has no \"now\": %1").arg(line->text()));
         emptied.confirmed = 100000000;
         model->upsert(emptied);
         controller->setShowingSavedForTest(false);
@@ -2132,7 +2132,7 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
         check(ui::holdingOf(controller, btc, shop).incoming == before + 2000 && ui::holdingOf(controller, btc).incoming == before + 2000, QStringLiteral("it is counted apart"));
         check(ui::holdingNote(controller, ui::holdingOf(controller, btc, shop)).contains(QLatin1String("pending")), QStringLiteral("and a coin says so"));
         receive->showAddress(paid);
-        check(line->text().contains(QLatin1String("not in a block yet")), QStringLiteral("as does Receive: %1").arg(line->text()));
+        check(line->text().contains(QLatin1String("pending")), QStringLiteral("as does Receive: %1").arg(line->text()));
         check(waitFor([&] { return list->rowCount() > 0 && list->item(0, 5)->text() == QLatin1String("Pending"); }, 3000), QStringLiteral("and its list, rather than Received: %1").arg(list->rowCount() > 0 ? list->item(0, 5)->text() : QString()));
         goToAddress(paid);
         check(detail->text().contains(QLatin1String("pending")), QStringLiteral("and its own page"));

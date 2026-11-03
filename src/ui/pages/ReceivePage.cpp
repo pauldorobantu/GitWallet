@@ -147,7 +147,7 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     page::applyPageLayout(root);
 
     ui_->noWallet = page::makeEmptyState(this, int(icon::Kind::ImportDown), QStringLiteral("No wallet yet"),
-                                         QStringLiteral("Add a wallet on the Wallets page, and its addresses to receive on show here."));
+                                         QStringLiteral("Add a wallet to get addresses to receive on."));
     root->addWidget(ui_->noWallet, 1);
 
     ui_->body = new QWidget(this);
@@ -182,7 +182,7 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     ui_->type->setObjectName(QStringLiteral("receiveType"));
     ui_->amount = new QLineEdit(card);
     ui_->amount->setObjectName(QStringLiteral("receiveAmount"));
-    ui_->amount->setPlaceholderText(trText(QStringLiteral("Optional: goes into the QR code")));
+    ui_->amount->setPlaceholderText(trText(QStringLiteral("Amount: goes into the QR code")));
     ui_->amount->setMaxLength(32);
     ui_->label = new QLineEdit(card);
     ui_->label->setObjectName(QStringLiteral("receiveLabel"));
@@ -216,7 +216,7 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     ui_->state->setTextFormat(Qt::PlainText);
     ui_->state->setWordWrap(true);
     right->addWidget(ui_->state);
-    ui_->notCounted = new QLabel(QStringLiteral("A scan cannot be seen from here: once it has been scanned, press New address, so that it is not offered again."), card);
+    ui_->notCounted = new QLabel(QStringLiteral("Scanned? Press New address."), card);
     ui_->notCounted->setObjectName(QStringLiteral("receiveNotCounted"));
     ui_->notCounted->setTextFormat(Qt::PlainText);
     ui_->notCounted->setWordWrap(true);
@@ -531,7 +531,7 @@ void ReceivePage::showAddress(const wallet::AddressRow& row)
     ui_->row = row;
     ui_->address = controller_->checkedAddress(row);
     ui_->offerState = ui_->address.isEmpty() ? wallet::ReceiveOffer::State::Failed : wallet::ReceiveOffer::State::Ready;
-    ui_->why = ui_->address.isEmpty() ? QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.") : QString();
+    ui_->why = ui_->address.isEmpty() ? QStringLiteral("The saved address does not match this wallet's key, so it is not offered.") : QString();
     resetTyped();
     updateShown();
     updateList();
@@ -671,15 +671,15 @@ void ReceivePage::updateShown()
     if (problem.isEmpty() && ready && !amount.isEmpty() && !validAmount(amount, wallet::assetInfo(wallet::networkInfo(ui_->row.network).coin)))
         problem = trText(QStringLiteral("That amount cannot go into the QR code: write it like 0.015"));
     setStatus(ui_->status, problem, Tone::Warning);
-    setStatus(ui_->owed, controller_ && controller_->givenOutOwed() ? trText(QStringLiteral("An address given out could not be written down yet, so another start may offer it again. This is tried again every half a minute.")) : QString(), Tone::Warning);
+    setStatus(ui_->owed, controller_ && controller_->givenOutOwed() ? trText(QStringLiteral("An address given out could not be saved yet, so a restart may offer it again. Retrying every 30 seconds.")) : QString(), Tone::Warning);
     ui_->notCounted->hide();
 
     switch (ui_->offerState) {
     case wallet::ReceiveOffer::State::Checking:
-        setStatus(ui_->state, trText(QStringLiteral("Looking for the next unused address: a server has to answer for it first.")), Tone::Muted);
+        setStatus(ui_->state, trText(QStringLiteral("Waiting for a server to confirm the next unused address.")), Tone::Muted);
         return;
     case wallet::ReceiveOffer::State::NoKey:
-        setStatus(ui_->state, ui_->coin->count() == 0 ? trText(QStringLiteral("This wallet has no key to receive on.")) : trText(QStringLiteral("This wallet has no such key.")), Tone::Warning);
+        setStatus(ui_->state, ui_->coin->count() == 0 ? trText(QStringLiteral("This wallet has no key to receive on.")) : trText(QStringLiteral("This wallet has no key of this type.")), Tone::Warning);
         return;
     case wallet::ReceiveOffer::State::Failed:
         setStatus(ui_->state, trText(ui_->why), Tone::Error);
@@ -708,14 +708,14 @@ void ReceivePage::updateShown()
             });
             const QString all = held.join(QStringLiteral(", "));
             if (saved) {
-                say(trText(QStringLiteral("Held %1 as far as was saved, being checked")).arg(all));
+                say(trText(QStringLiteral("Held %1 when last saved; being checked")).arg(all));
             } else if (stale) {
                 say(since.isEmpty() ? trText(QStringLiteral("Held %1 when last read; no server is answering now")).arg(all)
                                     : trText(QStringLiteral("Held %1 as of %2; no server is answering now")).arg(all, since));
                 tone = Tone::Warning;
             } else if (row.isUtxo() && row.unconfirmed > 0) {
                 const wallet::AssetInfo& coin = wallet::assetInfo(wallet::networkInfo(row.network).coin);
-                say(trText(QStringLiteral("Holds %1, of which %2 is not in a block yet")).arg(all, figures::formatAmount(chain::Amount::fromU64(quint64(row.unconfirmed)), coin) + QLatin1Char(' ') + coin.symbol));
+                say(trText(QStringLiteral("Holds %1, of which %2 is pending")).arg(all, figures::formatAmount(chain::Amount::fromU64(quint64(row.unconfirmed)), coin) + QLatin1Char(' ') + coin.symbol));
                 tone = Tone::Warning;
             } else {
                 say(trText(QStringLiteral("Holds %1")).arg(all));
@@ -726,7 +726,7 @@ void ReceivePage::updateShown()
                 say(trText(QStringLiteral("Has been used; what it holds is being read")));
                 tone = Tone::Accent;
             } else if (saved) {
-                say(trText(QStringLiteral("Had been used, and held nothing as far as was saved, being checked")));
+                say(trText(QStringLiteral("Had been used, and held nothing when last saved; being checked")));
             } else if (stale) {
                 say(since.isEmpty() ? trText(QStringLiteral("Had been used, and held nothing when last read; no server is answering now"))
                                     : trText(QStringLiteral("Had been used, and held nothing as of %1; no server is answering now")).arg(since));
@@ -737,7 +737,7 @@ void ReceivePage::updateShown()
         } else if (!row.checked) {
             say(given ? trText(QStringLiteral("Given out; no server has answered for it yet")) : trText(QStringLiteral("No server has answered for it yet")));
         } else if (saved) {
-            say(given ? trText(QStringLiteral("Given out; nothing had come in as far as was saved, being checked")) : trText(QStringLiteral("Unused as far as was saved, being checked")));
+            say(given ? trText(QStringLiteral("Given out; nothing had come in when last saved; being checked")) : trText(QStringLiteral("Unused when last saved; being checked")));
         } else if (stale) {
             if (given) {
                 say(since.isEmpty() ? trText(QStringLiteral("Given out; no server is answering now, so nothing can be said of it"))

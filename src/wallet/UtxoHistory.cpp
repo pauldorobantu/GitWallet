@@ -1396,7 +1396,7 @@ void UtxoHistory::compareBalance(const QString& scripthash)
         compareSoon(scripthash);
     } else if (!saidDiffering_) {
         saidDiffering_ = true;
-        emit problem(Problem::Failure, QStringLiteral("What a server says an address holds is not what its transactions add up to."), client_->serverName());
+        emit problem(Problem::Failure, QStringLiteral("A server's balance for an address does not match its transactions."), client_->serverName());
     }
 }
 

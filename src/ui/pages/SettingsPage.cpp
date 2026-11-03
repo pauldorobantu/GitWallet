@@ -5,6 +5,7 @@
 #include "net/ElectrumClient.h"
 #include "ui/DialogChrome.h"
 #include "ui/Feedback.h"
+#include "ui/Figures.h"
 #include "ui/LanguageManager.h"
 #include "ui/MainWindow.h"
 #include "ui/PageKit.h"
@@ -244,9 +245,9 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
                                QStringLiteral("How soon a new Ethereum balance shows. A wallet too large to read "
                                               "whole in this time reads its unused next addresses and those holding "
                                               "a balance this often, and the rest as fast as the endpoints allow."));
-    ui_->scanForm->addRow(QStringLiteral("Bitcoin receive gap"), ui_->receiveGap);
-    ui_->scanForm->addRow(QStringLiteral("Bitcoin change gap"), ui_->changeGap);
-    ui_->scanForm->addRow(QStringLiteral("Ethereum gap"), ui_->ethGap);
+    ui_->scanForm->addRow(QStringLiteral("Bitcoin receive: look ahead"), ui_->receiveGap);
+    ui_->scanForm->addRow(QStringLiteral("Bitcoin change: look ahead"), ui_->changeGap);
+    ui_->scanForm->addRow(QStringLiteral("Ethereum: look ahead"), ui_->ethGap);
     ui_->scanForm->addRow(QStringLiteral("Ethereum refresh every"), ui_->ethRefresh);
     column->addWidget(scan.card);
 
@@ -315,7 +316,7 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
 
     const page::Section alerts = page::makeSection(
         content, QStringLiteral("Payment alerts"),
-        QStringLiteral("GitWallet says when a payment comes in, and the bell in the title bar lists them. It can only say so while it is running: what came in while it was closed is told at the next start."));
+        QStringLiteral("GitWallet tells you when a payment comes in, and the bell in the title bar lists them. It only knows while it is running: what arrives while it is closed is reported at the next start."));
     auto* alertsOn = new QCheckBox(QStringLiteral("Tell me when a payment comes in"), alerts.card);
     alertsOn->setObjectName(QStringLiteral("paymentAlerts"));
     alertsOn->setChecked(SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) != QLatin1String("0"));
@@ -376,7 +377,7 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
     auto* lockRow = new QHBoxLayout(ui_->lockAfterRow);
     lockRow->setContentsMargins(0, 0, 0, 0);
     lockRow->setSpacing(page::kFormHSpacing);
-    lockRow->addWidget(new QLabel(QStringLiteral("Lock when left alone for"), ui_->lockAfterRow));
+    lockRow->addWidget(new QLabel(QStringLiteral("Lock when idle for"), ui_->lockAfterRow));
     ui_->lockAfter = new QComboBox(ui_->lockAfterRow);
     ui_->lockAfter->setObjectName(QStringLiteral("lockAfter"));
     ui_->lockAfter->addItem(QStringLiteral("1 minute"), 1);
@@ -403,7 +404,7 @@ SettingsPage::SettingsPage(WalletController* controller, QWidget* parent)
 
     const page::Section backup = page::makeSection(
         content, QStringLiteral("Backup"),
-        QStringLiteral("One file under a password of its own, to keep elsewhere or take to another PC: your wallets' public keys and names, the addresses given out, the settings, every label and note. It cannot spend, and it does not replace your seeds: write those down apart."));
+        QStringLiteral("A single password-protected file to keep elsewhere or take to another PC. It holds your wallets' public keys and names, the addresses given out, the settings and every label and note. It cannot spend, and it does not replace your seeds: keep those written down separately."));
     ui_->backupState = new QLabel(backup.card);
     ui_->backupState->setObjectName(QStringLiteral("backupState"));
     ui_->backupState->setWordWrap(true);
@@ -585,7 +586,7 @@ void SettingsPage::updateBackup()
 {
     const wallet::WalletStore* store = controller_ ? &controller_->store() : nullptr;
     if (!store || store->lastBackupMs <= 0) {
-        ui_->backupState->setText(trText(QStringLiteral("No backup was made here yet.")));
+        ui_->backupState->setText(trText(QStringLiteral("No backup made on this PC yet.")));
     } else {
         QString line = trText(QStringLiteral("Last backup: %1.")).arg(QDateTime::fromMSecsSinceEpoch(store->lastBackupMs).toString(QStringLiteral("d MMM yyyy HH:mm")));
         // By which wallets, not how many: one removed and one added come to the same count.
@@ -593,7 +594,7 @@ void SettingsPage::updateBackup()
         if (store->lastBackupNextWallet > 0)
             since = int(std::count_if(store->wallets.cbegin(), store->wallets.cend(), [store](const wallet::WalletEntry& entry) { return entry.id >= store->lastBackupNextWallet; }));
         if (since > 0)
-            line += QLatin1Char(' ') + trText(QStringLiteral("%1 wallets were added since: it does not hold them.")).arg(since);
+            line += QLatin1Char(' ') + figures::counted(since, QStringLiteral("%1 wallet added since is not in it."), QStringLiteral("%1 wallets added since are not in it."));
         ui_->backupState->setText(line);
     }
 }
@@ -777,30 +778,30 @@ void SettingsPage::askThenApply(const wallet::ScanSettings& settings, int accept
     QString text;
     QString detail;
     if (left.used > 0) {
-        text = left.atMost ? QStringLiteral("These gaps can leave out up to %1 addresses that have been used.").arg(left.used)
+        text = left.atMost ? QStringLiteral("This can leave out up to %1 addresses that have been used.").arg(left.used)
                : left.used == 1
-                   ? QStringLiteral("These gaps leave out 1 address that has been used.")
-                   : QStringLiteral("These gaps leave out %1 addresses that have been used.").arg(left.used);
+                   ? QStringLiteral("This leaves out 1 address that has been used.")
+                   : QStringLiteral("This leaves out %1 addresses that have been used.").arg(left.used);
         detail = QStringLiteral("Holding a balance now: %1 of %2. GitWallet would stop showing and watching these "
                                 "addresses, and their balances would leave the totals, until the gaps change "
                                 "again. Nothing changes on the blockchain.")
                      .arg(left.funded)
                      .arg(left.used);
     } else if (left.overLimit > 0) {
-        text = QStringLiteral("These gaps ask for about %1 more addresses than GitWallet follows.").arg(left.overLimit);
+        text = QStringLiteral("This asks for about %1 more addresses than GitWallet follows.").arg(left.overLimit);
         detail = QStringLiteral("The scan would stop at the limit, so no total would read as whole, until the gaps are "
                                 "lowered or wallets removed. Nothing changes on the blockchain.");
     } else {
-        text = QStringLiteral("Not every address has answered, so what smaller gaps leave out is not known.");
+        text = QStringLiteral("Not every address has answered, so what this leaves out is not known.");
         detail = QStringLiteral("GitWallet could stop showing and watching addresses it has not read, and their "
                                 "balances would not count in the totals, until the gaps are raised again. Nothing "
                                 "changes on the blockchain.");
     }
     if (left.atMost)
-        detail += QLatin1Char(' ') + QStringLiteral("A scan stops at a limit that these gaps go past.");
+        detail += QLatin1Char(' ') + QStringLiteral("A scan stops at a limit that this goes past.");
     if (left.used > 0 && unknown)
         detail += QLatin1Char(' ') + QStringLiteral("Not every address has answered, so there may be more.");
-    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Changing the gaps"), text, QMessageBox::NoButton, this);
+    auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Looking less far ahead"), text, QMessageBox::NoButton, this);
     box->setInformativeText(detail);
     QPushButton* saveAnyway = box->addButton(QStringLiteral("Save anyway"), QMessageBox::DestructiveRole);
     saveAnyway->setObjectName(QStringLiteral("dangerButton"));

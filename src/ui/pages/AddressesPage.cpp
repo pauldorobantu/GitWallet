@@ -385,8 +385,8 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     root->addWidget(ui_->noResults, 1);
     root->addWidget(ui_->nothingHere, 1);
     ui_->nothingHere->hide();
-    ui_->onlyDust = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("Only dust here"),
-                                         QStringLiteral("Hide dust keeps it off this list. It still counts in every total, and a search still finds it."));
+    ui_->onlyDust = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("Only tiny amounts here"),
+                                         QStringLiteral("Hide tiny amounts keeps them off this list. They still count in every total, and a search still finds them."));
     ui_->onlyDust->setObjectName(QStringLiteral("addressesOnlyDust"));
     root->addWidget(ui_->onlyDust, 1);
     ui_->onlyDust->hide();
@@ -408,12 +408,12 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->state->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->state->setToolTip(trText(QStringLiteral("In use: holds a balance, has transactions, or is waiting for a payment. Funded: holds a balance now. Used: has transactions or a balance. Waiting for payment: handed to someone, and nothing has come in yet.")));
     const page::ViewMenu viewMenu = page::makeViewMenu(bar.widget);
-    ui_->hideDust = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide dust"), "addressesHideDust", figures::hideDust());
+    ui_->hideDust = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide tiny amounts"), "addressesHideDust", figures::hideDust());
     ui_->filter->setHideDust(ui_->hideDust->isChecked());
     // What says which address it is stays; chain, type and path are in its tooltip and on its page.
     ui_->columns = new page::ColumnChoice(view, QStringLiteral("addresses"), {AddressTableModel::ColChain, AddressTableModel::ColType, AddressTableModel::ColPath}, viewMenu.menu);
     const auto dustTip = [this] {
-        ui_->hideDust->setToolTip(trText(QStringLiteral("An address holding only less than %1 leaves this list, unless it was given out or has a label. It still counts in every total, and a search still finds it.")).arg(figures::dustLimits()));
+        ui_->hideDust->setToolTip(trText(QStringLiteral("Hides an address holding less than %1, unless it was given out or has a label. It still counts in every total, and a search still finds it.")).arg(figures::dustLimits()));
     };
     dustTip();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
@@ -937,7 +937,7 @@ void AddressesPage::updateState()
     const int notChecked = rows ? qMax(0, rows->size() - rows->checkedCount()) : 0;
     QString countLine = hasWallet ? countText(shown, total, funded, notChecked == 0) : QString();
     if (hasWallet && dustHidden > 0)
-        countLine += QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(figures::formatCount(dustHidden));
+        countLine += QStringLiteral(" · ") + trText(QStringLiteral("%1 tiny amounts hidden")).arg(figures::formatCount(dustHidden));
     if (hasWallet && notChecked > 0)
         countLine += QStringLiteral(" · ") + trText(QStringLiteral("%1 not checked yet")).arg(figures::formatCount(notChecked));
     if (hasWallet && controller_->showingSaved())

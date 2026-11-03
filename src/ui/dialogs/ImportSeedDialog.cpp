@@ -258,7 +258,7 @@ ImportSeedDialog::ImportSeedDialog(WalletController* controller, QWidget* parent
     name_ = new QLineEdit(this);
     name_->setObjectName(QStringLiteral("walletName"));
     name_->setMaxLength(kMaxNameTyped);
-    name_->setPlaceholderText(QStringLiteral("For example: Online shop"));
+    name_->setPlaceholderText(QStringLiteral("Optional. For example: Online shop"));
     nameLabel_->setBuddy(name_);
     nameBlock->addWidget(nameLabel_);
     nameBlock->addWidget(name_);
@@ -561,9 +561,9 @@ void ImportSeedDialog::sourceChanged()
                                  : trText(QStringLiteral("This seed has a passphrase (25th word)")));
     hasPassphrase_->setVisible(seeds);
     passphrase_->setVisible(seeds && hasPassphrase_->isChecked());
-    nameLabel_->setText(many ? trText(QStringLiteral("Name for lines without one")) : trText(QStringLiteral("Wallet name")));
-    name_->setPlaceholderText(many ? trText(QStringLiteral("For example: Shop, which gives Shop 1, Shop 2"))
-                                   : trText(QStringLiteral("For example: Online shop")));
+    nameLabel_->setText(many ? trText(QStringLiteral("Name for unnamed lines")) : trText(QStringLiteral("Wallet name")));
+    name_->setPlaceholderText(many ? trText(QStringLiteral("For example: Shop (gives Shop 1, Shop 2)"))
+                                   : trText(QStringLiteral("Optional. For example: Online shop")));
     import_->setText(many ? trText(QStringLiteral("Add wallets")) : trText(QStringLiteral("Add wallet")));
     info_->setText(seeds ? trText(QStringLiteral("GitWallet derives the public keys of your accounts from each "
                                                  "seed and keeps only those, encrypted for your Windows user. "
@@ -855,7 +855,7 @@ void ImportSeedDialog::validateWords()
         if (count == 0) {
             // Nothing typed yet: no status.
         } else if (unknown < count) {
-            message = trText(QStringLiteral("Word %1 is not in the BIP39 list"))
+            message = trText(QStringLiteral("Word %1 is not a seed word: check its spelling"))
                           .arg(static_cast<int>(unknown + 1));
             tone = Tone::Error;
         } else if (!isValidWordCount(count)) {
@@ -864,14 +864,14 @@ void ImportSeedDialog::validateWords()
         } else if (typing) {
             // The right count, but the last word is unfinished: a muted note
             // until a space or the missing letters follow.
-            message = trText(QStringLiteral("Word %1 is not in the BIP39 list"))
+            message = trText(QStringLiteral("Word %1 is not a seed word: check its spelling"))
                           .arg(static_cast<int>(count));
         } else if (!chain::bip39::validate(seed.words)) {
             message =
-                trText(QStringLiteral("Checksum does not match — check the words and their order"));
+                trText(QStringLiteral("These words do not make a valid seed: check the words and their order"));
             tone = Tone::Error;
         } else {
-            message = trText(QStringLiteral("%1 words · checksum OK")).arg(static_cast<int>(count));
+            message = trText(QStringLiteral("%1 words · valid seed")).arg(static_cast<int>(count));
             tone = Tone::Success;
             wordsValid_ = true;
         }

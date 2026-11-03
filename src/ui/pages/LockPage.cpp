@@ -78,7 +78,7 @@ LockPage::LockPage(QWidget* parent) : QWidget(parent)
     unlock_->setFixedWidth(kFieldWidth);
     root->addWidget(unlock_, 0, Qt::AlignHCenter);
 
-    forgot_ = new QPushButton(QStringLiteral("Forgot the password?"), this);
+    forgot_ = new QPushButton(QStringLiteral("Forgot your password?"), this);
     forgot_->setObjectName(QStringLiteral("lockForgot"));
     forgot_->setFlat(true);
     root->addWidget(forgot_, 0, Qt::AlignHCenter);

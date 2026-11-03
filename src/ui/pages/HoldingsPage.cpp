@@ -35,10 +35,10 @@ HoldingsPage::HoldingsPage(WalletController* controller, QWidget* parent)
         table_->setHideZero(on);
         updateCount();
     });
-    hideDust_ = page::addViewToggle(this, menu, QStringLiteral("Hide dust"), "holdingsHideDust", figures::hideDust());
+    hideDust_ = page::addViewToggle(this, menu, QStringLiteral("Hide tiny amounts"), "holdingsHideDust", figures::hideDust());
     table_->setHideDust(hideDust_->isChecked());
     const auto dustTip = [this] {
-        hideDust_->setToolTip(trText(QStringLiteral("Less than %1 in all leaves this list. It still counts in the total.")).arg(figures::dustLimits()));
+        hideDust_->setToolTip(trText(QStringLiteral("Hides a coin when you hold less than %1 of it. It still counts in the total.")).arg(figures::dustLimits()));
     };
     dustTip();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
@@ -69,12 +69,12 @@ void HoldingsPage::updateCount()
     if (table_->rowsTotal() == 0 || (!table_->allFinal() && table_->rowsHolding() == 0))
         text.clear();
     else if (table_->allFinal())
-        text = trText(QStringLiteral("%1 of %2 hold something")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal()));
+        text = trText(QStringLiteral("%1 of %2 hold a balance")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal()));
     else
-        text = trText(QStringLiteral("%1 hold something so far")).arg(figures::formatCount(table_->rowsHolding()));
+        text = trText(QStringLiteral("%1 hold a balance so far")).arg(figures::formatCount(table_->rowsHolding()));
     const int dust = table_->dustHidden();
     if (dust > 0)
-        text += (text.isEmpty() ? QString() : QStringLiteral(" · ")) + trText(QStringLiteral("%1 dust hidden")).arg(figures::formatCount(dust));
+        text += (text.isEmpty() ? QString() : QStringLiteral(" · ")) + trText(QStringLiteral("%1 tiny amounts hidden")).arg(figures::formatCount(dust));
     count_->setText(text);
     // It would change every other list, and hide nothing here.
     hideDust_->setVisible(!table_->oneAddress());

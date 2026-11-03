@@ -76,7 +76,7 @@ PasswordDialog::PasswordDialog(Mode mode, const OldFiles& oldFiles, const QStrin
     case Mode::MakeBackup:
         title = QStringLiteral("Make a backup");
         okText = QStringLiteral("Make backup");
-        warning = QStringLiteral("Only this password opens the file. It need not be the one of the app. Keep it apart from the file: if you forget it, nobody can open it, GitWallet included.");
+        warning = QStringLiteral("Only this password opens the file. It can differ from the app password. Keep it separate from the file: if you forget it, nobody can open it, GitWallet included.");
         break;
     case Mode::OpenBackup:
         title = QStringLiteral("Restore from a backup");
@@ -102,12 +102,12 @@ PasswordDialog::PasswordDialog(Mode mode, const OldFiles& oldFiles, const QStrin
     column->addWidget(note);
 
     if (mode_ == Mode::ChangeApp || mode_ == Mode::RemoveApp)
-        current_ = addField(trText(QStringLiteral("The password in use")), "passwordCurrent");
+        current_ = addField(trText(QStringLiteral("Current password")), "passwordCurrent");
     if (mode_ == Mode::OpenBackup)
-        current_ = addField(trText(QStringLiteral("The password of the file")), "passwordCurrent");
+        current_ = addField(trText(QStringLiteral("Password of the backup")), "passwordCurrent");
     if (mode_ == Mode::SetApp || mode_ == Mode::ChangeApp || mode_ == Mode::MakeBackup) {
         fresh_ = addField(trText(QStringLiteral("New password")), "passwordNew", true);
-        repeat_ = addField(trText(QStringLiteral("The same again")), "passwordRepeat", true);
+        repeat_ = addField(trText(QStringLiteral("Repeat the new password")), "passwordRepeat", true);
         auto* hint = new QLabel(trText(QStringLiteral("At least %1 characters. A sentence of five or six words is long and easy to remember.")).arg(kLeastChars), this);
         hint->setWordWrap(true);
         setTone(hint, Tone::Muted);
@@ -188,7 +188,7 @@ void PasswordDialog::updateState()
                 why = trText(QStringLiteral("The two do not match."));
         } else if (current_ && current_->text() == fresh) {
             ready = false;
-            why = trText(QStringLiteral("That is the password in use."));
+            why = trText(QStringLiteral("That is already the current password."));
         }
     }
     if (understood_ && !understood_->isChecked())
@@ -205,7 +205,7 @@ void PasswordDialog::go()
     busy_ = true;
     ok_->setEnabled(false);
     cancel_->setEnabled(false);
-    setStatus(status_, trText(QStringLiteral("Working… a password takes about a second to check, on purpose.")), Tone::Muted);
+    setStatus(status_, trText(QStringLiteral("Working… checking a password takes about a second, on purpose.")), Tone::Muted);
     Filled filled;
     filled.current = current_ ? current_->text() : QString();
     filled.fresh = fresh_ ? fresh_->text() : QString();

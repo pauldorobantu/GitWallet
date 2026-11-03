@@ -214,14 +214,14 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     root->addWidget(view, 1);
 
     ui_->noWallet = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("No wallet yet"),
-                                         QStringLiteral("Add a wallet on the Wallets page, and its transactions show here."));
+                                         QStringLiteral("Add a wallet to see its transactions."));
     ui_->waiting = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("No transactions yet"),
-                                        QStringLiteral("Every transaction of every address shows here, as servers tell of it and proofs check out."));
+                                        QStringLiteral("Transactions show here as servers report them and their proofs are checked."));
     ui_->noResults = page::makeNoResultsState(this);
-    ui_->notRead = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("Not read yet on this network"),
-                                        QStringLiteral("The history of Ethereum, USDT and USDC comes in the next stage. Balances are read already, and an address opens on a block explorer."));
-    ui_->onlyDust = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("Only dust here"),
-                                         QStringLiteral("Hide dust keeps it off this list. It still counts in every balance, and a search still finds it."));
+    ui_->notRead = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("No history on this network yet"),
+                                        QStringLiteral("Ethereum, USDT and USDC transactions are not listed yet. What came in on them is under the bell, and an address opens on a block explorer."));
+    ui_->onlyDust = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("Only tiny amounts here"),
+                                         QStringLiteral("Hide tiny amounts keeps them off this list. They still count in every balance, and a search still finds them."));
     root->addWidget(ui_->noWallet, 1);
     root->addWidget(ui_->waiting, 1);
     root->addWidget(ui_->noResults, 1);
@@ -232,7 +232,7 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->onlyDust->hide();
 
     const page::ActionBar bar = page::makeActionBar(this);
-    ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search id, address, label or note"));
+    ui_->search = page::makeSearch(bar.widget, QStringLiteral("Label, amount, address or id"));
     view->search = ui_->search;
     ui_->wallet = new QComboBox(bar.widget);
     ui_->wallet->setObjectName(QStringLiteral("historyWallet"));
@@ -259,7 +259,7 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
                            QStringLiteral("Last 30 days"), QStringLiteral("This year"), QStringLiteral("Last year")});
     ui_->period->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     const page::ViewMenu viewMenu = page::makeViewMenu(bar.widget);
-    ui_->hideDust = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide dust"), "historyHideDust", figures::hideDust());
+    ui_->hideDust = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide tiny amounts"), "historyHideDust", figures::hideDust());
     connect(ui_->hideDust, &QAction::toggled, this, [this](bool on) {
         figures::setHideDust(on);
         applyFilter();
@@ -331,10 +331,10 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
 
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this, &HistoryPage::applyColumnWidths);
     const auto setTips = [this] {
-        ui_->type->setToolTip(trText(QStringLiteral("Moved: every output came back to the addresses shown, so only a fee left.")));
+        ui_->type->setToolTip(trText(QStringLiteral("Moved: every output came back to these addresses, so only the fee was spent.")));
         ui_->exportCsv->setToolTip(trText(QStringLiteral("Save these transactions to a spreadsheet file, dust included, so that its amounts add up. It is not encrypted: anyone who reads it "
                                                          "sees these transactions, labels and notes.")));
-        ui_->hideDust->setToolTip(trText(QStringLiteral("Less than %1 coming in leaves this list, unless the address was given out or has a label, or the line has a note. It still counts in every balance, and a search still finds it.")).arg(figures::dustLimits()));
+        ui_->hideDust->setToolTip(trText(QStringLiteral("Hides less than %1 coming in, unless the address was given out or has a label, or the line has a note. It still counts in every balance, and a search still finds it.")).arg(figures::dustLimits()));
     };
     setTips();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, [this, setTips] {
@@ -578,7 +578,7 @@ void HistoryPage::updateState()
         }
     }
     if (hasWallet && ui_->model->dustHidden() > 0)
-        line += QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(grouped(ui_->model->dustHidden()));
+        line += QStringLiteral(" · ") + trText(QStringLiteral("%1 tiny amounts hidden")).arg(grouped(ui_->model->dustHidden()));
     ui_->count->setText(line);
     ui_->count->setVisible(hasWallet);
 

@@ -96,7 +96,7 @@ QString handOutNote(const WalletController* controller, const wallet::AddressRow
     if (!row.checked)
         return trText(QStringLiteral("Copied, but no server has answered for it yet: it may have been used"));
     if (row.change != 0)
-        return trText(QStringLiteral("Copied. A change address is not kept as given out"));
+        return trText(QStringLiteral("Copied. A change address is not marked as given out"));
     return QString();
 }
 
@@ -106,7 +106,7 @@ bool copyAddress(QWidget* host, WalletController* controller, const wallet::Addr
         return false;
     const QString address = controller->checkedAddress(row);
     if (address.isEmpty()) {
-        Feedback::show(host, Feedback::Type::Error, trText(QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.")));
+        Feedback::show(host, Feedback::Type::Error, trText(QStringLiteral("The saved address does not match this wallet's key, so it is not offered.")));
         return false;
     }
     // As it stood before this: a second payer on one address is what a reader can still stop.

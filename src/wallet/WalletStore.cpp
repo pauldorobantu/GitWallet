@@ -718,7 +718,7 @@ bool WalletStore::openSealed(const QByteArray& key, QString* error)
     QByteArray json;
     const auto wipe = qScopeGuard([&json] { scrub(json); });
     if (!seal::open(key, sealed_, &json))
-        return fail(error, QStringLiteral("That is not the password."));
+        return fail(error, QStringLiteral("Wrong password."));
     StoreData data;
     if (!parseStore(json, filePath(), &data, error))
         return false;

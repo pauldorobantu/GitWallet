@@ -93,7 +93,7 @@ void setServer(QLabel* label, const wallet::NetworkStatus& status)
     // Nonces are read now and then, and all they can add is a rare address. Long overdue, the
     // figures are as right as ever, but what lies past those windows is not looked at.
     if (status.noncesAt.isValid() && status.noncesAt.secsTo(QDateTime::currentDateTime()) > kNoncesOldSeconds)
-        text += QStringLiteral(" · ") + trText(QStringLiteral("nonces from %1")).arg(shownTime(status.noncesAt, QDate::currentDate()));
+        text += QStringLiteral(" · ") + trText(QStringLiteral("new addresses last looked for %1")).arg(shownTime(status.noncesAt, QDate::currentDate()));
     label->setText(text);
     setTone(label, status.server.isEmpty() ? Tone::Muted : Tone::Neutral);
 }
@@ -273,10 +273,10 @@ QWidget* PortfolioPage::buildWalletState()
         table_->setHideZero(on);
         refreshView();
     });
-    hideDust_ = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide dust"), "hideDust", figures::hideDust());
+    hideDust_ = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide tiny amounts"), "hideDust", figures::hideDust());
     table_->setHideDust(hideDust_->isChecked());
     const auto dustTip = [this] {
-        hideDust_->setToolTip(trText(QStringLiteral("Less than %1 in all leaves this list. It still counts in the total.")).arg(figures::dustLimits()));
+        hideDust_->setToolTip(trText(QStringLiteral("Hides a coin when you hold less than %1 of it. It still counts in the total.")).arg(figures::dustLimits()));
     };
     dustTip();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
@@ -427,7 +427,7 @@ void PortfolioPage::refreshView()
         caption << trText(QStringLiteral("Still scanning"));
     const int inDoubt = controller_->balancesInDoubt();
     if (inDoubt > 0)
-        caption << trText(QStringLiteral("%1 do not add up to their transactions")).arg(formatCount(inDoubt));
+        caption << trText(QStringLiteral("%1 addresses do not match their transactions")).arg(formatCount(inDoubt));
     caption << controller_->pricesLine();
     pricesLabel_->setText(caption.join(QStringLiteral(" · ")));
 
@@ -485,7 +485,7 @@ void PortfolioPage::refreshView()
 void PortfolioPage::refreshCount()
 {
     const int dust = table_->dustHidden();
-    countLabel_->setText(dust > 0 ? countText_ + QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(formatCount(dust)) : countText_);
+    countLabel_->setText(dust > 0 ? countText_ + QStringLiteral(" · ") + trText(QStringLiteral("%1 tiny amounts hidden")).arg(formatCount(dust)) : countText_);
 }
 
 } // namespace app::ui

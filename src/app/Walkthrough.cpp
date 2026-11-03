@@ -630,7 +630,7 @@ void Walkthrough::buildSteps()
          nullptr, 1000,
          [this, shownPage] {
              expect(shownPage() == window_->findChild<ui::HistoryPage*>(), QStringLiteral("a token has a History tab too"));
-             expect(visibleText(shownPage()).contains(QLatin1String("Not read yet")), QStringLiteral("which says it is not read yet, rather than that nothing happened"));
+             expect(visibleText(shownPage()).contains(QLatin1String("No history on this network yet")), QStringLiteral("which says it is not read yet, rather than that nothing happened"));
          },
          nullptr},
         {QStringLiteral("wallet-place"),

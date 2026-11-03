@@ -326,7 +326,7 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     check(listed(model->at(scene.rowOf(0)).address), QStringLiteral("and an address with nothing: it is no dust"));
     const int shownWithout = table->model()->rowCount();
     check(shownWithout == model->size() - 3, QStringLiteral("three rows left the list (%1 of %2)").arg(shownWithout).arg(model->size()));
-    check(countLine().contains(QStringLiteral("funded · 3 dust hidden")), QStringLiteral("and it says so: %1").arg(countLine()));
+    check(countLine().contains(QStringLiteral("funded · 3 tiny amounts hidden")), QStringLiteral("and it says so: %1").arg(countLine()));
     check(countLine().contains(QStringLiteral("· 4 funded")), QStringLiteral("what it calls funded is what it shows: %1").arg(countLine()));
     // Nobody has answered for all of it yet: nothing can be called dust.
     {
@@ -336,12 +336,12 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
         part.used = true;
         model->upsert(part);
         pause(150);
-        check(listed(part.address) && countLine().contains(QStringLiteral("3 dust hidden")), QStringLiteral("a row with a balance still unanswered stays on the list: %1").arg(countLine()));
+        check(listed(part.address) && countLine().contains(QStringLiteral("3 tiny amounts hidden")), QStringLiteral("a row with a balance still unanswered stays on the list: %1").arg(countLine()));
         part = model->at(scene.ethRowOf(5));
         part.checked = true;
         model->upsert(part);
         pause(150);
-        check(!listed(part.address) && countLine().contains(QStringLiteral("4 dust hidden")), QStringLiteral("and goes once it has answered: %1").arg(countLine()));
+        check(!listed(part.address) && countLine().contains(QStringLiteral("4 tiny amounts hidden")), QStringLiteral("and goes once it has answered: %1").arg(countLine()));
         part = model->at(scene.ethRowOf(5));
         part.setBalance(ethereum.coin, chain::Amount());
         part.used = false;
@@ -358,14 +358,14 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     // It moves with what the row holds.
     scene.paid(1, QStringLiteral("a2"), 2000);
     pause(150);
-    check(listed(dustAddress) && countLine().contains(QStringLiteral("2 dust hidden")), QStringLiteral("more coming in brings it back: %1").arg(countLine()));
+    check(listed(dustAddress) && countLine().contains(QStringLiteral("2 tiny amounts hidden")), QStringLiteral("more coming in brings it back: %1").arg(countLine()));
     scene.paid(1, QStringLiteral("a3"), 500);
     pause(150);
     check(!listed(dustAddress), QStringLiteral("less takes it away"));
     hide->setChecked(false);
     pause(50);
     check(table->model()->rowCount() == model->size() && listed(dustAddress), QStringLiteral("unticked, all of them show"));
-    check(!countLine().contains(QLatin1String("dust")), QStringLiteral("and nothing is said to be hidden: %1").arg(countLine()));
+    check(!countLine().contains(QLatin1String("tiny")), QStringLiteral("and nothing is said to be hidden: %1").arg(countLine()));
     check(!ui::figures::hideDust(), QStringLiteral("which stays as chosen"));
     hide->setChecked(true);
     pause(50);
@@ -420,7 +420,7 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
         }
         return false;
     };
-    check(portfolioSays(QStringLiteral("2 dust hidden")), QStringLiteral("and the page says how many: USD Coin and Ethereum"));
+    check(portfolioSays(QStringLiteral("2 tiny amounts hidden")), QStringLiteral("and the page says how many: USD Coin and Ethereum"));
     hideCoins->setChecked(false);
     pause(450);
     check(coinRow(QStringLiteral("USD Coin")) >= 0, QStringLiteral("unticked it is back"));

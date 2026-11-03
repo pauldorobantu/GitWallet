@@ -333,7 +333,7 @@ void MainWindow::buildUi()
     // Spending comes once the history has been verified against other wallets and block explorers.
     stack_->addWidget(page::makeEmptyState(
         stack_, int(icon::Kind::ExternalLink), QStringLiteral("Send"),
-        QStringLiteral("Consolidating funds is added in the next stage, once balances are verified.")));
+        QStringLiteral("GitWallet only watches: it keeps public keys and no seed, so it cannot spend. To move coins, use the wallet the seed came from.")));
     stack_->addWidget(settings_);
     stack_->addWidget(holdings_);
 
@@ -949,7 +949,7 @@ void MainWindow::tryUnlock(const QString& password)
 
 void MainWindow::forgotPassword()
 {
-    auto* box = new QMessageBox(QMessageBox::Information, trText(QStringLiteral("Forgot the password")),
+    auto* box = new QMessageBox(QMessageBox::Information, trText(QStringLiteral("Forgot your password")),
                                 trText(QStringLiteral("Nobody can open this without the password, GitWallet included: there is no way around it, and no one to ask.")),
                                 QMessageBox::NoButton, this);
     box->setAttribute(Qt::WA_DeleteOnClose);
@@ -963,7 +963,7 @@ void MainWindow::forgotPassword()
         return;
     }
     box->setInformativeText(trText(QStringLiteral("Your coins are safe: they are on their seeds, which were never stored here. You can start over: the file stays beside the new one under another name, in case the password comes back to you, and you add your seeds again. Labels, notes and addresses given out come back only from a backup.")));
-    QPushButton* startOver = box->addButton(trText(QStringLiteral("Keep it aside and start over")), QMessageBox::DestructiveRole);
+    QPushButton* startOver = box->addButton(trText(QStringLiteral("Set the file aside and start over")), QMessageBox::DestructiveRole);
     startOver->setObjectName(QStringLiteral("dangerButton"));
     QPushButton* cancel = box->addButton(QMessageBox::Cancel);
     box->setDefaultButton(cancel);
@@ -1124,12 +1124,12 @@ MainWindow::Notice MainWindow::classify(wallet::Problem kind, const QString& mes
         break;
     case wallet::Problem::LabelsOwed:
         n.key = QStringLiteral("labels-owed");
-        n.headline = trText(QStringLiteral("The labels and notes of an older file have yet to come over"));
+        n.headline = trText(QStringLiteral("Labels and notes from an older file have not come over yet"));
         n.depends = 0;
         break;
     case wallet::Problem::GivenOutNotKept:
         n.key = QStringLiteral("given-out-not-kept");
-        n.headline = trText(QStringLiteral("An address given out could not be written down"));
+        n.headline = trText(QStringLiteral("An address given out could not be saved"));
         n.severity = kSeverityWarning;
         n.depends = 0;
         break;

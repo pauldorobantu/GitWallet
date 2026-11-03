@@ -289,7 +289,7 @@ void TitleBar::refreshUtilityIcons()
         aboutBtn_->setIcon(makeIcon(icon::Kind::Shield, c, 17, 1.8));
     if (bellBtn_) {
         bellBtn_->setIcon(bellIcon(c, theme::ThemeManager::instance()->color(QStringLiteral("accent")), unreadPayments_, devicePixelRatioF()));
-        bellBtn_->setToolTip(unreadPayments_ > 0 ? trText(QStringLiteral("Payments received: %1 not looked at yet")).arg(unreadPayments_) : trText(QStringLiteral("Payments received")));
+        bellBtn_->setToolTip(unreadPayments_ > 0 ? trText(QStringLiteral("Incoming payments: %1 not looked at yet")).arg(unreadPayments_) : trText(QStringLiteral("Incoming payments")));
     }
     if (lockBtn_) {
         lockBtn_->setIcon(makeIcon(icon::Kind::Lock, c, 17, 1.8));

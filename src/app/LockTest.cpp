@@ -367,7 +367,7 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         wallet::PaymentBook::setPauseForTest(1000);
         shown.type(QString::fromLatin1(kOtherPassword));
         check(waitFor([&] { return !shown.busy(); }, 10000) && shown.window->isLocked(), QStringLiteral("a wrong password leaves it locked"));
-        check(shown.statusLine().contains(QLatin1String("not the password")) && shown.lock()->field()->text().isEmpty(), QStringLiteral("says so, and clears the field: %1").arg(shown.statusLine()));
+        check(shown.statusLine().contains(QLatin1String("Wrong password")) && shown.lock()->field()->text().isEmpty(), QStringLiteral("says so, and clears the field: %1").arg(shown.statusLine()));
         shown.type(QString::fromLatin1(kPassword));
         check(waitFor([&] { return !shown.window->isLocked(); }, 10000), QStringLiteral("the right one opens it"));
         check(!shown.lock()->isVisible() && shown.window->findChild<ui::SideNav*>()->isVisible() && shown.lock()->field()->text().isEmpty(), QStringLiteral("with nothing left of it in the field"));
@@ -434,7 +434,7 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         check(!shown.controller->applySettings(changedSettings, &error) && fileBytes(wallet::WalletStore::filePath()) == before, QStringLiteral("nor written over by settings"));
         shown.type(QString::fromLatin1(kOtherPassword));
         check(waitFor([&] { return !shown.busy(); }, 10000) && shown.controller->needsPassword(), QStringLiteral("a wrong password opens nothing"));
-        check(shown.statusLine().contains(QLatin1String("not the password")), QStringLiteral("and says so: %1").arg(shown.statusLine()));
+        check(shown.statusLine().contains(QLatin1String("Wrong password")), QStringLiteral("and says so: %1").arg(shown.statusLine()));
         shown.type(QString::fromLatin1(kPassword));
         check(waitFor([&] { return !shown.window->isLocked(); }, 10000), QStringLiteral("the right one opens it"));
         check(shown.controller->hasWallet() && shown.controller->store().wallets.value(0).label == QLatin1String("Shop renamed"), QStringLiteral("with what was saved under it"));
@@ -449,7 +449,7 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         check(shown.controller->renameWallet(shop, QStringLiteral("Shop"), &error), QStringLiteral("what is written next goes in: this window read the file: %1").arg(error));
 
         // Another password. A wrong one for the old is refused.
-        check(waited([&](const auto& done) { shown.controller->changePassword(QString::fromLatin1(kOtherPassword), QStringLiteral("a brand new sentence"), false, shown.window.get(), done); }).contains(QLatin1String("not the password")),
+        check(waited([&](const auto& done) { shown.controller->changePassword(QString::fromLatin1(kOtherPassword), QStringLiteral("a brand new sentence"), false, shown.window.get(), done); }).contains(QLatin1String("not the current password")),
               QStringLiteral("changing it takes the one in use"));
         check(waited([&](const auto& done) { shown.controller->changePassword(QString::fromLatin1(kPassword), QString::fromLatin1(kOtherPassword), false, shown.window.get(), done); }).isEmpty(), QStringLiteral("with it, it changes"));
         wallet::WalletStore probe;
@@ -487,7 +487,7 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
             ok->click();
             check(waitFor([&] { return !still || ok->isEnabled(); }, 10000) && still && still->isVisible() && shown.controller->hasPassword(), QStringLiteral("the wrong one takes nothing off, and the dialog says so"));
             if (still) {
-                check(still->findChild<QLabel*>(QStringLiteral("passwordStatus"))->text().contains(QLatin1String("not the password")), QStringLiteral("in those words"));
+                check(still->findChild<QLabel*>(QStringLiteral("passwordStatus"))->text().contains(QLatin1String("not the current password")), QStringLiteral("in those words"));
                 current->setText(QString::fromLatin1(kOtherPassword));
                 ok->click();
                 check(waitFor([&] { return !shown.controller->hasPassword(); }, 10000), QStringLiteral("the right one does"));
@@ -659,7 +659,7 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         // A second wallet after it: the page says the backup does not hold it.
         const QList<wallet::AccountKey> otherKeys = wallet::WalletStore::deriveAccounts(chain::bip39::split("legal winner thank year wave sausage worth useful legal winner thank yellow"), {});
         check(shown.controller->addKeysWallet(keysOf(otherKeys), QStringLiteral("Warehouse"), &error), QStringLiteral("(a wallet after it: %1)").arg(error));
-        check(settingsPage->findChild<QLabel*>(QStringLiteral("backupState"))->text().contains(QLatin1String("does not hold")), QStringLiteral("what came after is said to be outside it: %1").arg(settingsPage->findChild<QLabel*>(QStringLiteral("backupState"))->text()));
+        check(settingsPage->findChild<QLabel*>(QStringLiteral("backupState"))->text().contains(QLatin1String("not in it")), QStringLiteral("what came after is said to be outside it: %1").arg(settingsPage->findChild<QLabel*>(QStringLiteral("backupState"))->text()));
         check(waitFor([&] { return !shown.controller->loadingSaved(); }, 15000), QStringLiteral("(ready)"));
 
         // Files that are not it.
@@ -1036,7 +1036,7 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         check(waitFor([&] { return !shown.controller->loadingSaved(); }, 15000), QStringLiteral("(ready)"));
         check(shown.controller->removeWallet(first, &error), QStringLiteral("(the first goes: %1)").arg(error));
         auto* settings = shown.window->findChild<ui::SettingsPage*>();
-        check(settings->findChild<QLabel*>(QStringLiteral("backupState"))->text().contains(QLatin1String("does not hold")), QStringLiteral("the new one is said to be outside it: %1").arg(settings->findChild<QLabel*>(QStringLiteral("backupState"))->text()));
+        check(settings->findChild<QLabel*>(QStringLiteral("backupState"))->text().contains(QLatin1String("not in it")), QStringLiteral("the new one is said to be outside it: %1").arg(settings->findChild<QLabel*>(QStringLiteral("backupState"))->text()));
         // Labels on their way: what is removed now would come back with them.
         const QString labelsFile = folder.filePath(QStringLiteral("labels.jsonl"));
         {

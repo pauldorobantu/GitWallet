@@ -120,7 +120,7 @@ TransactionDialog::TransactionDialog(WalletController* controller, HistoryTableM
     feeValue_ = valueLabel(figures::dash(), this);
     feeValue_->setObjectName(QStringLiteral("txFee"));
     // Only what an id covers is proven: the witness is a server's word.
-    feeValue_->setToolTip(trText(QStringLiteral("The size a rate goes by is as a server gives it: no proof covers a transaction's witness.")));
+    feeValue_->setToolTip(trText(QStringLiteral("The fee rate uses the size a server reports: no proof covers a transaction's witness.")));
     form->addRow(trText(QStringLiteral("Fee")), feeValue_);
 
     const QStringList wallets = model_->walletsOf(line);
@@ -166,7 +166,7 @@ TransactionDialog::TransactionDialog(WalletController* controller, HistoryTableM
     form->addRow(trText(QStringLiteral("Note")), note_);
     column->addLayout(form);
 
-    reading_ = valueLabel(trText(QStringLiteral("Reading where its coins came from…")), this);
+    reading_ = valueLabel(trText(QStringLiteral("Reading where the coins came from…")), this);
     setTone(reading_, Tone::Muted);
     column->addWidget(reading_);
 
@@ -237,10 +237,10 @@ TransactionDialog::TransactionDialog(WalletController* controller, HistoryTableM
     if (history && history->running()) {
         // It waits for a server, and fills in when there is one.
         if (!history->connected())
-            reading_->setText(trText(QStringLiteral("Where its coins came from is read from a server, and none is connected.")));
+            reading_->setText(trText(QStringLiteral("No server is connected, so where the coins came from cannot be read.")));
         history->readDetail(txid_, this, [this](const wallet::TxDetail& detail) { showDetail(detail); });
     } else {
-        reading_->setText(trText(QStringLiteral("Where its coins came from is read from a server, and none is connected.")));
+        reading_->setText(trText(QStringLiteral("No server is connected, so where the coins came from cannot be read.")));
     }
 }
 
@@ -354,10 +354,10 @@ void TransactionDialog::showDetail(const wallet::TxDetail& detail)
     if (detail.coinbase) {
         reading_->setText(trText(QStringLiteral("Newly mined coins: they come from no address.")));
     } else if (detail.inputsUnread > 0) {
-        reading_->setText(trText(QStringLiteral("%1 of what it spends could not be read from the server.")).arg(detail.inputsUnread));
+        reading_->setText(trText(QStringLiteral("%1 of its inputs could not be read from the server.")).arg(detail.inputsUnread));
         setTone(reading_, Tone::Warning);
     } else if (detail.inputsLeftOut > 0) {
-        reading_->setText(trText(QStringLiteral("It spends %1 more than are listed here.")).arg(detail.inputsLeftOut));
+        reading_->setText(trText(QStringLiteral("It spends %1 more inputs than are listed here.")).arg(detail.inputsLeftOut));
     } else {
         reading_->hide();
     }

@@ -1076,11 +1076,11 @@ void EvmScanner::sendNonces()
                                            QStringLiteral("eth_chainId is not %1").arg(self->info().chainId)),
                             serverDetail(idError)};
         } else if (!idError.isEmpty()) {
-            issues << Issue{Problem::Failure, QStringLiteral("%1 nonce lookup failed").arg(self->info().name),
+            issues << Issue{Problem::Failure, QStringLiteral("%1 activity lookup failed").arg(self->info().name),
                             serverDetail(idError)};
         } else if (!parseQuantity(results.value(0), &chainId)) {
             issues << Issue{Problem::Failure,
-                            QStringLiteral("%1 nonce lookup failed: no valid chain id in the reply").arg(self->info().name),
+                            QStringLiteral("%1 activity lookup failed: no valid chain id in the reply").arg(self->info().name),
                             QString()};
         } else if (chainId != self->info().chainId) {
             issues << Issue{Problem::WrongChain,
@@ -1099,12 +1099,12 @@ void EvmScanner::sendNonces()
                     nonces[i] = nonce;
                     ok[i] = true;
                 } else if (!err.isEmpty()) {
-                    issues << Issue{Problem::Failure, QStringLiteral("%1 nonce lookup failed").arg(self->info().name),
+                    issues << Issue{Problem::Failure, QStringLiteral("%1 activity lookup failed").arg(self->info().name),
                                     serverDetail(err)};
                 } else {
                     unusable = true;
                     issues << Issue{Problem::Failure,
-                                    QStringLiteral("%1 nonce lookup failed: unexpected reply").arg(self->info().name),
+                                    QStringLiteral("%1 activity lookup failed: unexpected reply").arg(self->info().name),
                                     QString()};
                 }
             }

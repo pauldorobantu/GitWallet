@@ -129,8 +129,8 @@ QString problemWith(const Words& words, bool beside)
     }
     for (size_t i = 0; i < words.list.size(); ++i) {
         if (!chain::bip39::isWord(words.list[i])) {
-            return (beside ? QStringLiteral("word %1 of the phrase is not in the BIP39 list")
-                           : QStringLiteral("word %1 is not in the BIP39 list"))
+            return (beside ? QStringLiteral("word %1 of the phrase is not a seed word")
+                           : QStringLiteral("word %1 is not a seed word"))
                 .arg(i + 1);
         }
     }
@@ -138,7 +138,7 @@ QString problemWith(const Words& words, bool beside)
     std::string why;
     const bool valid = chain::bip39::validate(words.list, &why);
     chain::secureClear(why);
-    return valid ? QString() : QStringLiteral("the checksum does not match: a word is wrong or out of order");
+    return valid ? QString() : QStringLiteral("these words do not make a valid seed: a word is wrong or out of order");
 }
 
 size_t listWordsIn(const Words& words)

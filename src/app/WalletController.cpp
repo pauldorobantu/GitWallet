@@ -1237,7 +1237,7 @@ QString WalletController::statusText() const
     case Status::Unscanned:
         return QStringLiteral("Some addresses not scanned · %1").arg(rows);
     case Status::DoNotAddUp:
-        return QStringLiteral("Balances in doubt · %1 · %2 do not add up to their transactions").arg(rows, grouped(differingAddresses()));
+        return QStringLiteral("Balances in doubt · %1 · %2 do not match their transactions").arg(rows, grouped(differingAddresses()));
     case Status::UpToDate:
         break;
     }
@@ -1321,7 +1321,7 @@ QString WalletController::labelsBlocker() const
     if (!ledger_->isOpen())
         return ui::trText(QStringLiteral("Labels and notes are not being kept: %1.")).arg(ledgerClosedWhy_.isEmpty() ? ui::trText(QStringLiteral("another GitWallet window holds this folder")) : ledgerClosedWhy_);
     if (ledger_->labelsOwed())
-        return ui::trText(QStringLiteral("The labels and notes of an older file have yet to come over, and until they have none can be changed. This is tried again every minute: free some disk space if the disk is full."));
+        return ui::trText(QStringLiteral("Labels and notes from an older file have not come over yet, and until they have none can be changed. Retrying every minute: free some disk space if the disk is full."));
     return {};
 }
 
@@ -1724,7 +1724,7 @@ void WalletController::checkPassword(const QString& password, QObject* guard, co
         // No key is no answer: it says nothing of whether the password was right.
         const QString error = key.isEmpty() ? ui::trText(QStringLiteral("This PC has too little free memory to check a password. Close some programs and try again."))
                               : store_.isPasswordKey(key) ? QString()
-                                                          : ui::trText(QStringLiteral("That is not the password."));
+                                                          : ui::trText(QStringLiteral("Wrong password."));
         wallet::seal::wipe(key);
         if (stillThere)
             done(error);
@@ -1764,7 +1764,7 @@ void WalletController::changePassword(const QString& current, const QString& fre
             return;
         }
         if (hadOne && !store_.isPasswordKey(keys.current)) {
-            finish(ui::trText(QStringLiteral("That is not the password in use.")));
+            finish(ui::trText(QStringLiteral("That is not the current password.")));
             return;
         }
         if (!removing && keys.fresh.isEmpty()) {
@@ -2313,7 +2313,7 @@ wallet::ReceiveOffer WalletController::nextReceive(quint32 wallet, wallet::Netwo
         offer.address = checkedAddress(row);
         if (offer.address.isEmpty()) {
             offer.state = wallet::ReceiveOffer::State::Failed;
-            offer.why = QStringLiteral("What is kept for this address is not what the key of this wallet gives, so it is not offered.");
+            offer.why = QStringLiteral("The saved address does not match this wallet's key, so it is not offered.");
             return offer;
         }
         offer.state = wallet::ReceiveOffer::State::Ready;
@@ -2352,7 +2352,7 @@ bool WalletController::saveGivenOut(QString* error)
         settingsOnlyHere_ = false; // what was for this session only has gone with it
         return true;
     }
-    const QString message = QStringLiteral("An address given out could not be written down, so another start may offer it again: %1. This is tried again every half a minute.").arg(why);
+    const QString message = QStringLiteral("An address given out could not be saved, so a restart may offer it again: %1. Retrying every 30 seconds.").arg(why);
     setError(error, message);
     givenRetry_->start();
     if (!givenOwed_) {
