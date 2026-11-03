@@ -966,15 +966,15 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(scene.window->lastPaymentAlert().contains(QStringLiteral("3 balances went up")) && scene.window->lastPaymentAlert().contains(QStringLiteral("$30.00")), QStringLiteral("as one: %1").arg(scene.window->lastPaymentAlert()));
 
         // A stream of them, each within a pause of the last.
-        wallet::PaymentBook::setPauseForTest(300);
+        wallet::PaymentBook::setPauseForTest(500);
         pause(50);
         told.clear();
         int streamTold = 0;
         const QMetaObject::Connection counting = QObject::connect(payments, &wallet::PaymentBook::told, payments, [&streamTold] { ++streamTold; });
         setToken(15, 10000000);
-        pause(100);
+        pause(300);
         setToken(16, 10000000);
-        pause(100);
+        pause(300);
         setToken(17, 10000000);
         check(waitFor([&] { return told.size() == 3; }, 5000) && streamTold == 1, QStringLiteral("a stream is one thing to say: %1 times, %2 payments").arg(streamTold).arg(told.size()));
         QObject::disconnect(counting);
@@ -1117,8 +1117,10 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         if (latest) {
             check(latest->model()->index(0, 1).data().toString() == QStringLiteral("+10.00 USDT"), QStringLiteral("the latest first: %1").arg(latest->model()->index(0, 1).data().toString()));
             check(payments->unread() == 1, QStringLiteral("and showing them marks nothing as looked at"));
+            const QString paidTo = payments->all().last().address;
             emit latest->clicked(latest->model()->index(0, 1));
-            check(scene.window->placeBar()->place().address.has_value(), QStringLiteral("one click opens the address it came to"));
+            const std::optional<wallet::AddressRow> opened = scene.window->placeBar()->place().address;
+            check(!latest->isVisible() && opened && opened->address == paidTo, QStringLiteral("one click opens the address it came to"));
             scene.window->showPage(QStringLiteral("portfolio"));
         }
         told.clear();

@@ -20,9 +20,9 @@ USDC. Coins and networks are data, what the wallets show is kept in an encrypted
 start shows it at once, and 425,000 addresses fit (stage 1). Every Bitcoin transaction is in a
 History, overall, per wallet and per address, proven on this PC, with its fee, USD then and now,
 explorer link, labels and notes (stage 2). It opens on a Portfolio, goes down both ways with a
-clickable path, and Receive gives the next address nobody has been given, with its QR code. Dust can be
-hidden, a payment coming in is told and listed, and there is an app password and a backup in one file
-(stage 3). Missing against the known wallets: the history of Ethereum, Send.
+clickable path, and Receive gives the next address nobody has been given, with its QR code. Tiny amounts
+can be hidden, a payment coming in is told and listed, what becomes of it is told too, and there is an app
+password and a backup in one file (stage 3). Missing against the known wallets: the history of Ethereum, Send.
 
 ## The logic people already know
 

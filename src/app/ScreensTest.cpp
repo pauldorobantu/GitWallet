@@ -1939,6 +1939,7 @@ void testHandingOut(const Check& check, const QList<wallet::AccountKey>& keys)
         check(detail->text().contains(QLatin1String("Waiting for payment")), QStringLiteral("as does its own page: %1").arg(detail->text()));
         window.showPage(QStringLiteral("addresses"));
         addresses->showWallet(shop);
+        addresses->findChild<QComboBox*>(QStringLiteral("stateFilter"))->setCurrentIndex(0);
         pause(50);
         check(rowInTable(free.address) >= 0, QStringLiteral("what was given out counts as in use"));
         everyState();
