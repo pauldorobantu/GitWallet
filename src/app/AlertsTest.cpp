@@ -1208,9 +1208,20 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(ofShop > 0, QStringLiteral("(some are of that wallet)"));
         // Its addresses moved this run, and it can be added again.
         scene.paidOnChange(18, QStringLiteral("forget"), 5100);
+        const chain::Transaction hadBefore = transaction({somewhere(49)}, {{scene.changeScriptOf(18), 5100}}, 52);
         check(scene.controller->removeWallet(scene.shop, &removeError), QStringLiteral("a wallet removed: %1").arg(removeError));
         check(std::none_of(payments->all().cbegin(), payments->all().cend(), [&scene](const wallet::Payment& payment) { return payment.wallet == scene.shop; }), QStringLiteral("takes its payments along"));
         check(scene.window->titleBar()->unreadPayments() == payments->unread(), QStringLiteral("off the bell too"));
+        // Added again in the same run: what it had is a first look, not a payment.
+        check(scene.controller->addKeysWallet({scene.btcKey, scene.ethKey}, QStringLiteral("Shop again"), &removeError), QStringLiteral("(added again: %1)").arg(removeError));
+        for (const wallet::WalletEntry& entry : scene.controller->store().wallets) {
+            if (entry.label == QLatin1String("Shop again"))
+                scene.shop = entry.id;
+        }
+        check(waitFor([&] { return scene.changeRowOf(18) >= 0; }, 15000), QStringLiteral("(its rows)"));
+        const int beforeHad = scene.payments();
+        scene.add(hadBefore);
+        check(scene.payments() == beforeHad, QStringLiteral("a wallet removed and added again in one run tells nothing of what it had"));
         check(scene.controller->removeAllWallets(&removeError), QStringLiteral("it all goes: %1").arg(removeError));
         check(scene.payments() == 0, QStringLiteral("and so does the list"));
     }

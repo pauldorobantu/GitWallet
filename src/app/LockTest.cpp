@@ -9,6 +9,7 @@
 #include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/dialogs/PasswordDialog.h"
 #include "ui/dialogs/PaymentsDialog.h"
+#include "ui/dialogs/StatusDialog.h"
 #include "ui/pages/LockPage.h"
 #include "ui/pages/SettingsPage.h"
 #include "wallet/History.h"
@@ -1129,6 +1130,35 @@ void testLockEdges(const Check& check, const QList<wallet::AccountKey>& keys)
         leftThere->done(0);
     }
 
+    // The list of payments left open: the lock is not someone looking at what came after it opened.
+    {
+        wallet::PaymentBook* book = shown.controller->payments();
+        wallet::WalletModel* rows = shown.controller->model();
+        const wallet::Network ether = wallet::findNetwork(QStringLiteral("ethereum"))->network;
+        const wallet::Asset token = wallet::networkInfo(ether).tokens.first();
+        book->noteAnswered(ether, 0, {}, {wallet::assetInfo(token).key});
+        const quint32 own = shown.controller->store().wallets.first().id;
+        check(waitFor([&] { return rows->find(own, ether, chain::ScriptType::EthAccount, 0, 0, 2) >= 0; }, 15000), QStringLiteral("(its rows)"));
+        const auto pay = [&](quint32 index, quint64 units) {
+            wallet::AddressRow row = rows->at(rows->find(own, ether, chain::ScriptType::EthAccount, 0, 0, index));
+            row.checked = true;
+            row.used = true;
+            rows->upsert(row);
+            row.setBalance(token, chain::Amount::fromU64(units));
+            rows->upsert(row);
+        };
+        pay(1, 5000000);
+        check(book->unread() == 1, QStringLiteral("(one not looked at)"));
+        shown.window->openPayments();
+        auto* list = shown.window->findChild<ui::PaymentsDialog*>();
+        check(list && list->isVisible(), QStringLiteral("(the list is open)"));
+        pay(2, 6000000);
+        check(book->unread() == 2, QStringLiteral("(one more while it is open)"));
+        shown.window->lockNow();
+        check(shown.window->isLocked() && book->unread() == 1, QStringLiteral("the lock closing the list leaves what came after it opened as not looked at: %1").arg(book->unread()));
+        unlock();
+    }
+
     // What this program copied does not stay behind the lock; what someone else put there is theirs.
     QClipboard* clipboard = QApplication::clipboard();
     ui::copyTextToClipboard(shown.window.get(), QStringLiteral("zpub of the wallet"), QStringLiteral("Copied"));
@@ -1141,6 +1171,19 @@ void testLockEdges(const Check& check, const QList<wallet::AccountKey>& keys)
     shown.window->lockNow();
     check(clipboard->text() == QLatin1String("something of someone else's"), QStringLiteral("what was copied since by anything else stays"));
     unlock();
+
+    // How the scan stands opens from the status, and follows along.
+    shown.window->openStatus();
+    auto* status = shown.window->findChild<ui::StatusDialog*>();
+    check(status && status->isVisible(), QStringLiteral("the status in the title bar opens how the scan stands"));
+    if (status) {
+        auto* whole = status->findChild<QLabel*>(QStringLiteral("statusWhole"));
+        check(whole && whole->text() == shown.controller->statusText(), QStringLiteral("with the whole of what it says: %1").arg(whole ? whole->text() : QString()));
+        const QPointer<ui::StatusDialog> open(status);
+        shown.window->lockNow();
+        check(!open || !open->isVisible(), QStringLiteral("and it does not stay over the lock"));
+        unlock();
+    }
 
     // Too long, where it is typed.
     check(shown.lock()->field()->maxLength() == ui::PasswordDialog::kMostChars, QStringLiteral("the lock takes what a password can be"));
