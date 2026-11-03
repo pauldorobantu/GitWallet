@@ -606,6 +606,8 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         scene.paid(19, QStringLiteral("w1"), 0, 90000);
         const int waitingAt = scene.add(transaction({somewhere(32)}, {{scene.scriptOf(19), 90000}}, 32));
         pause(50);
+        int settledTimes = 0;
+        QObject::connect(payments, &wallet::PaymentBook::settled, payments, [&settledTimes](const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>&) { settledTimes += int(inABlock.size()); });
         const QString saidThen = scene.window->lastPaymentAlert();
         const int unreadThen = payments->unread();
         scene.book->setHeight(waitingAt, 900200);
@@ -616,10 +618,12 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(scene.window->lastPaymentAlert().contains(QStringLiteral("$90.00")) && scene.window->lastPaymentAlert().contains(QStringLiteral("Shop")), QStringLiteral("with what it is"));
         check(payments->unread() == unreadThen && scene.payments() == count + 1, QStringLiteral("as no new payment"));
         count = scene.payments();
-        const QString saidOnce = scene.window->lastPaymentAlert();
         scene.book->setStatus(model->at(scene.rowOf(19)).scripthash, QStringLiteral("w1"));
+        scene.add(transaction({somewhere(32)}, {{scene.scriptOf(19), 90000}}, 32));
+        scene.book->setProven(waitingAt, false);
+        scene.book->setProven(waitingAt, true);
         pause(50);
-        check(scene.window->lastPaymentAlert() == saidOnce, QStringLiteral("and once"));
+        check(settledTimes == 1, QStringLiteral("and once: %1").arg(settledTimes));
 
         // And one that will not come.
         wallet::AddressRow goneRow = model->at(scene.rowOf(0));
