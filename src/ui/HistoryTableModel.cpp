@@ -108,8 +108,9 @@ HistoryTableModel::HistoryTableModel(WalletController* controller, QObject* pare
         });
         connect(controller_, &WalletController::historyProgress, this, &HistoryTableModel::noteProgress);
         // A search goes through addresses' labels too.
+        // And a label says a line of next to nothing was meant.
         connect(controller_, &WalletController::labelsChanged, this, [this] {
-            if (!filter_.query.isEmpty())
+            if (!filter_.query.isEmpty() || filter_.hideDust)
                 scheduleRebuild();
         });
         connect(controller_->prices(), &net::PriceFeed::updated, this, [this] {
@@ -345,11 +346,42 @@ void HistoryTableModel::rebuildNow()
     rebuild_->stop();
     QElapsedTimer clock;
     clock.start();
-    QVector<Line> lines;
     qint64 receivedShown = 0;
     qint64 spentShown = 0;
     int dustHidden = 0;
-    const bool hideDust = filter_.hideDust && filter_.scripthash.isEmpty() && filter_.query.isEmpty();
+    QVector<Line> lines = readLines(filter_.hideDust && filter_.scripthash.isEmpty() && filter_.query.isEmpty(), &receivedShown, &spentShown, &dustHidden);
+    stale_ = false;
+    totalAtRebuild_ = totalCount();
+    emit aboutToRebuild();
+    beginResetModel();
+    lines_ = std::move(lines);
+    receivedShown_ = receivedShown;
+    spentShown_ = spentShown;
+    dustHidden_ = dustHidden;
+    sortLines(lines_);
+    endResetModel();
+    lastRebuildMs_ = int(clock.elapsed());
+    emit rebuilt();
+}
+
+QVector<HistoryTableModel::Line> HistoryTableModel::linesForExport() const
+{
+    if (dustHidden_ == 0)
+        return lines_;
+    qint64 received = 0;
+    qint64 spent = 0;
+    int dust = 0;
+    QVector<Line> lines = readLines(false, &received, &spent, &dust);
+    sortLines(lines);
+    return lines;
+}
+
+QVector<HistoryTableModel::Line> HistoryTableModel::readLines(bool hideDust, qint64* received, qint64* spent, int* dustHidden) const
+{
+    QVector<Line> lines;
+    qint64 receivedShown = 0;
+    qint64 spentShown = 0;
+    int hidden = 0;
     if (controller_) {
         const QList<wallet::UtxoHistory*> histories = controller_->histories();
         for (const wallet::UtxoHistory* history : histories) {
@@ -368,11 +400,8 @@ void HistoryTableModel::rebuildNow()
                     continue;
                 if (!matches(line, *book, book->at(position), book->effectsOf(position)))
                     continue;
-                if (hideDust && isDust(line, *book, dustLimit)) {
-                    ++dustHidden;
-                    continue;
-                }
                 // What it did, as the line says: change and moves between what is shown are nothing.
+                // Dust counts: what later spends it would read as more going out than ever came in.
                 if (line.state == TxState::Confirming || line.state == TxState::Confirmed) {
                     const qint64 net = line.received - line.spent;
                     if (net > 0)
@@ -380,22 +409,18 @@ void HistoryTableModel::rebuildNow()
                     else
                         spentShown -= net;
                 }
+                if (hideDust && isDust(line, *book, dustLimit)) {
+                    ++hidden;
+                    continue;
+                }
                 lines.append(line);
             }
         }
     }
-    stale_ = false;
-    totalAtRebuild_ = totalCount();
-    emit aboutToRebuild();
-    beginResetModel();
-    lines_ = std::move(lines);
-    receivedShown_ = receivedShown;
-    spentShown_ = spentShown;
-    dustHidden_ = dustHidden;
-    sortLines();
-    endResetModel();
-    lastRebuildMs_ = int(clock.elapsed());
-    emit rebuilt();
+    *received = receivedShown;
+    *spent = spentShown;
+    *dustHidden = hidden;
+    return lines;
 }
 
 double HistoryTableModel::priceNow(const wallet::HistoryBook& book) const
@@ -409,7 +434,7 @@ double HistoryTableModel::coinValue(const Line& line) const
     return double(net < 0 ? -net : net) / 100000000.0;
 }
 
-void HistoryTableModel::sortLines()
+void HistoryTableModel::sortLines(QVector<Line>& lines) const
 {
     const bool ascending = sortOrder_ == Qt::AscendingOrder;
     // By date, as the column reads. What is pending has no block yet: it stands above every block, as
@@ -432,14 +457,14 @@ void HistoryTableModel::sortLines()
     };
     // Each key once, on a list that half a million comparisons a level go over.
     const auto order = [&](const auto& keyOf) {
-        using Key = std::decay_t<decltype(keyOf(lines_.first()))>;
+        using Key = std::decay_t<decltype(keyOf(lines.first()))>;
         std::vector<Key> keys;
-        keys.reserve(size_t(lines_.size()));
-        for (const Line& line : std::as_const(lines_))
+        keys.reserve(size_t(lines.size()));
+        for (const Line& line : std::as_const(lines))
             keys.push_back(keyOf(line));
         std::vector<int> rows(keys.size());
         std::iota(rows.begin(), rows.end(), 0);
-        const QVector<Line> before = lines_;
+        const QVector<Line> before = lines;
         std::stable_sort(rows.begin(), rows.end(), [&](int a, int b) {
             const Key& x = keys[size_t(a)];
             const Key& y = keys[size_t(b)];
@@ -448,12 +473,12 @@ void HistoryTableModel::sortLines()
             return ascending ? x < y : y < x;
         });
         for (size_t i = 0; i < rows.size(); ++i)
-            lines_[qsizetype(i)] = before.at(rows[i]);
+            lines[qsizetype(i)] = before.at(rows[i]);
     };
     // Text sorts as the numbers of what there is of it, of which there are few.
     const auto orderText = [&](const auto& textOf) {
         QHash<QString, int> numbers;
-        for (const Line& line : std::as_const(lines_))
+        for (const Line& line : std::as_const(lines))
             numbers.insert(textOf(line), 0);
         // As the other pages do it, whatever case a name is in.
         QStringList distinct = numbers.keys();
@@ -495,7 +520,7 @@ void HistoryTableModel::sortLines()
         break;
     case ColDate:
     default:
-        std::stable_sort(lines_.begin(), lines_.end(), [&](const Line& a, const Line& b) {
+        std::stable_sort(lines.begin(), lines.end(), [&](const Line& a, const Line& b) {
             return ascending ? byTime(a, b) : byTime(b, a);
         });
         break;
@@ -511,7 +536,7 @@ void HistoryTableModel::sort(int column, Qt::SortOrder order)
     // A row chosen stays that transaction, not that number.
     emit aboutToRebuild();
     emit layoutAboutToBeChanged();
-    sortLines();
+    sortLines(lines_);
     emit layoutChanged();
     emit rebuilt();
 }

@@ -105,6 +105,8 @@ public:
     int rowsShown() const;
     int rowsHolding() const; // of those a key looks at
     int rowsTotal() const;   // those a key looks at
+    int dustHidden() const;  // rows off the list for holding only dust
+    bool oneAddress() const; // of which nothing is ever hidden as dust: it was asked for by name
     bool allFinal() const;   // every figure among those has answered
     void refresh();
 

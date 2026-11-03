@@ -977,7 +977,8 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         check(waitFor([&] { QString why; return shown.controller->removeAllWallets(&why); }, 15000), QStringLiteral("all removed"));
     }
 
-    // A wallet here with one key of the backup's wallet: the same wallet, and what it lacks comes along.
+    // A wallet here with one key of the backup's wallet: what it lacks comes along, as a wallet of its own,
+    // for an address a wallet here hands out is that wallet's own, whatever a file says.
     {
         const QList<wallet::AccountKey> otherKeys = wallet::WalletStore::deriveAccounts(chain::bip39::split("legal winner thank year wave sausage worth useful legal winner thank yellow"), {});
         Window shown;
@@ -991,16 +992,16 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         check(shown.controller->addKeysWallet(part, QStringLiteral("Part of it"), &error), QStringLiteral("(a wallet with one key of it: %1)").arg(error));
         check(waitFor([&] { return !shown.controller->loadingSaved(); }, 15000), QStringLiteral("(ready)"));
         const WalletController::RestoreReport report = restoring(shown.controller, shown.window.get(), path);
-        check(report.error.isEmpty() && report.walletsHere == 1 && report.walletsAdded == 0, QStringLiteral("it is that wallet: %1").arg(report.error));
-        check(report.keysAdded == int(added.size()) - 2 && report.keysNotAdded == 1, QStringLiteral("its other keys join it, but for one whose place is taken: %1 added, %2 not").arg(report.keysAdded).arg(report.keysNotAdded));
+        check(report.error.isEmpty() && report.walletsHere == 1 && report.walletsAdded == 1, QStringLiteral("it counts as here, and what it lacks goes in: %1").arg(report.error));
+        check(report.keysApart == int(added.size()) - 1, QStringLiteral("all of those keys: %1").arg(report.keysApart));
         const wallet::WalletEntry* entry = shown.controller->store().wallets.isEmpty() ? nullptr : &shown.controller->store().wallets.first();
-        check(entry && entry->accounts.size() == part.size() + report.keysAdded && entry->label == QLatin1String("Part of it"), QStringLiteral("under the name it has here"));
+        check(entry && entry->accounts.size() == part.size() && entry->label == QLatin1String("Part of it"), QStringLiteral("the wallet here gets no key from a file: nothing it hands out can change"));
+        const wallet::WalletEntry apart = shown.controller->store().wallets.value(1);
+        check(apart.accounts.size() == report.keysApart && apart.label == QLatin1String("Shop") && apart.fromKeys, QStringLiteral("they are a wallet of their own, to be seen: %1").arg(apart.label));
         wallet::WalletStore written;
-        check(written.load(&error) && written.wallets.value(0).accounts.size() == part.size() + report.keysAdded, QStringLiteral("written down, and it reads: %1").arg(error));
-        if (entry) {
-            for (const wallet::AccountKey& key : entry->accounts)
-                check(key.wallet == entry->id, QStringLiteral("each under that wallet"));
-        }
+        check(written.load(&error) && written.wallets.size() == 2, QStringLiteral("written down, and it reads: %1").arg(error));
+        const WalletController::RestoreReport second = restoring(shown.controller, shown.window.get(), path);
+        check(second.error.isEmpty() && second.walletsAdded == 0 && second.keysApart == 0 && shown.controller->store().wallets.size() == 2, QStringLiteral("again, nothing doubles"));
         check(waitFor([&] { QString why; return shown.controller->removeAllWallets(&why); }, 15000), QStringLiteral("all removed"));
     }
 

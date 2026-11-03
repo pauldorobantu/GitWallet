@@ -49,6 +49,7 @@ private:
     void showState();       // the wallet view when there is a wallet, else the empty state
     void scheduleRefresh(); // one refreshView() per burst of totals / status signals
     void refreshView();
+    void refreshCount();
 
     WalletController* controller_ = nullptr;
     QStackedLayout* states_ = nullptr;
@@ -61,6 +62,7 @@ private:
     QCheckBox* hideZero_ = nullptr;
     QCheckBox* hideDust_ = nullptr;
     QLabel* countLabel_ = nullptr;
+    QString countText_;
     QWidget* details_ = nullptr;
     QPushButton* detailsButton_ = nullptr;
     // Chip: "Connecting…" / "Address limit reached" / "Ethereum endpoint answers for

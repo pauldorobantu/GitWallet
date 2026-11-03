@@ -121,19 +121,22 @@ public:
         if (hide != hideDust_)
             change([&] { hideDust_ = hide; });
     }
-    // What the dust filter alone keeps off the list now. What a search looks for it finds all the same.
-    int dustHidden() const
+    // What the dust filter alone keeps off the list now, in the order of the rows. What a search looks
+    // for it finds all the same.
+    QList<int> rowsHiddenAsDust() const
     {
+        QList<int> hidden;
         const auto* table = static_cast<const AddressTableModel*>(sourceModel());
         if (!hideDust_ || !query_.isEmpty() || !table)
-            return 0;
-        int hidden = 0;
+            return hidden;
         for (const int row : table->rowsOfDust()) {
             if (row < table->rowCount() && table->isDust(row) && passes(row, QModelIndex()))
-                ++hidden;
+                hidden.append(row);
         }
+        std::sort(hidden.begin(), hidden.end());
         return hidden;
     }
+    int dustHidden() const { return int(rowsHiddenAsDust().size()); }
     // All of it in one go: a pass over the rows per field is a long time at a million.
     void setAll(quint32 wallet, int chain, int state, std::optional<wallet::Asset> held, const wallet::WalletModel* model)
     {
@@ -313,6 +316,7 @@ struct AddressesPage::Ui : QObject
     QTimer* searchPause = nullptr; // on a large list, the query waits for the typing to stop
     QTimer* cooldown = nullptr;  // Refresh stays disabled while it runs
     QWidget* nothingHere = nullptr; // a place where no address holds what it is about
+    QWidget* onlyDust = nullptr;    // every row that would show is under the limit
     bool inPlace = false;        // the wallet and chain come from the place, and their combos are gone
     int placeState = 0;          // the state a place came up on: anything else is the reader's own
     quint32 placeWallet = 0;
@@ -368,6 +372,11 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     root->addWidget(ui_->noResults, 1);
     root->addWidget(ui_->nothingHere, 1);
     ui_->nothingHere->hide();
+    ui_->onlyDust = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("Only dust here"),
+                                         QStringLiteral("Hide dust keeps it off this list. It still counts in every total, and a search still finds it."));
+    ui_->onlyDust->setObjectName(QStringLiteral("addressesOnlyDust"));
+    root->addWidget(ui_->onlyDust, 1);
+    ui_->onlyDust->hide();
 
     const page::ActionBar bar = page::makeActionBar(this);
     ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search address, label or path"));
@@ -408,7 +417,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     page::finishBarLeft(bar, ui_->search, ui_->count);
 
     ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
-    ui_->exportCsv->setToolTip(QStringLiteral("Save the rows shown to a spreadsheet file. It is not encrypted: "
+    ui_->exportCsv->setToolTip(QStringLiteral("Save these addresses to a spreadsheet file, dust included, so that its balances add up to the total. It is not encrypted: "
                                               "anyone who reads it sees these addresses and balances."));
     bar.right->addWidget(ui_->exportCsv);
     ui_->refresh = new QPushButton(QStringLiteral("Refresh"), bar.widget);
@@ -716,13 +725,11 @@ void AddressesPage::chooseExportFile()
         return;
     QString error;
     if (exportCsv(path, &error)) {
-        const int hidden = ui_->filter->dustHidden();
-        Feedback::show(ui_->exportCsv, hidden > 0 ? Feedback::Type::Info : Feedback::Type::Success,
-                       hidden > 0 ? trText(QStringLiteral("Addresses exported, without the %1 hidden as dust")).arg(figures::formatCount(hidden))
-                       : controller_ && controller_->showingSaved()
+        Feedback::show(ui_->exportCsv, Feedback::Type::Success,
+                       controller_ && controller_->showingSaved()
                            ? trText(QStringLiteral("Addresses exported, with saved balances still being checked"))
                            : trText(QStringLiteral("Addresses exported")));
-    }    else
+    } else
         Feedback::show(this, Feedback::Type::Error, error);
 }
 
@@ -747,11 +754,17 @@ bool AddressesPage::exportCsv(const QString& path, QString* error) const
             text = (QStringLiteral("saved ") + text).trimmed();
         asOf.insert(network.network, text);
     }
-    for (int row = 0; model && row < ui_->filter->rowCount(); ++row) {
-        const QModelIndex first = ui_->filter->mapToSource(ui_->filter->index(row, 0));
-        if (first.row() >= model->size())
+    // What a list hides as dust is still in the file: its balances add up to the total.
+    QList<int> rows;
+    rows.reserve(ui_->filter->rowCount());
+    for (int row = 0; model && row < ui_->filter->rowCount(); ++row)
+        rows.append(ui_->filter->mapToSource(ui_->filter->index(row, 0)).row());
+    rows += ui_->filter->rowsHiddenAsDust();
+    for (const int sourceRow : std::as_const(rows)) {
+        if (!model || sourceRow >= model->size())
             continue;
-        const wallet::AddressRow& r = model->at(first.row());
+        const QModelIndex first = ui_->model->index(sourceRow, 0);
+        const wallet::AddressRow& r = model->at(sourceRow);
         const auto cell = [&](int column) { return first.siblingAtColumn(column).data().toString(); };
         QStringList fields;
         fields << csvField(cell(AddressTableModel::ColWallet), format)
@@ -887,11 +900,11 @@ void AddressesPage::updateState()
     ui_->copy->setEnabled(chosen);
 
     const int shown = ui_->filter->rowCount();
+    const int dustHidden = ui_->filter->dustHidden();
     // Not part of what the database kept, with nothing to say so.
-    ui_->exportCsv->setEnabled(shown > 0 && !(controller_ && controller_->loadingSaved()));
+    ui_->exportCsv->setEnabled(shown + dustHidden > 0 && !(controller_ && controller_->loadingSaved()));
     const int total = ui_->model->rowCount();
     int funded = 0;
-    const int dustHidden = ui_->filter->dustHidden();
     if (!ui_->filter->narrowed()) {
         // Every row shows: the model counts them, so a scan streaming in
         // thousands of rows costs no recount per burst.
@@ -916,13 +929,15 @@ void AddressesPage::updateState()
     const bool scanning = controller_ && controller_->isScanning();
     // Said only once all there is to ask has answered: until then nobody knows.
     const bool nothing = hasWallet && ui_->inPlace && !scanning && shown == 0 && dustHidden == 0 && ui_->placeAsset && holdingOf(controller_, *ui_->placeAsset, ui_->placeWallet).complete;
-    QWidget* empty = !hasWallet ? ui_->noWallet : nothing ? ui_->nothingHere : ui_->waiting;
-    for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->nothingHere}) {
+    // What is there is hidden, which is neither nothing nor nothing found.
+    const bool onlyDust = hasWallet && shown == 0 && dustHidden > 0;
+    QWidget* empty = !hasWallet ? ui_->noWallet : onlyDust ? ui_->onlyDust : nothing ? ui_->nothingHere : ui_->waiting;
+    for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->nothingHere, ui_->onlyDust}) {
         if (other != empty)
             other->hide();
     }
     const bool chainChosen = !ui_->placeAsset && ui_->chain->currentData().toInt() != kAllChains;
-    const bool narrowed = dustHidden > 0 || (ui_->inPlace ? ui_->state->currentIndex() != ui_->placeState || chainChosen : ui_->filter->filtered());
+    const bool narrowed = !onlyDust && (dustHidden > 0 || (ui_->inPlace ? ui_->state->currentIndex() != ui_->placeState || chainChosen : ui_->filter->filtered()));
     page::showListState(ui_->view, empty, ui_->noResults, shown,
                         hasWallet ? ui_->search->text().trimmed() : QString(),
                         hasWallet && narrowed);

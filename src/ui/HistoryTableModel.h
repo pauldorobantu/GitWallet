@@ -90,6 +90,8 @@ public:
     void setWalletNamesForTest(const QHash<quint32, QString>& names) { labels_ = names; }
 
     QVector<Line> lines() const { return lines_; } // shared until the next change: costs nothing
+    // What a file gets, in the same order: dust too, or its column would not add up to a balance.
+    QVector<Line> linesForExport() const;
     // As an export writes it, under what it was narrowed to when it began.
     ExportLine exportLine(const Line& line, const Filter& filter) const;
     QString stateText(const Line& line) const;
@@ -112,7 +114,8 @@ signals:
 
 private:
     void scheduleRebuild();
-    void sortLines();
+    void sortLines(QVector<Line>& lines) const;
+    QVector<Line> readLines(bool hideDust, qint64* received, qint64* spent, int* dustHidden) const;
     bool makeLine(wallet::HistoryBook* book, const wallet::UtxoHistory* history, int position, int scope, int tip, const Filter& filter, Line* out) const;
     TxState stateOf(const wallet::TxRecord& tx, int tip, const wallet::UtxoHistory* history) const;
     bool matches(const Line& line, const wallet::HistoryBook& book, const wallet::TxRecord& tx, const QVector<wallet::TxEffect>& effects) const;

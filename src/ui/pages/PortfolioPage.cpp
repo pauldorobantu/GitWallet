@@ -230,7 +230,10 @@ QWidget* PortfolioPage::buildWalletState()
     table_->showCoins();
     root->addWidget(table_, 1);
     connect(table_, &HoldingsTable::coinChosen, this, &PortfolioPage::coinChosen);
-    connect(table_, &HoldingsTable::refreshed, this, [this] { allocation_->setParts(table_->parts()); });
+    connect(table_, &HoldingsTable::refreshed, this, [this] {
+        allocation_->setParts(table_->parts());
+        refreshCount();
+    });
 
     const page::Section status = page::makeSection(host, QStringLiteral("Status"));
     details_ = status.card;
@@ -476,9 +479,16 @@ void PortfolioPage::refreshView()
     for (qsizetype i = 0; i < networkList.size() && i < serverLabels_.size(); ++i)
         setServer(serverLabels_.at(i), states[networkList.at(i).network]);
 
-    countLabel_->setText(derived == 0 ? trText(QStringLiteral("%1 wallets")).arg(formatCount(walletCount))
-                                      : trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
-                                            .arg(formatCount(walletCount), figures::countSoFar(model ? model->fundedCount() : 0, allAnswered), formatCount(derived)));
+    countText_ = derived == 0 ? trText(QStringLiteral("%1 wallets")).arg(formatCount(walletCount))
+                              : trText(QStringLiteral("%1 wallets · %2 funded of %3 addresses"))
+                                    .arg(formatCount(walletCount), figures::countSoFar(model ? model->fundedCount() : 0, allAnswered), formatCount(derived));
+    refreshCount();
+}
+
+void PortfolioPage::refreshCount()
+{
+    const int dust = table_->dustHidden();
+    countLabel_->setText(dust > 0 ? countText_ + QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(formatCount(dust)) : countText_);
 }
 
 } // namespace app::ui

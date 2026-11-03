@@ -64,12 +64,19 @@ void HoldingsPage::showEvent(QShowEvent* event)
 void HoldingsPage::updateCount()
 {
     // No count of nothing while nothing has answered, nor of no row at all.
+    QString text;
     if (table_->rowsTotal() == 0 || (!table_->allFinal() && table_->rowsHolding() == 0))
-        count_->clear();
+        text.clear();
     else if (table_->allFinal())
-        count_->setText(trText(QStringLiteral("%1 of %2 hold something")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal())));
+        text = trText(QStringLiteral("%1 of %2 hold something")).arg(figures::formatCount(table_->rowsHolding()), figures::formatCount(table_->rowsTotal()));
     else
-        count_->setText(trText(QStringLiteral("%1 hold something so far")).arg(figures::formatCount(table_->rowsHolding())));
+        text = trText(QStringLiteral("%1 hold something so far")).arg(figures::formatCount(table_->rowsHolding()));
+    const int dust = table_->dustHidden();
+    if (dust > 0)
+        text += (text.isEmpty() ? QString() : QStringLiteral(" · ")) + trText(QStringLiteral("%1 dust hidden")).arg(figures::formatCount(dust));
+    count_->setText(text);
+    // It would change every other list, and hide nothing here.
+    hideDust_->setVisible(!table_->oneAddress());
 }
 
 } // namespace app::ui

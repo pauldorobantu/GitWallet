@@ -319,8 +319,9 @@ AddressTableModel::AddressTableModel(WalletController* controller, QObject* pare
         return;
     prices_ = currentPrices(controller_);
     refreshLabels();
-    connect(controller_, &WalletController::walletChanged, this, &AddressTableModel::refreshLabels);
+    // In this order: what refreshLabels() sets off asks each row whether it was given out.
     connect(controller_, &WalletController::walletChanged, this, [this] { givenStale_ = true; });
+    connect(controller_, &WalletController::walletChanged, this, &AddressTableModel::refreshLabels);
     connect(controller_, &WalletController::rowGivenOut, this, [this](int row) {
         givenStale_ = true;
         if (row >= 0 && row < rows_)
@@ -599,7 +600,8 @@ void AddressTableModel::refreshPrices()
 void AddressTableModel::noteDust(int row)
 {
     const wallet::WalletModel* model = controller_ ? controller_->model() : nullptr;
-    if (model && row < model->size() && model->at(row).onlyDust())
+    // Nobody can say it is only dust until each of its balances has answered.
+    if (model && row < model->size() && model->at(row).checked && model->at(row).onlyDust())
         dust_.insert(row);
     else
         dust_.remove(row);
@@ -612,7 +614,7 @@ void AddressTableModel::readDust()
     if (!model)
         return;
     for (int row = 0; row < rows_ && row < model->size(); ++row) {
-        if (model->at(row).state() == wallet::AddressState::Funded && model->at(row).onlyDust())
+        if (model->at(row).checked && model->at(row).onlyDust())
             dust_.insert(row);
     }
 }

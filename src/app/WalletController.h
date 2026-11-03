@@ -115,8 +115,7 @@ public:
         int walletsHere = 0;      // this PC has them already: what they gave out is joined
         int walletsRefused = 0;
         QStringList refused;      // those: the name, and why
-        int keysAdded = 0;        // keys of a wallet here that only the backup had
-        int keysNotAdded = 0;     // the wallet here has another key in that place
+        int keysApart = 0;        // keys a wallet here lacks: they go in as a wallet of their own
         qint64 givenOut = 0;      // addresses given out that this PC had not known of
         int labels = 0;
         int labelsLeftOut = 0;

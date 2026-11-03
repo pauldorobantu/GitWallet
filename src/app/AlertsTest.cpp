@@ -323,6 +323,26 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     check(shownWithout == model->size() - 3, QStringLiteral("three rows left the list (%1 of %2)").arg(shownWithout).arg(model->size()));
     check(countLine().contains(QStringLiteral("funded · 3 dust hidden")), QStringLiteral("and it says so: %1").arg(countLine()));
     check(countLine().contains(QStringLiteral("· 4 funded")), QStringLiteral("what it calls funded is what it shows: %1").arg(countLine()));
+    // Nobody has answered for all of it yet: nothing can be called dust.
+    {
+        wallet::AddressRow part = model->at(scene.ethRowOf(5));
+        part.setBalance(ethereum.coin, chain::Amount::fromU64(1000));
+        part.checked = false;
+        part.used = true;
+        model->upsert(part);
+        pause(150);
+        check(listed(part.address) && countLine().contains(QStringLiteral("3 dust hidden")), QStringLiteral("a row with a balance still unanswered stays on the list: %1").arg(countLine()));
+        part = model->at(scene.ethRowOf(5));
+        part.checked = true;
+        model->upsert(part);
+        pause(150);
+        check(!listed(part.address) && countLine().contains(QStringLiteral("4 dust hidden")), QStringLiteral("and goes once it has answered: %1").arg(countLine()));
+        part = model->at(scene.ethRowOf(5));
+        part.setBalance(ethereum.coin, chain::Amount());
+        part.used = false;
+        model->upsert(part);
+        pause(150);
+    }
     auto* search = addresses->findChild<QLineEdit*>();
     const QString dustAddress = model->at(scene.rowOf(1)).address;
     search->setText(dustAddress);
@@ -388,6 +408,14 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     const QString heroWith = portfolio->findChild<QLabel*>(QStringLiteral("heroValue"))->text();
     check(coinRow(QStringLiteral("USD Coin")) < 0, QStringLiteral("a coin of only dust leaves the list"));
     check(coinRow(QStringLiteral("Bitcoin")) >= 0, QStringLiteral("one with more does not"));
+    const auto portfolioSays = [&](const QString& words) {
+        for (const QLabel* label : portfolio->findChildren<QLabel*>()) {
+            if (label->text().contains(words))
+                return true;
+        }
+        return false;
+    };
+    check(portfolioSays(QStringLiteral("2 dust hidden")), QStringLiteral("and the page says how many: USD Coin and Ethereum"));
     hideCoins->setChecked(false);
     pause(450);
     check(coinRow(QStringLiteral("USD Coin")) >= 0, QStringLiteral("unticked it is back"));
@@ -407,6 +435,12 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     for (int row = 0; row < assets->model()->rowCount(); ++row)
         dustShown = dustShown || assets->model()->index(row, 0).data().toString() == QLatin1String("Ethereum");
     check(dustShown, QStringLiteral("the page of one address shows its dust"));
+    QCheckBox* holdingsHide = nullptr;
+    for (QCheckBox* box : holdingsPage->findChildren<QCheckBox*>()) {
+        if (box->text().contains(QLatin1String("dust")))
+            holdingsHide = box;
+    }
+    check(holdingsHide && !holdingsHide->isVisible(), QStringLiteral("with nothing to untick: it would change every other list and hide nothing there"));
     scene.window->showPage(QStringLiteral("history"));
 
     // The history.
@@ -436,6 +470,24 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     check(shownLine(labelLine), QStringLiteral("to one with a label"));
     check(shownLine(notedLine), QStringLiteral("or has a note"));
     check(lines->dustHidden() == 1, QStringLiteral("and it counts what it left out: %1").arg(lines->dustHidden()));
+    // A file has it all the same, or its column would not add up.
+    check(lines->linesForExport().size() == lines->rowCount() + 1, QStringLiteral("what is exported is all of it: %1 of %2").arg(lines->linesForExport().size()).arg(lines->rowCount()));
+    const auto exportedOf = [&](const QVector<ui::HistoryTableModel::Line>& some, int position) {
+        return std::any_of(some.cbegin(), some.cend(), [position](const ui::HistoryTableModel::Line& line) { return line.position == position; });
+    };
+    check(exportedOf(lines->linesForExport(), dustLine), QStringLiteral("that line too"));
+    // In and out count it too: what later spends it would otherwise read as more than ever came.
+    const int dustTip = std::max(controller->historyOf(scene.bitcoin)->tip(), 900000);
+    scene.book->setHeight(dustLine, dustTip);
+    scene.book->setProven(dustLine, true);
+    lines->rebuildNow();
+    check(lines->receivedShown() >= 500 && !shownLine(dustLine), QStringLiteral("what the lines came to counts it, hidden or not: %1").arg(lines->receivedShown()));
+    // A label on its address says it was meant.
+    const QString sixAddress = model->at(scene.rowOf(6)).address;
+    check(controller->setAddressLabel(sixAddress, QStringLiteral("Meant"), &error), QStringLiteral("(a label: %1)").arg(error));
+    check(waitFor([&] { return shownLine(dustLine); }, 3000), QStringLiteral("a label given brings the line back"));
+    check(controller->setAddressLabel(sixAddress, QString(), &error), QStringLiteral("(and off: %1)").arg(error));
+    check(waitFor([&] { return !shownLine(dustLine); }, 3000), QStringLiteral("taken off, it goes again"));
     auto* lineSearch = history->findChild<QLineEdit*>();
     lineSearch->setText(QString::fromStdString(chain::hashHex(scene.book->at(dustLine).txid)));
     pause(350);
@@ -490,6 +542,25 @@ void testOnlyDust(const Check& check, const QList<wallet::AccountKey>& keys)
     pause(100);
     check(names().size() == coins->model()->rowCount() && names().contains(QStringLiteral("Bitcoin")) && names().contains(QStringLiteral("Ethereum")), QStringLiteral("with zeros shown, those too: %1").arg(names().join(QStringLiteral(", "))));
     portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
+
+    // A place of nothing but dust says so, rather than that a search found nothing.
+    auto* addresses = scene.window->findChild<ui::AddressesPage*>();
+    ui::figures::setHideDust(true);
+    scene.window->showPage(QStringLiteral("addresses"));
+    addresses->showPlace(scene.shop, eth);
+    pause(200);
+    auto* onlyDustAddresses = addresses->findChild<QWidget*>(QStringLiteral("addressesOnlyDust"));
+    check(onlyDustAddresses && onlyDustAddresses->isVisible(), QStringLiteral("a coin whose addresses are all dust opens on saying so"));
+    addresses->clearPlace();
+    scene.paid(1, QStringLiteral("a"), 500);
+    scene.add(transaction({somewhere(1)}, {{scene.scriptOf(1), 500}}, 1));
+    auto* history = scene.window->findChild<ui::HistoryPage*>();
+    scene.window->showPage(QStringLiteral("history"));
+    history->findChild<QCheckBox*>(QStringLiteral("historyHideDust"))->setChecked(true);
+    history->tableModel()->rebuildNow();
+    pause(300);
+    auto* onlyDustLines = history->findChild<QWidget*>(QStringLiteral("historyOnlyDust"));
+    check(history->tableModel()->rowCount() == 0 && onlyDustLines && onlyDustLines->isVisible(), QStringLiteral("so does a history of nothing but dust, rather than that there is nothing"));
     check(scene.controller->removeAllWallets(&error), QStringLiteral("it goes: %1").arg(error));
 }
 
@@ -782,6 +853,21 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         scene.book->setProven(claimedAt, true);
         check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("proven, it is told so: %1").arg(scene.window->lastPaymentAlert()));
         scene.book->setStatus(model->at(scene.rowOf(18)).scripthash, QStringLiteral("b1"));
+        // Its proof does not hold: that is said too, once it has had its chance.
+        {
+            const int claimHeight = std::max(controller->historyOf(scene.bitcoin)->tip(), 900000) + 2;
+            scene.paid(18, QStringLiteral("b3"), 95000);
+            const chain::Transaction claimed = transaction({somewhere(48)}, {{scene.scriptOf(18), 5000}}, 50);
+            payments->setProofFailedForTest([&claimed](wallet::Network, const chain::Hash256& txid) { return txid == claimed.txid; });
+            const int claimAt = scene.add(claimed, claimHeight);
+            pause(60);
+            check(scene.window->lastPaymentAlert().contains(QStringLiteral("not verified yet")), QStringLiteral("(told as not verified): %1").arg(scene.window->lastPaymentAlert()));
+            check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Could not be verified")); }, 3000), QStringLiteral("a block claimed and not proven is told, in time: %1").arg(scene.window->lastPaymentAlert()));
+            payments->setProofFailedForTest([](wallet::Network, const chain::Hash256&) { return false; });
+            scene.book->setProven(claimAt, true);
+            check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("and if it is proven after all, told so: %1").arg(scene.window->lastPaymentAlert()));
+            scene.book->setStatus(model->at(scene.rowOf(18)).scripthash, QStringLiteral("b3"));
+        }
         // Proven before it is told of: told once, as received.
         pause(50);
         scene.paid(18, QStringLiteral("b2"), 90000);
@@ -1139,6 +1225,12 @@ bool checkTrayAlert(const QString& file)
 
 void runAlertsTest(const Check& check, const QList<wallet::AccountKey>& someKeys)
 {
+    {
+        // From the first line on, whatever is touched or not.
+        ui::figures::setHideDust(true);
+        ui::MainWindow fresh;
+        check(fresh.findChild<ui::HistoryPage*>()->tableModel()->filter().hideDust, QStringLiteral("History hides dust from the first start, as its box says"));
+    }
     testDust(check, someKeys);
     testOnlyDust(check, someKeys);
     testPayments(check, someKeys);

@@ -809,6 +809,22 @@ bool HoldingsTable::allFinal() const
     return std::all_of(lines.cbegin(), lines.cend(), [](const Line& line) { return line.holding.watched ? line.holding.complete : !line.holding.unread; });
 }
 
+int HoldingsTable::dustHidden() const
+{
+    int hidden = 0;
+    for (int row = 0; row < ui_->model->rowCount(); ++row) {
+        const QModelIndex first = ui_->model->index(row, 0);
+        if (first.data(kDustRole).toBool() && !ui_->filter->mapFromSource(first).isValid())
+            ++hidden;
+    }
+    return hidden;
+}
+
+bool HoldingsTable::oneAddress() const
+{
+    return ui_->kind == Kind::AssetsOfAddress;
+}
+
 int HoldingsTable::rowsTotal() const
 {
     const QList<Line>& lines = ui_->model->lines();

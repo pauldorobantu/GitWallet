@@ -643,10 +643,8 @@ void SettingsPage::restoreBackupFrom(const QString& path)
             lines << trText(QStringLiteral("Wallets added: %1")).arg(report.walletsAdded);
             if (report.walletsHere > 0)
                 lines << trText(QStringLiteral("Already on this PC: %1")).arg(report.walletsHere);
-            if (report.keysAdded > 0)
-                lines << trText(QStringLiteral("Keys added to a wallet this PC has: %1")).arg(report.keysAdded);
-            if (report.keysNotAdded > 0)
-                lines << trText(QStringLiteral("Keys not added, as that wallet has another in their place: %1")).arg(report.keysNotAdded);
+            if (report.keysApart > 0)
+                lines << trText(QStringLiteral("Keys a wallet here lacks, added as a wallet of their own: %1. Check they are yours: nothing can show they come from the same seed.")).arg(report.keysApart);
             if (report.walletsRefused > 0) {
                 lines << trText(QStringLiteral("Not added: %1")).arg(report.walletsRefused);
                 // A backup cannot be listed anywhere else, so this is the only place to learn which.

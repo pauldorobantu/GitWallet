@@ -75,6 +75,7 @@ public:
         std::function<qint64(Network)> fallWindowMs; // by when a figure that fell has been read again
     };
     void setHooks(const Hooks& hooks) { hooks_ = hooks; }
+    void setProofFailedForTest(const std::function<bool(Network, const chain::Hash256&)>& failed) { hooks_.proofFailed = failed; }
 
     const QList<Payment>& all() const { return payments_; } // the oldest first
     int unread() const { return unread_; }

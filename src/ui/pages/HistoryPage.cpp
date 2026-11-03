@@ -132,6 +132,7 @@ struct HistoryPage::Ui : QObject
     QWidget* waiting = nullptr;
     QWidget* noResults = nullptr;
     QWidget* notRead = nullptr; // a network whose history is not read yet
+    QWidget* onlyDust = nullptr; // every line that would show is under the limit
     QTimer* searchPause = nullptr;
     QTimer* update = nullptr;
     QTimer* periodAgain = nullptr;
@@ -202,11 +203,16 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->noResults = page::makeNoResultsState(this);
     ui_->notRead = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("Not read yet on this network"),
                                         QStringLiteral("The history of Ethereum, USDT and USDC comes in the next stage. Balances are read already, and an address opens on a block explorer."));
+    ui_->onlyDust = page::makeEmptyState(this, int(icon::Kind::Traffic), QStringLiteral("Only dust here"),
+                                         QStringLiteral("Hide dust keeps it off this list. It still counts in every balance, and a search still finds it."));
     root->addWidget(ui_->noWallet, 1);
     root->addWidget(ui_->waiting, 1);
     root->addWidget(ui_->noResults, 1);
     root->addWidget(ui_->notRead, 1);
+    ui_->onlyDust->setObjectName(QStringLiteral("historyOnlyDust"));
+    root->addWidget(ui_->onlyDust, 1);
     ui_->notRead->hide();
+    ui_->onlyDust->hide();
 
     const page::ActionBar bar = page::makeActionBar(this);
     ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search id, address, label or note"));
@@ -309,9 +315,9 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     connect(theme::ThemeManager::instance(), &theme::ThemeManager::changed, this, &HistoryPage::applyColumnWidths);
     const auto setTips = [this] {
         ui_->type->setToolTip(trText(QStringLiteral("Moved: every output came back to the addresses shown, so only a fee left.")));
-        ui_->exportCsv->setToolTip(trText(QStringLiteral("Save the lines shown to a spreadsheet file. It is not encrypted: anyone who reads it "
+        ui_->exportCsv->setToolTip(trText(QStringLiteral("Save these transactions to a spreadsheet file, dust included, so that its amounts add up. It is not encrypted: anyone who reads it "
                                                          "sees these transactions, labels and notes.")));
-        ui_->count->setToolTip(trText(QStringLiteral("In and out: what the lines shown came to, of those proven in a block.")));
+        ui_->count->setToolTip(trText(QStringLiteral("In and out: what these transactions came to, of those proven in a block, dust included.")));
         ui_->hideDust->setToolTip(trText(QStringLiteral("Less than %1 coming in leaves this list, unless the address was given out or has a label, or the line has a note. It still counts in every balance, and a search still finds it.")).arg(figures::dustLimits()));
     };
     setTips();
@@ -341,8 +347,8 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
         });
     }
     rebuildWalletFilter();
-    ui_->model->rebuildNow();
-    updateState();
+    // From the first line on, by what the box says.
+    applyFilter();
 }
 
 HistoryTableModel* HistoryPage::tableModel() const
@@ -492,7 +498,6 @@ void HistoryPage::applyFilter()
     filter.state = ui_->state->currentData().toInt();
     filter.query = ui_->search->text().trimmed();
     filter.hideDust = ui_->hideDust->isChecked();
-    ui_->hideDust->setVisible(ui_->scripthash.isEmpty());
     const QDateTime now = QDateTime::currentDateTime();
     ui_->yearOfFilter = now.date().year();
     switch (ui_->period->currentIndex()) {
@@ -532,7 +537,7 @@ void HistoryPage::updateState()
     ui_->details->setEnabled(!chosen.isEmpty());
     const bool exporting = ui_->exportFile != nullptr;
     // Not part of what the database kept, with nothing to say so.
-    ui_->exportCsv->setEnabled(shown > 0 && !exporting && !(controller_ && controller_->loadingSaved()));
+    ui_->exportCsv->setEnabled((shown > 0 || ui_->model->dustHidden() > 0) && !exporting && !(controller_ && controller_->loadingSaved()));
 
     // What the lines shown came to, in the only coin there is so far.
     QString line;
@@ -542,7 +547,7 @@ void HistoryPage::updateState()
         line = shown == all ? trText(all == 1 ? QStringLiteral("%1 transaction") : QStringLiteral("%1 transactions")).arg(grouped(all))
                             : trText(QStringLiteral("%1 of %2 transactions")).arg(grouped(shown), grouped(all));
         const wallet::NetworkInfo* utxo = wallet::firstOf(wallet::Family::Utxo);
-        if (utxo && shown > 0) {
+        if (utxo && (shown > 0 || ui_->model->dustHidden() > 0)) {
             const wallet::AssetInfo& coin = wallet::assetInfo(utxo->coin);
             try {
                 line += QStringLiteral(" · %1 %2 · %3 %4")
@@ -643,20 +648,28 @@ void HistoryPage::updateState()
         control->setVisible(!notRead && (control != ui_->count || hasWallet));
     ui_->exportCsv->setVisible(!notRead);
     ui_->details->setVisible(!notRead);
+    // It hides nothing of one address, or where there is no list at all.
+    ui_->hideDust->setVisible(!notRead && ui_->scripthash.isEmpty());
     if (notRead) {
         ui_->status->hide();
         ui_->view->hide();
         ui_->noWallet->hide();
         ui_->waiting->hide();
         ui_->noResults->hide();
+        ui_->onlyDust->hide();
         return;
     }
-    QWidget* empty = hasWallet ? ui_->waiting : ui_->noWallet;
-    (hasWallet ? ui_->noWallet : ui_->waiting)->hide();
+    // What is there is hidden, which is neither nothing yet nor nothing found.
+    const bool onlyDust = hasWallet && shown == 0 && ui_->model->dustHidden() > 0;
+    QWidget* empty = !hasWallet ? ui_->noWallet : onlyDust ? ui_->onlyDust : ui_->waiting;
+    for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->onlyDust}) {
+        if (other != empty)
+            other->hide();
+    }
     const HistoryTableModel::Filter& filter = ui_->model->filter();
     // Only what the reader can change is a filter: not what the place came up on.
     const bool narrowed = (filter.wallet != 0 && !ui_->inPlace) || filter.kind >= 0 || filter.state >= 0 || filter.from > 0;
-    page::showListState(ui_->view, empty, ui_->noResults, shown, hasWallet ? filter.query : QString(), hasWallet && narrowed && total > 0);
+    page::showListState(ui_->view, empty, ui_->noResults, shown, hasWallet ? filter.query : QString(), hasWallet && narrowed && total > 0 && !onlyDust);
 }
 
 void HistoryPage::rememberPlace()
@@ -803,7 +816,7 @@ bool HistoryPage::exportCsvNow(const QString& path, QString* error)
         *error = trText(QStringLiteral("Could not write the file: %1")).arg(file.errorString());
         return false;
     }
-    const QVector<HistoryTableModel::Line> lines = ui_->model->lines();
+    const QVector<HistoryTableModel::Line> lines = ui_->model->linesForExport();
     const HistoryTableModel::Filter filter = ui_->model->filter();
     const CsvFormat& format = ui_->exportFormat;
     for (const HistoryTableModel::Line& line : lines) {
@@ -841,7 +854,7 @@ void HistoryPage::chooseExportFile()
         finishExport(false, trText(QStringLiteral("Could not write the file: %1")).arg(ui_->exportFile->errorString()));
         return;
     }
-    ui_->exporting = ui_->model->lines();
+    ui_->exporting = ui_->model->linesForExport();
     ui_->exportFilter = ui_->model->filter();
     ui_->exportAt = 0;
     updateState();
@@ -875,9 +888,7 @@ void HistoryPage::finishExport(bool ok, const QString& error)
     ui_->exporting.clear();
     updateState();
     if (ok)
-        Feedback::show(ui_->exportCsv, ui_->model->dustHidden() > 0 ? Feedback::Type::Info : Feedback::Type::Success,
-                       ui_->model->dustHidden() > 0 ? trText(QStringLiteral("Transactions exported, without the %1 hidden as dust")).arg(grouped(ui_->model->dustHidden()))
-                                                    : trText(QStringLiteral("Transactions exported")));
+        Feedback::show(ui_->exportCsv, Feedback::Type::Success, trText(QStringLiteral("Transactions exported")));
     else
         Feedback::show(this, Feedback::Type::Error, error);
 }

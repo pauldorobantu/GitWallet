@@ -2031,16 +2031,6 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
     const wallet::ScanSettings settingsBefore = store_.settings;
     const bool hadWallets = hasWallet();
     QList<wallet::WalletRequest> requests;
-    struct MoreKey {
-        quint32 owner = 0;
-        wallet::AccountKey key;
-    };
-    struct MoreKept {
-        quint32 owner = 0;
-        QJsonValue key;
-    };
-    QList<MoreKey> moreKeys;
-    QList<MoreKept> moreKept;
     try {
         QHash<QByteArray, wallet::AccountKey*> here;
         QHash<QString, quint32> keptHere;
@@ -2069,20 +2059,30 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
             }
             if (owner != 0) {
                 ++report.walletsHere;
-                // One key in common makes it the same wallet, and what only the file has of it comes
-                // along. Added after this: `here` points into the lists that would move.
+                // One key in common says nothing of the others: public keys cannot show they come from one
+                // seed, and an address a wallet here hands out must be one of that wallet's. So what only the
+                // file has goes in where it can be seen, as a wallet of its own, and nothing is left out of a total.
+                wallet::WalletRequest rest;
                 for (qsizetype i = 0; i < ids.size(); ++i) {
                     if (wallet::AccountKey* mine = here.value(ids.at(i))) {
                         const qint64 before = mine->given.count();
                         mine->given.merge(entry.accounts.at(i).given);
                         report.givenOut += mine->given.count() - before;
                     } else {
-                        moreKeys.append({owner, entry.accounts.at(i)});
+                        rest.accounts.append(entry.accounts.at(i));
                     }
                 }
                 for (const QJsonValue& kept : entry.keptAccounts) {
                     if (!keptHere.contains(keptKeyOf(kept)))
-                        moreKept.append({owner, kept});
+                        rest.keptAccounts.append(kept);
+                }
+                if (!rest.accounts.isEmpty() || !rest.keptAccounts.isEmpty()) {
+                    report.keysApart += int(rest.accounts.size() + rest.keptAccounts.size());
+                    rest.label = wallet::looksLikeSecret(entry.label) ? QString() : entry.label;
+                    rest.numbered = names.contains(nameKey(entry.label));
+                    rest.fromKeys = true;
+                    names.insert(nameKey(entry.label));
+                    requests.append(rest);
                 }
                 continue;
             }
@@ -2101,34 +2101,6 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
         report.error = ui::trText(QStringLiteral("A public key in that backup could not be read."));
         finish(report);
         return;
-    }
-
-    for (MoreKey& more : moreKeys) {
-        wallet::WalletEntry* owner = nullptr;
-        for (wallet::WalletEntry& entry : store_.wallets) {
-            if (entry.id == more.owner)
-                owner = &entry;
-        }
-        if (!owner)
-            continue;
-        // Its place in that wallet is taken by another key: two would make the file unreadable.
-        const bool placeTaken = std::any_of(owner->accounts.cbegin(), owner->accounts.cend(), [&more](const wallet::AccountKey& mine) {
-            return mine.type == more.key.type && mine.network == more.key.network && mine.account == more.key.account;
-        });
-        if (placeTaken) {
-            ++report.keysNotAdded;
-            continue;
-        }
-        more.key.wallet = owner->id;
-        owner->accounts.append(more.key);
-        ++report.keysAdded;
-        report.givenOut += more.key.given.count();
-    }
-    for (const MoreKept& more : std::as_const(moreKept)) {
-        for (wallet::WalletEntry& entry : store_.wallets) {
-            if (entry.id == more.owner)
-                entry.keptAccounts.append(more.key);
-        }
     }
 
     // A PC with no wallet takes the settings along, but for servers it was already set up with: a private
@@ -2202,7 +2174,7 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
         for (const wallet::AccountKey& key : request.accounts)
             report.givenOut += key.given.count();
     }
-    if (added == 0 && (report.givenOut > 0 || report.keysAdded > 0 || !(store_.settings == settingsBefore))) {
+    if (added == 0 && (report.givenOut > 0 || !(store_.settings == settingsBefore))) {
         restartServices();
         emit statusChanged();
     }
