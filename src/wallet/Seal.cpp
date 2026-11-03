@@ -23,8 +23,8 @@ constexpr qsizetype kSaltBytes = 16;
 constexpr qsizetype kNonceBytes = 12;
 constexpr int kVersion = 1;
 // A key is made with less than this, now and for a long time to come.
-constexpr double kMostMemoryKib = 4.0 * 1024 * 1024;
-constexpr double kMostPasses = 64;
+constexpr double kMostMemoryKib = 2.0 * 1024 * 1024;
+constexpr double kMostPasses = 16;
 constexpr double kMostLanes = 16;
 
 quint32 gTestMemoryKib = 0;

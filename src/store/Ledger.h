@@ -62,6 +62,8 @@ public:
     // What came in. Nothing but the list of them hangs on it: the transactions are read again.
     void savePayment(const wallet::Payment& payment);
     void setPaymentsRead(qint64 upTo);
+    void deletePayment(qint64 id);
+    void savePaymentState(const QHash<QString, QString>& changes);
 
     void flush(); // what waits goes now
     // Writes what waits and closes: when this returns, the file is complete and let go.
@@ -77,6 +79,7 @@ signals:
     // Before any row: what can be edited on a row has to be there with it.
     void labelsRead(const QHash<QString, QString>& addressLabels);
     void paymentsRead(const QList<wallet::Payment>& payments);
+    void paymentStateRead(const QHash<QString, QString>& state);
     // Everything has been read. `savedAt`: when each network last had a full answer.
     void loaded(const QList<SavedPrice>& prices, const QList<SavedTime>& times);
     void problem(const QString& message);

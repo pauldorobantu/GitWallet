@@ -135,6 +135,23 @@ QStringList keptAsideFiles()
         .entryList({QStringLiteral("wallet.dat.unread-*"), QStringLiteral("wallet.dat.format*")}, QDir::Files);
 }
 
+QStringList unreadFiles()
+{
+    return QDir(wallet::WalletStore::dataDir()).entryList({QStringLiteral("wallet.dat.unread-*")}, QDir::Files, QDir::Time);
+}
+
+QStringList formatCopies()
+{
+    return QDir(wallet::WalletStore::dataDir()).entryList({QStringLiteral("wallet.dat.format*")}, QDir::Files);
+}
+
+// A key this version cannot read, by what makes it that key.
+QString keptKeyOf(const QJsonValue& kept)
+{
+    const QJsonObject key = kept.toObject();
+    return key.value(QStringLiteral("type")).toString() + QLatin1Char('/') + key.value(QStringLiteral("network")).toString() + QLatin1Char('/') + key.value(QStringLiteral("xpub")).toString();
+}
+
 // Why a write is refused in a second GitWallet on the same data folder.
 QString inUseElsewhere()
 {
@@ -267,14 +284,27 @@ WalletController::WalletController(QObject* parent) : QObject(parent)
     hooks.price = [this](wallet::Asset asset) { return prices_->usd(asset); };
     hooks.givenOut = [this](const wallet::AddressRow& row) { return isGivenOut(row); };
     hooks.labelled = [this](const QString& address) { return addressLabels_.contains(address); };
-    hooks.starting = [this] { return showingSaved_; };
+    hooks.starting = [this](const wallet::AddressRow& row) { return showingSaved_ && !scheduler_->rowAnswered(row); };
     hooks.hideDust = [] { return ui::figures::hideDust(); };
+    hooks.tip = [this](wallet::Network network) {
+        const wallet::UtxoHistory* history = historyOf(network);
+        return history ? history->tip() : -1;
+    };
+    hooks.proofFailed = [this](wallet::Network network, const chain::Hash256& txid) {
+        const wallet::UtxoHistory* history = historyOf(network);
+        return history && history->proofFailed(txid);
+    };
+    hooks.fallWindowMs = [this](wallet::Network network) { return 2 * scheduler_->plannedPassMs(network); };
     payments_->setHooks(hooks);
     connect(payments_, &wallet::PaymentBook::recorded, ledger_, &store::Ledger::savePayment);
+    connect(payments_, &wallet::PaymentBook::removed, ledger_, &store::Ledger::deletePayment);
     connect(payments_, &wallet::PaymentBook::readUpTo, ledger_, &store::Ledger::setPaymentsRead);
+    connect(payments_, &wallet::PaymentBook::stateToSave, ledger_, &store::Ledger::savePaymentState);
     connect(ledger_, &store::Ledger::paymentsRead, payments_, &wallet::PaymentBook::addSaved);
+    connect(ledger_, &store::Ledger::paymentStateRead, payments_, &wallet::PaymentBook::restoreState);
     connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::historyProgress);
     connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::queueStatus); // an address may not add up
+    connect(scheduler_, &wallet::Scheduler::historyProgress, this, &WalletController::tellPaymentsWhatAnswered);
 
     priceTimer_ = new QTimer(this);
     priceTimer_->setInterval(kPriceInterval);
@@ -386,6 +416,7 @@ WalletController::~WalletController()
         if (thread)
             thread->wait();
     }
+    payments_->flushState();
     ledger_->close();
 }
 
@@ -403,6 +434,7 @@ bool WalletController::loadExisting(QString* error)
     lockDataDir();
     if (!store_.exists()) {
         fileDigest_.clear();
+        sayFileAside();
         return false;
     }
 
@@ -439,6 +471,7 @@ void WalletController::finishLoading()
 
     // Nothing runs yet at startup; a second call starts again from a clean slate.
     stopServices();
+    payments_->flushState();
     ledger_->close();
     model_->clear();
     payments_->clear();
@@ -448,6 +481,23 @@ void WalletController::finishLoading()
     openLedger();
     emit walletChanged();
     emit statusChanged();
+    sayFileAside();
+}
+
+void WalletController::sayFileAside()
+{
+    // This session put one there, and has said so.
+    if (!fileSetAside_.isEmpty())
+        return;
+    const QStringList unread = unreadFiles();
+    if (unread.isEmpty())
+        return;
+    const QString path = QDir(wallet::WalletStore::dataDir()).filePath(unread.first());
+    fileSetAside_ = QDir::toNativeSeparators(path);
+    emit errorOccurred(wallet::Problem::FileSetAside,
+                       QStringLiteral("An older wallet file is kept beside this one, as %1, from %2. Its wallets are not shown here. If you did not put it there, check that the wallets shown here are yours before you hand out their addresses.")
+                           .arg(fileSetAside_, QFileInfo(path).lastModified().toString(QStringLiteral("d MMM yyyy HH:mm"))),
+                       QString());
 }
 
 bool WalletController::addMnemonicWallet(const std::vector<std::string>& words,
@@ -525,10 +575,13 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
     // One set of addresses has one owner: the scanners and the totals count each
     // address once. By what decides the addresses, not by the text of the key.
     QHash<QByteArray, QString> owners; // an account's addresses -> its wallet's name
+    QHash<QString, QString> keptOwners; // the same of a key this version cannot read
     try {
         for (const wallet::WalletEntry& other : std::as_const(store_.wallets)) {
             for (const wallet::AccountKey& theirs : other.accounts)
                 owners.insert(wallet::WalletStore::addressSetId(theirs), other.label);
+            for (const QJsonValue& kept : other.keptAccounts)
+                keptOwners.insert(keptKeyOf(kept), other.label);
         }
     } catch (const std::exception&) {
         setError(error, what + QStringLiteral(": a public key could not be read."));
@@ -551,7 +604,7 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
         request.refused.clear();
         // Whatever the screen let through: wallet.dat never holds a secret as a name.
         if (wallet::looksLikeSecret(request.label)) {
-            request.refused = QStringLiteral("its name looks like seed words or a private key.");
+            request.refused = ui::trText(QStringLiteral("its name looks like seed words or a private key."));
             continue;
         }
         QList<QByteArray> ids;
@@ -559,17 +612,24 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
             for (const wallet::AccountKey& key : std::as_const(request.accounts))
                 ids.append(wallet::WalletStore::addressSetId(key));
         } catch (const std::exception&) {
-            request.refused = QStringLiteral("a public key could not be read.");
+            request.refused = ui::trText(QStringLiteral("a public key could not be read."));
             continue;
         }
         const auto owned = std::find_if(ids.cbegin(), ids.cend(),
                                         [&owners](const QByteArray& id) { return owners.contains(id); });
         if (owned != ids.cend()) {
-            request.refused = QStringLiteral("wallet “%1” already has these keys.").arg(owners.value(*owned));
+            request.refused = ui::trText(QStringLiteral("wallet “%1” already has these keys.")).arg(owners.value(*owned));
+            continue;
+        }
+        // Two wallets with one such key read as damaged, to the build that knows what it is.
+        const auto keptOwned = std::find_if(request.keptAccounts.cbegin(), request.keptAccounts.cend(),
+                                            [&keptOwners](const QJsonValue& kept) { return keptOwners.contains(keptKeyOf(kept)); });
+        if (keptOwned != request.keptAccounts.cend()) {
+            request.refused = ui::trText(QStringLiteral("wallet “%1” already has these keys.")).arg(keptOwners.value(keptKeyOf(*keptOwned)));
             continue;
         }
         if (room <= 0) {
-            request.refused = QStringLiteral("GitWallet keeps at most %1 wallets.").arg(wallet::WalletStore::kMaxWallets);
+            request.refused = ui::trText(QStringLiteral("GitWallet keeps at most %1 wallets.")).arg(wallet::WalletStore::kMaxWallets);
             continue;
         }
 
@@ -578,7 +638,7 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
             // Only what really goes in takes a number.
             label = nextFreeName(label.isEmpty() ? QStringLiteral("Wallet") : label, taken, asked);
         } else if (taken.contains(nameKey(label))) {
-            request.refused = QStringLiteral("a wallet is already named “%1”.").arg(label);
+            request.refused = ui::trText(QStringLiteral("a wallet is already named “%1”.")).arg(label);
             continue;
         }
         taken.insert(nameKey(label));
@@ -594,6 +654,8 @@ int WalletController::addWalletsAs(QList<wallet::WalletRequest>* requests, const
             key.wallet = entry.id;
         for (const QByteArray& id : std::as_const(ids))
             owners.insert(id, entry.label);
+        for (const QJsonValue& kept : std::as_const(request.keptAccounts))
+            keptOwners.insert(keptKeyOf(kept), entry.label);
         entries.append(entry);
     }
     if (entries.isEmpty())
@@ -660,6 +722,10 @@ bool WalletController::removeWallet(quint32 id, QString* error)
     // Its labels would come back with those.
     if (ledger_->labelsOwed()) {
         setError(error, QStringLiteral("The wallet was not removed: ") + labelsBlocker());
+        return false;
+    }
+    if (importingLabels_) {
+        setError(error, QStringLiteral("The wallet was not removed: labels are still going in. Try again in a moment."));
         return false;
     }
     const qsizetype position = std::find_if(store_.wallets.cbegin(), store_.wallets.cend(),
@@ -761,6 +827,11 @@ bool WalletController::removeAllWallets(QString* error)
         setError(error, QStringLiteral("The wallets were not removed: what is saved is still being read. Try again in a moment."));
         return false;
     }
+    // They would come back with what was just removed.
+    if (importingLabels_) {
+        setError(error, QStringLiteral("The wallets were not removed: labels are still going in. Try again in a moment."));
+        return false;
+    }
     // Checked first, so a refusal leaves the scan running as it was.
     if (!lockDataDir()) {
         setError(error, QStringLiteral("The wallets were not removed: ") + inUseElsewhere());
@@ -824,6 +895,22 @@ bool WalletController::removeAllWallets(QString* error)
                                .arg(left.join(QStringLiteral(", "))),
                            QString());
     return true;
+}
+
+int WalletController::walletFormatCopies() const
+{
+    return int(formatCopies().size());
+}
+
+int WalletController::walletFilesUnread() const
+{
+    return int(unreadFiles().size());
+}
+
+QString WalletController::unreadFileKept() const
+{
+    const QStringList unread = unreadFiles();
+    return unread.isEmpty() ? QString() : QDir::toNativeSeparators(QDir(wallet::WalletStore::dataDir()).filePath(unread.first()));
 }
 
 int WalletController::walletFilesKeptAside() const
@@ -1028,6 +1115,8 @@ bool WalletController::applySettings(const wallet::ScanSettings& settings, QStri
     // index 0. Not after a smaller gap: rows past the new windows would stay on
     // screen unfollowed until the scan has found those windows, so they go now.
     const bool gapsDown = gapsFall(previous, store_.settings);
+    if (previous.utxoReceiveGap != store_.settings.utxoReceiveGap || previous.utxoChangeGap != store_.settings.utxoChangeGap || previous.evmGap != store_.settings.evmGap)
+        payments_->noteGapsChanged();
     stopServices();
     if (gapsDown)
         model_->clear();
@@ -1435,6 +1524,7 @@ struct LabelImport {
     int added = 0;
     int left = 0;
     int later = 0;
+    int kept = 0; // vetted: lines that word otherwise what is here, which stays
     bool anyAddress = false;
     QPointer<QObject> guard;
     std::function<void(int, int, int, const QString&)> done;
@@ -1539,16 +1629,34 @@ void WalletController::importNextPart(const std::shared_ptr<LabelImport>& import
             }
             // Over what is there only what the line says: most wallets' files have labels alone.
             wallet::TxNote kept = history->book()->noteOf(line.txid);
-            if (!label.isEmpty())
-                kept.label = label;
-            if (!note.isEmpty())
-                kept.note = note;
+            if (import->vetted) {
+                // A backup is from before now, and a restore removes nothing: it fills in what is empty.
+                const wallet::TxNote here = kept;
+                if ((!label.isEmpty() && !here.label.isEmpty() && here.label != label) || (!note.isEmpty() && !here.note.isEmpty() && here.note != note))
+                    ++import->kept;
+                if (here.label.isEmpty())
+                    kept.label = label;
+                if (here.note.isEmpty())
+                    kept.note = note;
+                if (kept.label == here.label && kept.note == here.note)
+                    continue;
+            } else {
+                if (!label.isEmpty())
+                    kept.label = label;
+                if (!note.isEmpty())
+                    kept.note = note;
+            }
             notes[network->network].insert(line.txid, kept);
             history->book()->setNote(line.txid, kept);
         } else {
             // All an address has is its label: a line without one says nothing of it.
             if (label.isEmpty()) {
                 ++import->left;
+                continue;
+            }
+            if (import->vetted && addressLabels_.contains(line.address)) {
+                if (addressLabels_.value(line.address) != label)
+                    ++import->kept;
                 continue;
             }
             labels.insert(line.address, label);
@@ -1569,7 +1677,7 @@ void WalletController::importNextPart(const std::shared_ptr<LabelImport>& import
     if (import->anyAddress)
         emit labelsChanged();
     if (import->guard)
-        import->done(import->added, import->left, import->later, QString());
+        import->done(import->added, import->left, import->vetted ? import->kept : import->later, QString());
 }
 
 // ---------------------------------------------------------------- password ----
@@ -1604,7 +1712,7 @@ void WalletController::openWithPassword(const QString& password, QObject* guard,
     });
 }
 
-void WalletController::checkPassword(const QString& password, QObject* guard, const std::function<void(bool)>& done)
+void WalletController::checkPassword(const QString& password, QObject* guard, const std::function<void(const QString&)>& done)
 {
     const QPointer<QObject> stillThere(guard);
     copiesBeingWritten_.removeIf([](const QPointer<QThread>& thread) { return thread.isNull(); });
@@ -1613,14 +1721,17 @@ void WalletController::checkPassword(const QString& password, QObject* guard, co
         wallet::seal::wipe(bytes);
         return key;
     }, [this, stillThere, done](QByteArray key) {
-        const bool right = store_.isPasswordKey(key);
+        // No key is no answer: it says nothing of whether the password was right.
+        const QString error = key.isEmpty() ? ui::trText(QStringLiteral("This PC has too little free memory to check a password. Close some programs and try again."))
+                              : store_.isPasswordKey(key) ? QString()
+                                                          : ui::trText(QStringLiteral("That is not the password."));
         wallet::seal::wipe(key);
         if (stillThere)
-            done(right);
+            done(error);
     });
 }
 
-void WalletController::changePassword(const QString& current, const QString& fresh, bool deleteOld, QObject* guard, const std::function<void(const QString&)>& done)
+void WalletController::changePassword(const QString& current, const QString& fresh, int deleteOld, QObject* guard, const std::function<void(const QString&)>& done)
 {
     const QPointer<QObject> stillThere(guard);
     struct Keys {
@@ -1648,6 +1759,10 @@ void WalletController::changePassword(const QString& current, const QString& fre
             if (stillThere)
                 done(error);
         };
+        if (hadOne && keys.current.isEmpty()) {
+            finish(ui::trText(QStringLiteral("This PC has too little free memory to check a password. Close some programs and try again.")));
+            return;
+        }
         if (hadOne && !store_.isPasswordKey(keys.current)) {
             finish(ui::trText(QStringLiteral("That is not the password in use.")));
             return;
@@ -1669,13 +1784,23 @@ void WalletController::changePassword(const QString& current, const QString& fre
             finish(storeMessage(why, QStringLiteral("The wallet could not be saved.")));
             return;
         }
-        if (deleteOld) {
-            const QDir folder(wallet::WalletStore::dataDir());
-            const QStringList aside = keptAsideFiles();
-            for (const QString& name : aside)
-                QFile::remove(folder.filePath(name));
+        const QDir folder(wallet::WalletStore::dataDir());
+        QStringList going;
+        if (deleteOld & DeleteFormatCopies)
+            going += formatCopies();
+        if (deleteOld & DeleteUnreadFiles)
+            going += unreadFiles();
+        QStringList stayed;
+        for (const QString& name : std::as_const(going)) {
+            if (!QFile::remove(folder.filePath(name)))
+                stayed.append(name);
         }
         emit passwordChanged();
+        if (!stayed.isEmpty()) {
+            emit errorOccurred(wallet::Problem::FilesLeft,
+                               QStringLiteral("The password is set, and these older files could not be deleted: %1. No password reaches them: delete them from the folder once no program holds them.").arg(stayed.join(QStringLiteral(", "))),
+                               QString());
+        }
         finish(QString());
     });
 }
@@ -1759,6 +1884,7 @@ void WalletController::writeBackup(const QString& path, const QString& password,
     body.insert(QStringLiteral("store"), QJsonDocument::fromJson(store_.backupBody()).object());
     body.insert(QStringLiteral("labels"), QString::fromUtf8(labelsFile()));
     const int wallets = int(store_.wallets.size());
+    const quint32 nextWallet = store_.nextWalletId();
     const QPointer<QObject> stillThere(guard);
     copiesBeingWritten_.removeIf([](const QPointer<QThread>& thread) { return thread.isNull(); });
     copiesBeingWritten_ += offThisThread(this, [plain = QJsonDocument(body).toJson(QJsonDocument::Compact), bytes = wallet::seal::passwordBytes(password), path]() mutable {
@@ -1789,17 +1915,20 @@ void WalletController::writeBackup(const QString& path, const QString& password,
         wallet::seal::wipe(key);
         wallet::seal::wipe(plain);
         return error;
-    }, [this, stillThere, done, wallets](const QString& error) {
+    }, [this, stillThere, done, wallets, nextWallet](const QString& error) {
         if (error.isEmpty()) {
             // Worth having, and nothing hangs on it.
             const qint64 lastBefore = store_.lastBackupMs;
             const int walletsBefore = store_.lastBackupWallets;
+            const quint32 nextBefore = store_.lastBackupNextWallet;
             store_.lastBackupMs = QDateTime::currentMSecsSinceEpoch();
             store_.lastBackupWallets = wallets;
+            store_.lastBackupNextWallet = nextWallet;
             QString why = settingsSaveBlocker();
             if (!why.isEmpty() || !saveStore(&why)) {
                 store_.lastBackupMs = lastBefore;
                 store_.lastBackupWallets = walletsBefore;
+                store_.lastBackupNextWallet = nextBefore;
             }
             emit backupMade();
         }
@@ -1888,7 +2017,9 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
         finish(report);
         return;
     }
-    why = settingsSaveBlocker();
+    // With no wallet loaded a wallet.dat that could not be read is what a backup is for: adding the wallets
+    // puts it aside, as addWallets() says. With wallets, whatever keeps the settings from being saved counts.
+    why = hasWallet() ? settingsSaveBlocker() : QString();
     if (!why.isEmpty()) {
         report.error = why;
         finish(report);
@@ -1900,34 +2031,66 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
     const wallet::ScanSettings settingsBefore = store_.settings;
     const bool hadWallets = hasWallet();
     QList<wallet::WalletRequest> requests;
+    struct MoreKey {
+        quint32 owner = 0;
+        wallet::AccountKey key;
+    };
+    struct MoreKept {
+        quint32 owner = 0;
+        QJsonValue key;
+    };
+    QList<MoreKey> moreKeys;
+    QList<MoreKept> moreKept;
     try {
         QHash<QByteArray, wallet::AccountKey*> here;
+        QHash<QString, quint32> keptHere;
         QSet<QString> names;
         for (wallet::WalletEntry& entry : store_.wallets) {
             names.insert(nameKey(entry.label));
             for (wallet::AccountKey& key : entry.accounts)
                 here.insert(wallet::WalletStore::addressSetId(key), &key);
+            for (const QJsonValue& kept : std::as_const(entry.keptAccounts))
+                keptHere.insert(keptKeyOf(kept), entry.id);
         }
         for (const wallet::WalletEntry& entry : std::as_const(backup.wallets)) {
             QList<QByteArray> ids;
             for (const wallet::AccountKey& key : entry.accounts)
                 ids.append(wallet::WalletStore::addressSetId(key));
-            const bool known = std::any_of(ids.cbegin(), ids.cend(), [&here](const QByteArray& id) { return here.contains(id); });
-            if (known) {
+            quint32 owner = 0;
+            for (const QByteArray& id : std::as_const(ids)) {
+                if (const wallet::AccountKey* mine = here.value(id)) {
+                    owner = mine->wallet;
+                    break;
+                }
+            }
+            for (const QJsonValue& kept : entry.keptAccounts) {
+                if (owner == 0)
+                    owner = keptHere.value(keptKeyOf(kept));
+            }
+            if (owner != 0) {
                 ++report.walletsHere;
+                // One key in common makes it the same wallet, and what only the file has of it comes
+                // along. Added after this: `here` points into the lists that would move.
                 for (qsizetype i = 0; i < ids.size(); ++i) {
                     if (wallet::AccountKey* mine = here.value(ids.at(i))) {
                         const qint64 before = mine->given.count();
                         mine->given.merge(entry.accounts.at(i).given);
                         report.givenOut += mine->given.count() - before;
+                    } else {
+                        moreKeys.append({owner, entry.accounts.at(i)});
                     }
+                }
+                for (const QJsonValue& kept : entry.keptAccounts) {
+                    if (!keptHere.contains(keptKeyOf(kept)))
+                        moreKept.append({owner, kept});
                 }
                 continue;
             }
             wallet::WalletRequest request;
             request.accounts = entry.accounts;
             request.keptAccounts = entry.keptAccounts;
-            request.label = entry.label;
+            // A name is only a name: the wallet goes in under another rather than stay out.
+            request.label = wallet::looksLikeSecret(entry.label) ? QString() : entry.label;
             request.numbered = names.contains(nameKey(entry.label));
             request.fromKeys = entry.fromKeys;
             names.insert(nameKey(entry.label));
@@ -1940,13 +2103,76 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
         return;
     }
 
-    // A PC with no wallet takes the settings along. One with wallets keeps its own, and only gaps
-    // grow: those of the backup are what its wallets were found with.
+    for (MoreKey& more : moreKeys) {
+        wallet::WalletEntry* owner = nullptr;
+        for (wallet::WalletEntry& entry : store_.wallets) {
+            if (entry.id == more.owner)
+                owner = &entry;
+        }
+        if (!owner)
+            continue;
+        // Its place in that wallet is taken by another key: two would make the file unreadable.
+        const bool placeTaken = std::any_of(owner->accounts.cbegin(), owner->accounts.cend(), [&more](const wallet::AccountKey& mine) {
+            return mine.type == more.key.type && mine.network == more.key.network && mine.account == more.key.account;
+        });
+        if (placeTaken) {
+            ++report.keysNotAdded;
+            continue;
+        }
+        more.key.wallet = owner->id;
+        owner->accounts.append(more.key);
+        ++report.keysAdded;
+        report.givenOut += more.key.given.count();
+    }
+    for (const MoreKept& more : std::as_const(moreKept)) {
+        for (wallet::WalletEntry& entry : store_.wallets) {
+            if (entry.id == more.owner)
+                entry.keptAccounts.append(more.key);
+        }
+    }
+
+    // A PC with no wallet takes the settings along, but for servers it was already set up with: a private
+    // one set up first stays the one every address is asked of. One with wallets keeps its own, whatever
+    // a file names, and only gaps grow: those of the backup are what its wallets were found with.
     wallet::ScanSettings merged = hadWallets ? store_.settings : backup.settings;
+    for (const wallet::NetworkInfo& network : wallet::networks()) {
+        const QStringList mine = store_.settings.servers.value(network.id);
+        if (!hadWallets && !mine.isEmpty())
+            merged.servers.insert(network.id, mine);
+        if ((hadWallets || !mine.isEmpty()) && mine != backup.settings.servers.value(network.id))
+            report.serversKept = true;
+    }
     if (hadWallets) {
-        merged.utxoReceiveGap = std::max(store_.settings.utxoReceiveGap, backup.settings.utxoReceiveGap);
-        merged.utxoChangeGap = std::max(store_.settings.utxoChangeGap, backup.settings.utxoChangeGap);
-        merged.evmGap = std::max(store_.settings.evmGap, backup.settings.evmGap);
+        // Not so far that the scan stops at its limit and no total reads as whole.
+        const int receive = std::max(store_.settings.utxoReceiveGap, backup.settings.utxoReceiveGap);
+        const int change = std::max(store_.settings.utxoChangeGap, backup.settings.utxoChangeGap);
+        const int evm = std::max(store_.settings.evmGap, backup.settings.evmGap);
+        const bool rises = receive != store_.settings.utxoReceiveGap || change != store_.settings.utxoChangeGap || evm != store_.settings.evmGap;
+        QList<wallet::AccountKey> accounts = store_.allAccounts();
+        for (const wallet::WalletRequest& request : std::as_const(requests))
+            accounts += request.accounts;
+        bool tooFar = false;
+        for (const wallet::NetworkInfo& network : wallet::networks()) {
+            qint64 wanted = 0;
+            for (const wallet::AccountKey& key : std::as_const(accounts)) {
+                if (key.serves(network.network))
+                    wanted += network.family == wallet::Family::Utxo ? qint64(receive) + change : evm;
+            }
+            const qint64 limit = network.family == wallet::Family::Utxo ? wallet::UtxoScanner::kMaxFollowedRows : wallet::EvmScanner::kMaxFollowedRows;
+            tooFar = tooFar || wanted > limit;
+        }
+        report.backupReceiveGap = backup.settings.utxoReceiveGap;
+        report.backupChangeGap = backup.settings.utxoChangeGap;
+        report.backupEvmGap = backup.settings.evmGap;
+        if (rises && tooFar) {
+            report.gapsKept = true;
+        } else if (rises) {
+            merged.utxoReceiveGap = receive;
+            merged.utxoChangeGap = change;
+            merged.evmGap = evm;
+            report.gapsRose = true;
+            payments_->noteGapsChanged();
+        }
     }
     store_.settings = sanitized(merged);
 
@@ -1954,8 +2180,11 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
     if (!requests.isEmpty())
         added = addWallets(&requests, &why);
     bool failed = !why.isEmpty();
-    if (!failed && added == 0 && !saveStore(&why))
-        failed = true;
+    if (!failed && added == 0) {
+        // Settings alone never take the place of a file this window did not load.
+        why = settingsSaveBlocker();
+        failed = !why.isEmpty() || !saveStore(&why);
+    }
     if (failed) {
         store_.wallets = walletsBefore;
         store_.settings = settingsBefore;
@@ -1967,12 +2196,13 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
     for (const wallet::WalletRequest& request : std::as_const(requests)) {
         if (!request.refused.isEmpty()) {
             ++report.walletsRefused;
+            report.refused.append(QStringLiteral("%1: %2").arg(request.label.isEmpty() ? ui::trText(QStringLiteral("A wallet with no name")) : request.label, request.refused));
             continue;
         }
         for (const wallet::AccountKey& key : request.accounts)
             report.givenOut += key.given.count();
     }
-    if (added == 0 && (report.givenOut > 0 || !(store_.settings == settingsBefore))) {
+    if (added == 0 && (report.givenOut > 0 || report.keysAdded > 0 || !(store_.settings == settingsBefore))) {
         restartServices();
         emit statusChanged();
     }
@@ -1980,7 +2210,7 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
         emit givenOutChanged();
     emit walletChanged();
 
-    // The labels, once what the database holds is in. They go over what is here only where a line says.
+    // The labels, once what the database holds is in. They fill in what is empty here.
     const QByteArray labels = read.labels;
     auto bringLabels = [this, labels, report, guard, done]() mutable {
         const QString blocker = labels.isEmpty() ? QString() : labelsBlocker();
@@ -1990,9 +2220,10 @@ void WalletController::applyBackup(const ReadBackup& read, const QString& path, 
                 done(report);
             return;
         }
-        startLabelImport([labels](QString*) { return labels; }, true, this, [report, guard, done](int added, int skipped, int, const QString& error) mutable {
+        startLabelImport([labels](QString*) { return labels; }, true, this, [report, guard, done](int added, int skipped, int kept, const QString& error) mutable {
             report.labels = std::max(added, 0);
             report.labelsLeftOut = skipped;
+            report.labelsKept = kept;
             report.labelsWhy = error;
             if (guard)
                 done(report);
@@ -2265,9 +2496,37 @@ void WalletController::startServices()
     timesTimer_->start();
 }
 
+void WalletController::tellPaymentsWhatAnswered()
+{
+    if (!running_ || !hasWallet())
+        return;
+    const QList<wallet::Network> answered = scheduler_->answeredNetworks();
+    for (const wallet::Network network : answered) {
+        if (answeredTold_.contains(network))
+            continue;
+        // Its chain stands in a moment: its first scan ended at a height, and that is what later goes by it.
+        const wallet::UtxoHistory* history = historyOf(network);
+        const int tip = history ? history->tip() : 0;
+        if (history && tip <= 0)
+            continue;
+        QList<quint32> wallets;
+        const QList<wallet::AccountKey> accounts = store_.allAccounts();
+        for (const wallet::AccountKey& key : accounts) {
+            if (key.serves(network) && !wallets.contains(key.wallet))
+                wallets.append(key.wallet);
+        }
+        QStringList assets;
+        for (const wallet::Asset asset : wallet::networkInfo(network).assets)
+            assets.append(wallet::assetInfo(asset).key);
+        payments_->noteAnswered(network, tip, wallets, assets);
+        answeredTold_.insert(network);
+    }
+}
+
 void WalletController::stopServices()
 {
     saveTimes();
+    answeredTold_.clear();
     running_ = false;
     scheduler_->stop();
     priceTimer_->stop();
@@ -2353,6 +2612,8 @@ void WalletController::onLedgerLoaded(const QList<store::SavedPrice>& prices, co
     const QList<wallet::HistoryBook*> books = scheduler_->books();
     for (wallet::HistoryBook* book : books)
         book->keepWallets(wallets, store_.nextWalletId());
+    // After the books: what was told of last time is looked up in them.
+    payments_->watchSaved();
 
     QList<net::PriceQuote> quotes;
     for (const store::SavedPrice& saved : prices) {
@@ -2442,6 +2703,7 @@ void WalletController::onScanProgress()
         showingSaved_ = false;
         saveTimes();
     }
+    tellPaymentsWhatAnswered();
     queueStatus();
 }
 

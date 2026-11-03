@@ -1,5 +1,7 @@
 #include "ui/Holdings.h"
 
+#include "ui/TableUtil.h"
+
 #include "app/WalletController.h"
 #include "net/PriceFeed.h"
 #include "ui/CoinIcon.h"
@@ -182,7 +184,7 @@ public:
             return page::text();
         case Qt::ToolTipRole:
             if (column == ColName)
-                return line.name;
+                return plainTip(line.name);
             if (column == ColAmount || column == ColValue)
                 return line.note.isEmpty() ? QVariant() : QVariant(line.note);
             return {};

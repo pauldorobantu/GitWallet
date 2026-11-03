@@ -51,6 +51,14 @@ public:
     // Everything it follows has answered in this run, even if a limit keeps the scan from
     // reaching all it should: no figure left is only what the database kept.
     virtual bool answered() const = 0;
+    // This row has had its first answer of this run. Where a whole pass reads every row, that is the pass.
+    virtual bool rowAnswered(const AddressRow& row) const
+    {
+        Q_UNUSED(row);
+        return answered();
+    }
+    // How long a whole round of reads is planned to take; 0: nothing to go by.
+    virtual qint64 plannedPassMs() const { return 0; }
     virtual bool limitReached() const = 0;      // a window is cut at the row limit
     virtual bool connecting() const { return false; } // nothing can be asked yet
     virtual bool wrongChain() const { return false; } // the server last tried answers for another network

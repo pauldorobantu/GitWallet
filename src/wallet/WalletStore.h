@@ -107,6 +107,7 @@ public:
     int lockMinutes = kDefaultLockMinutes; // with a password: how long left alone before it locks; 0: never
     qint64 lastBackupMs = 0;  // when a backup was last made here, ms since the epoch; 0: never
     int lastBackupWallets = 0; // how many wallets that held
+    quint32 lastBackupNextWallet = 0; // the next id then: a wallet at or past it is not in that backup; 0: not known
 
 private:
     quint32 nextWalletId_ = 1;

@@ -17,6 +17,9 @@ namespace wallet {
 
 // Which receive addresses of a key were given out, so that none goes to two payers. Runs in order, as
 // they nearly always follow one another.
+// How many addresses of one chain are ever derived and followed.
+inline constexpr int kMaxChainRows = 100000;
+
 struct GivenOut {
     struct Run {
         quint32 from = 0;

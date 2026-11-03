@@ -43,6 +43,7 @@ public:
     void refresh()
     {
         beginResetModel();
+        shown_ = int(controller_->payments()->all().size());
         endResetModel();
     }
     // How a payment stands now can move with nothing new having come.
@@ -54,10 +55,11 @@ public:
     const wallet::Payment* at(int row) const
     {
         const QList<wallet::Payment>& all = controller_->payments()->all();
-        return row >= 0 && row < all.size() ? &all.at(all.size() - 1 - row) : nullptr;
+        const int at = shown_ - 1 - row;
+        return row >= 0 && at >= 0 && at < all.size() ? &all.at(at) : nullptr;
     }
 
-    int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : int(controller_->payments()->all().size()); }
+    int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : shown_; }
     int columnCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : ColumnCount; }
 
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override
@@ -199,6 +201,7 @@ private:
     }
 
     WalletController* controller_ = nullptr;
+    int shown_ = 0;
 };
 
 } // namespace
@@ -213,6 +216,8 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     page::applyDialogLayout(root);
 
     auto* model = new PaymentsModel(controller_, this);
+    model->refresh();
+    lastAtOpen_ = controller_->payments()->lastId();
     auto* view = new HoverRowTableView(this);
     view_ = view;
     view->setObjectName(QStringLiteral("paymentsTable"));
@@ -224,6 +229,8 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     view->setSelectionMode(QAbstractItemView::SingleSelection);
     QHeaderView* header = view->horizontalHeader();
     header->setStretchLastSection(false);
+    // What is on screen sets the widths: measuring a thousand rows at each change holds up the scanners too.
+    header->setResizeContentsPrecision(0);
     header->setSectionResizeMode(QHeaderView::ResizeToContents);
     header->setSectionResizeMode(ColAddress, QHeaderView::Stretch);
     root->addWidget(view, 1);
@@ -248,7 +255,12 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     connect(open_, &QPushButton::clicked, this, &PaymentsDialog::openChosen);
     connect(view, &QAbstractItemView::activated, this, &PaymentsDialog::openChosen);
     connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &PaymentsDialog::updateState);
-    connect(controller_->payments(), &wallet::PaymentBook::changed, this, [this, model] {
+    // Many coming one after the other are one redraw.
+    auto* redraw = new QTimer(this);
+    redraw->setSingleShot(true);
+    redraw->setInterval(200);
+    connect(controller_->payments(), &wallet::PaymentBook::changed, redraw, qOverload<>(&QTimer::start));
+    connect(redraw, &QTimer::timeout, this, [this, model] {
         const QModelIndexList chosen = view_->selectionModel()->selectedRows();
         const qint64 kept = chosen.isEmpty() || !model->at(chosen.first().row()) ? 0 : model->at(chosen.first().row())->id;
         model->refresh();
@@ -297,7 +309,10 @@ void PaymentsDialog::openChosen()
 
 void PaymentsDialog::done(int result)
 {
-    controller_->payments()->markAllRead();
+    if (forLock_)
+        controller_->payments()->markReadUpTo(lastAtOpen_);
+    else
+        controller_->payments()->markAllRead();
     QDialog::done(result);
 }
 

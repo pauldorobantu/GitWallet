@@ -71,6 +71,7 @@ struct StoreData {
     int lockMinutes = WalletStore::kDefaultLockMinutes;
     qint64 lastBackupMs = 0;
     int lastBackupWallets = 0;
+    quint32 lastBackupNextWallet = 0;
 };
 
 // What a file under a password says it is, inside DPAPI.
@@ -361,7 +362,7 @@ QStringList readList(const QJsonObject& o, const QString& key)
 // ------------------------------------------------------------ file body ----
 
 QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const ScanSettings& s,
-                  const QByteArray& databaseKey, int lockMinutes = WalletStore::kDefaultLockMinutes, qint64 lastBackupMs = 0, int lastBackupWallets = 0)
+                  const QByteArray& databaseKey, int lockMinutes = WalletStore::kDefaultLockMinutes, qint64 lastBackupMs = 0, int lastBackupWallets = 0, quint32 lastBackupNextWallet = 0)
 {
     QJsonArray entries;
     for (const WalletEntry& w : wallets) {
@@ -414,6 +415,7 @@ QByteArray toJson(const QList<WalletEntry>& wallets, quint32 nextWalletId, const
     if (lastBackupMs > 0) {
         root.insert(QStringLiteral("lastBackupMs"), lastBackupMs);
         root.insert(QStringLiteral("lastBackupWallets"), lastBackupWallets);
+        root.insert(QStringLiteral("lastBackupNextWallet"), qint64(lastBackupNextWallet));
     }
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
 }
@@ -575,6 +577,7 @@ bool parseStore(const QByteArray& json, const QString& path, StoreData* out, QSt
     out->lockMinutes = std::clamp(readInt(root, QStringLiteral("lockMinutes"), WalletStore::kDefaultLockMinutes), 0, kMostLockMinutes);
     out->lastBackupMs = qint64(root.value(QStringLiteral("lastBackupMs")).toDouble());
     out->lastBackupWallets = readInt(root, QStringLiteral("lastBackupWallets"), 0);
+    out->lastBackupNextWallet = quint32(std::max(readInt(root, QStringLiteral("lastBackupNextWallet"), 0), 0));
     return true;
 }
 
@@ -703,6 +706,7 @@ bool WalletStore::load(QString* error)
     lockMinutes = data.lockMinutes;
     lastBackupMs = data.lastBackupMs;
     lastBackupWallets = data.lastBackupWallets;
+    lastBackupNextWallet = data.lastBackupNextWallet;
     olderFormat_ = data.format < kFormatVersion ? data.format : 0;
     sealed_ = {};
     passwordKey_.clear();
@@ -728,6 +732,7 @@ bool WalletStore::openSealed(const QByteArray& key, QString* error)
     lockMinutes = data.lockMinutes;
     lastBackupMs = data.lastBackupMs;
     lastBackupWallets = data.lastBackupWallets;
+    lastBackupNextWallet = data.lastBackupNextWallet;
     olderFormat_ = data.format < kFormatVersion ? data.format : 0;
     return true;
 }
@@ -758,6 +763,13 @@ bool WalletStore::readBackupBody(const QByteArray& json, const QString& name, Wa
     StoreData data;
     if (!parseStore(json, name, &data, error))
         return false;
+    // Nothing this program wrote goes so far, and whatever goes through what was given out would have to walk it.
+    for (const WalletEntry& entry : std::as_const(data.wallets)) {
+        for (const AccountKey& key : entry.accounts) {
+            if (key.given.end() > quint32(kMaxChainRows))
+                return fail(error, QStringLiteral("%1 is damaged: it marks more addresses as given out than a wallet can have.").arg(name));
+        }
+    }
     into->wallets = std::move(data.wallets);
     into->settings = std::move(data.settings);
     return true;
@@ -777,7 +789,7 @@ bool WalletStore::save(QString* error, QByteArray* digest) const
 
     QByteArray blob;
     {
-        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings), databaseKey, lockMinutes, lastBackupMs, lastBackupWallets);
+        QByteArray json = toJson(wallets, nextWalletId_, sanitized(settings), databaseKey, lockMinutes, lastBackupMs, lastBackupWallets, lastBackupNextWallet);
         const auto wipe = qScopeGuard([&json] { scrub(json); });
         if (!passwordKey_.isEmpty()) {
             try {

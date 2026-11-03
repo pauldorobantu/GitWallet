@@ -72,7 +72,7 @@ constexpr qint64 kHotAhead = 20;
 // wallet in a pass that never ends, until memory runs out. Far above what a
 // shop seed needs (the controller's largest gap is 5,000), and well below 2^31,
 // where non-hardened BIP32 indices end.
-constexpr qint64 kMaxEthRows = 100'000;
+constexpr qint64 kMaxEthRows = kMaxChainRows;
 // Rows derived over all accounts together: wallets add up.
 constexpr qint64 kMaxEthTotalRows = EvmScanner::kMaxFollowedRows;
 // Rows derived per event-loop turn when a pass sets up its windows: BtcScanner's
@@ -543,10 +543,14 @@ bool EvmScanner::refreshFailing() const
     // the first answers are in, the time is from an earlier run and says so anyway.
     if (!running_ || !finished_ || !balancesAt_.isValid())
         return false;
+    return balancesAt_.msecsTo(QDateTime::currentDateTime()) > 2 * plannedPassMs() + kPassGraceMs;
+}
+
+qint64 EvmScanner::plannedPassMs() const
+{
     // The pass under way may be one that reads every nonce, a lot longer than the last.
     const qint64 sweeping = sweepAsking_ && passActive_ ? totalRows_ / kNoncesPerSecond : 0;
-    const qint64 planned = qMax(qMax<qint64>(lastPassSeconds_, refreshSeconds_), sweeping) * 1000;
-    return balancesAt_.msecsTo(QDateTime::currentDateTime()) > 2 * planned + kPassGraceMs;
+    return qMax(qMax<qint64>(lastPassSeconds_, refreshSeconds_), sweeping) * 1000;
 }
 
 // ------------------------------------------------------------ the window ----

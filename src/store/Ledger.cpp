@@ -144,6 +144,10 @@ bool Ledger::handOverLabels(quint64 run, QString* why)
     QMetaObject::invokeMethod(this, [this, self, run, payments] {
         if (self && run == loadRun_) emit paymentsRead(payments);
     }, Qt::QueuedConnection);
+    const QHash<QString, QString> paymentState = db_->loadPaymentState(nullptr);
+    QMetaObject::invokeMethod(this, [this, self, run, paymentState] {
+        if (self && run == loadRun_) emit paymentStateRead(paymentState);
+    }, Qt::QueuedConnection);
     return true;
 }
 
@@ -566,6 +570,28 @@ void Ledger::setPaymentsRead(qint64 upTo)
         QString why;
         if (!db_->setPaymentsRead(upTo, &why))
             qCWarning(lcLedger).noquote() << "payments could not be marked as read:" << why;
+    });
+}
+
+void Ledger::deletePayment(qint64 id)
+{
+    if (!open_)
+        return;
+    onWorker([this, id] {
+        QString why;
+        if (!db_->deletePayment(id, &why))
+            qCWarning(lcLedger).noquote() << "a payment could not be taken off the list:" << why;
+    });
+}
+
+void Ledger::savePaymentState(const QHash<QString, QString>& changes)
+{
+    if (!open_)
+        return;
+    onWorker([this, changes] {
+        QString why;
+        if (!db_->savePaymentState(changes, &why))
+            qCWarning(lcLedger).noquote() << "what the list of payments keeps could not be saved:" << why;
     });
 }
 

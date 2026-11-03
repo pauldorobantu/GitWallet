@@ -26,6 +26,8 @@ public:
 
     QTableView* view() const { return view_; }
     void done(int result) override;
+    // The lock is what closes it: nobody looked at what came after it opened.
+    void closingForLock() { forLock_ = true; }
 
 signals:
     void openAddressRequested(const wallet::AddressRow& row);
@@ -38,6 +40,8 @@ private:
     QTableView* view_ = nullptr;
     QPushButton* open_ = nullptr;
     QWidget* nothing_ = nullptr;
+    qint64 lastAtOpen_ = 0;
+    bool forLock_ = false;
 };
 
 } // namespace app::ui

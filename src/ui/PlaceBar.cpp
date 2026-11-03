@@ -61,7 +61,7 @@ public:
     void setFull(const QString& text)
     {
         full_ = text;
-        setToolTip(text);
+        setToolTip(plainTip(text));
         fit();
     }
 

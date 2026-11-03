@@ -63,6 +63,7 @@ public:
     bool hasAccounts() const override { return !accounts_.isEmpty(); }
     bool isScanning() const override;
     bool answered() const override { return answered_; }
+    qint64 plannedPassMs() const override;
     int checkedCount() const;  // rows whose nonce and every balance have answered
     int derivedCount() const;
     bool limitReached() const override; // a window is cut at 100,000 addresses, or all of them at the limit over all accounts

@@ -730,7 +730,10 @@ void UtxoHistory::onHistory(quint64 generation, const QString& scripthash, const
     Reading& reading = reading_[scripthash];
     reading.status = status;
     reading.listed.reserve(listed.size());
-    for (const Listed& one : std::as_const(listed)) {
+    // News goes to the front of the queue one by one, so the last to go there is read first: what
+    // made a coin before what spends it, or the spend reads as if it spent nothing of the wallets'.
+    for (int i = 0; i < listed.size(); ++i) {
+        const Listed& one = listed.at(reading.news ? listed.size() - 1 - i : i);
         reading.listed.append(one.txid);
         namedHere_.insert(one.txid);
         const int position = book_->find(one.txid);

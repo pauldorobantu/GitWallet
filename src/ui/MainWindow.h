@@ -1,12 +1,16 @@
 #pragma once
 
 #include "ui/PlaceBar.h"
+#include "wallet/Payments.h"
 
 #include <QElapsedTimer>
+#include <QList>
 #include <QMap>
+#include <QPointer>
 #include <QStringList>
 #include <QWidget>
 
+class QDialog;
 class QLabel;
 class QPushButton;
 class QSystemTrayIcon;
@@ -16,7 +20,6 @@ class QStackedWidget;
 
 namespace wallet {
 enum class Problem;
-struct Payment;
 }
 
 namespace app {
@@ -58,6 +61,7 @@ public:
     TitleBar* titleBar() const { return title_; }
     void openPayments(); // the list of what came in
     QString lastPaymentAlert() const { return lastPaymentAlert_; } // for tests
+    QString lastPaymentNotification() const { return lastPaymentNotification_; } // for tests
     bool trayShown() const;                                        // for a check on the real platform
     void sayPaymentForTest(const QString& text);
     void unlockForTest() { showUnlocked(); }
@@ -68,6 +72,9 @@ public:
     bool isLocked() const { return locked_; }
     LockPage* lockPage() const { return lockPage_; }
     void setIdleLimitForTest(int ms);
+
+signals:
+    void unlocked();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -132,11 +139,15 @@ private:
     void dismissNotices();
     void flushToast();
     void onPaymentsTold(const QList<wallet::Payment>& payments);
-    void onPaymentsSettled(const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>& gone);
-    void sayPayment(const QString& text, int feedbackType); // on the spot, or as a Windows notification
+    void onPaymentsSettled(const wallet::PaymentNews& news);
+    void sayNews(const wallet::PaymentNews& news);
+    // On the spot, or as a Windows notification: which, under a password, stays on Windows' side of
+    // any lock, so it says only `bare`.
+    void sayPayment(const QString& text, const QString& bare, int feedbackType);
     void refreshBell();
     void showLocked();
     void showUnlocked();
+    void showIconOnly(bool iconOnly);
     void tryUnlock(const QString& password);
     void forgotPassword();
     void afterPasswordChange();
@@ -173,6 +184,9 @@ private:
     QTimer* clickGuard_ = nullptr;
     QSystemTrayIcon* tray_ = nullptr; // made at the first alert with the window out of sight
     QString lastPaymentAlert_;
+    QString lastPaymentNotification_; // what went to Windows, for tests
+    wallet::PaymentNews heldNews_; // what became of payments while locked: told at the unlock
+    QList<QPointer<QDialog>> heldDialogs_; // what could not close for the lock: back after it
 };
 
 } // namespace app::ui

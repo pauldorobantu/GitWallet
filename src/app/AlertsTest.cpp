@@ -158,6 +158,20 @@ struct Scene {
 
     int rowOf(quint32 index) const { return model->find(shop, bitcoin, btcKey.type, 0, 0, index); }
     int ethRowOf(quint32 index) const { return model->find(shop, ethereum, ethKey.type, 0, 0, index); }
+    int changeRowOf(quint32 index) const { return model->find(shop, bitcoin, btcKey.type, 0, 1, index); }
+    chain::Bytes changeScriptOf(quint32 index) const
+    {
+        return chain::addressFromChainNode(btcKey.node().deriveChild(1), btcKey.type, btcKey.account, 1, index, wallet::networkInfo(bitcoin).format).scriptPubKey;
+    }
+    void paidOnChange(quint32 index, const QString& status, qint64 unconfirmed) const
+    {
+        wallet::AddressRow row = model->at(changeRowOf(index));
+        row.status = status;
+        row.used = true;
+        row.checked = true;
+        row.unconfirmed = unconfirmed;
+        model->upsert(row);
+    }
     chain::Bytes scriptOf(quint32 index) const
     {
         return chain::addressFromChainNode(btcKey.node().deriveChild(0), btcKey.type, btcKey.account, 0, index, wallet::networkInfo(bitcoin).format).scriptPubKey;
@@ -494,6 +508,12 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         wallet::WalletModel* model = scene.model;
         wallet::PaymentBook* payments = controller->payments();
         QObject::connect(payments, &wallet::PaymentBook::told, payments, [&told](const QList<wallet::Payment>& some) { told.append(some); });
+        QStringList ethAssets;
+        for (const wallet::Asset asset : wallet::networkInfo(scene.ethereum).assets)
+            ethAssets.append(wallet::assetInfo(asset).key);
+        const QString usdcKey = QStringLiteral("ethereum/usdc");
+        ethAssets.removeAll(usdcKey);
+        payments->noteAnswered(scene.ethereum, 0, {}, ethAssets);
         ui::TitleBar* title = scene.window->titleBar();
         check(scene.payments() == 0 && title->unreadPayments() == 0, QStringLiteral("nothing has come in"));
 
@@ -508,7 +528,7 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(!one.whileClosed && !one.read, QStringLiteral("not looked at yet"));
         check(title->unreadPayments() == 1, QStringLiteral("the bell says so"));
         check(waitFor([&] { return !told.isEmpty(); }, 3000), QStringLiteral("and it is told"));
-        check(scene.window->lastPaymentAlert().contains(QStringLiteral("not in a block yet")) && !scene.window->lastPaymentAlert().contains(QStringLiteral("Received")) && scene.window->lastPaymentAlert().contains(QStringLiteral("$50.00")) && scene.window->lastPaymentAlert().contains(QStringLiteral("Shop")),
+        check(scene.window->lastPaymentAlert().contains(QStringLiteral("not confirmed yet")) && !scene.window->lastPaymentAlert().contains(QStringLiteral("Received")) && scene.window->lastPaymentAlert().contains(QStringLiteral("$50.00")) && scene.window->lastPaymentAlert().contains(QStringLiteral("Shop")),
               QStringLiteral("as what it is, not as received: %1").arg(scene.window->lastPaymentAlert()));
         scene.book->setStatus(model->at(scene.rowOf(1)).scripthash, QStringLiteral("s1"));
 
@@ -574,6 +594,64 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         scene.paid(8, QStringLiteral("r3"), 0, 70000);
         scene.add(transaction({somewhere(9)}, {{scene.scriptOf(8), 70000}}, 11));
         check(scene.payments() == kept + 1, QStringLiteral("one that pays another amount is"));
+        // The same amount from the same coins, to another of the wallets' addresses: what the first
+        // was for has not been paid, and what the second was for has.
+        scene.paidOnChange(10, QStringLiteral("rb1"), 65000);
+        const chain::Transaction toFirst = transaction({somewhere(40)}, {{scene.changeScriptOf(10), 65000}}, 40);
+        scene.add(toFirst);
+        const int beforeOther = scene.payments();
+        scene.paidOnChange(11, QStringLiteral("rb2"), 65000);
+        const chain::Transaction toOther = transaction({somewhere(40)}, {{scene.changeScriptOf(11), 65000}}, 41);
+        scene.add(toOther);
+        check(scene.payments() == beforeOther + 1 && payments->all().constLast().txid == toOther.txid && payments->all().constLast().address == model->at(scene.changeRowOf(11)).address,
+              QStringLiteral("a replacement that pays another address of the wallets is a payment of its own"));
+        check(payments->all().at(payments->all().size() - 2).txid == toFirst.txid, QStringLiteral("and the first stays on its own address"));
+
+        // Its own change, read before the coin it spends is: it goes as soon as that comes.
+        const chain::Transaction parent = transaction({somewhere(41)}, {{scene.changeScriptOf(12), 9000}}, 42);
+        const chain::Transaction spender = transaction({chain::OutPoint{parent.txid, 0}}, {{scene.changeScriptOf(13), 8000}}, 43);
+        scene.paidOnChange(13, QStringLiteral("own1"), 8000);
+        scene.add(spender);
+        const int withChange = scene.payments();
+        const int unreadWithChange = payments->unread();
+        check(payments->all().constLast().txid == spender.txid, QStringLiteral("(change read first looks like a payment)"));
+        scene.paidOnChange(12, QStringLiteral("own2"), 9000);
+        scene.add(parent);
+        const auto hasTx = [&](const chain::Hash256& txid) { return std::any_of(payments->all().cbegin(), payments->all().cend(), [&txid](const wallet::Payment& one) { return one.hasTx && one.txid == txid; }); };
+        check(!hasTx(spender.txid) && hasTx(parent.txid) && scene.payments() == withChange, QStringLiteral("the wallet's own change leaves the list once what it spends is read, and the real payment stays"));
+        check(payments->unread() == unreadWithChange, QStringLiteral("and it does not count as unread: %1").arg(payments->unread()));
+        scene.add(spender);
+        check(!hasTx(spender.txid), QStringLiteral("nor does it come back"));
+
+        // Known only by its balance: its first status says nothing has moved.
+        wallet::AddressRow balanceOnly = model->at(scene.changeRowOf(14));
+        balanceOnly.status.clear();
+        balanceOnly.used = true;
+        balanceOnly.checked = true;
+        balanceOnly.confirmed = 4000;
+        model->upsert(balanceOnly);
+        const int withOld = scene.payments();
+        scene.paidOnChange(14, QStringLiteral("late read"), 0);
+        scene.add(transaction({somewhere(42)}, {{scene.changeScriptOf(14), 4000}}, 44));
+        check(scene.payments() == withOld, QStringLiteral("a row known only by its balance tells nothing of an old history read at last"));
+
+        // A row the window reaches after the wallet's first whole scan.
+        payments->noteAnswered(scene.bitcoin, 900000, {scene.shop}, {});
+        wallet::AddressRow grown = model->at(scene.changeRowOf(15));
+        grown.checked = false;
+        model->upsert(grown);
+        scene.paidOnChange(15, QStringLiteral("g1"), 3300);
+        scene.add(transaction({somewhere(43)}, {{scene.changeScriptOf(15), 1300}}, 45), 899000);
+        const int grownBefore = scene.payments();
+        check(grownBefore == withOld, QStringLiteral("what it held before that scan is no news"));
+        scene.add(transaction({somewhere(44)}, {{scene.changeScriptOf(15), 2000}}, 46), 900001);
+        check(scene.payments() == grownBefore + 1, QStringLiteral("what is newer than that scan is"));
+        wallet::AddressRow grownPending = model->at(scene.changeRowOf(16));
+        grownPending.checked = false;
+        model->upsert(grownPending);
+        scene.paidOnChange(16, QStringLiteral("g2"), 2500);
+        scene.add(transaction({somewhere(45)}, {{scene.changeScriptOf(16), 2500}}, 47));
+        check(scene.payments() == grownBefore + 2, QStringLiteral("and so is what is in no block yet"));
 
         // Dust.
         told.clear();
@@ -623,7 +701,7 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(scene.payments() == count, QStringLiteral("nor is a source behind the others coming back to what was there"));
         setToken(1, 12000000);
         setToken(1, 32000000);
-        check(scene.payments() == ++count, QStringLiteral("anything else coming back is"));
+        check(scene.payments() == ++count && payments->all().constLast().amount.toDecimalString() == "2000000", QStringLiteral("anything else coming back is, for what is new: %1").arg(QString::fromStdString(payments->all().constLast().amount.toDecimalString())));
         wallet::AddressRow noAnswer = model->at(scene.ethRowOf(2));
         noAnswer.checked = false;
         model->upsert(noAnswer);
@@ -632,11 +710,86 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         setToken(3, 5000);
         check(scene.payments() == count, QStringLiteral("nor does dust of a token"));
 
-        // One already in a block when it is first read is received.
+        // A token new on the list: all that every address long held of it comes up at once.
+        const wallet::Asset usdc = ethereum.tokens.last();
+        check(wallet::assetInfo(usdc).key == usdcKey, QStringLiteral("(the second token)"));
+        const auto setUsdc = [&](quint32 index, quint64 units) {
+            wallet::AddressRow row = model->at(scene.ethRowOf(index));
+            row.setBalance(usdc, chain::Amount::fromU64(units));
+            row.checked = true;
+            row.used = true;
+            model->upsert(row);
+        };
+        setUsdc(11, 40000000);
+        check(scene.payments() == count, QStringLiteral("what a token not read before already held is no news"));
+        payments->noteAnswered(scene.ethereum, 0, {}, {usdcKey});
+        setUsdc(11, 50000000);
+        check(scene.payments() == ++count && payments->all().constLast().asset == usdcKey, QStringLiteral("what it gains after the network answered with it is"));
+
+        // A row of Ethereum's that its window reached this run, past the first scan.
+        const wallet::AddressRow template_ = model->at(scene.ethRowOf(12));
+        payments->noteAnswered(scene.ethereum, 0, {scene.shop}, {});
+        wallet::AddressRow reached = template_;
+        reached.index = 500;
+        reached.address = QStringLiteral("0xreached");
+        reached.checked = false;
+        reached.used = false;
+        reached.balances.clear();
+        model->upsert(reached);
+        wallet::AddressRow answered = model->at(model->find(scene.shop, scene.ethereum, scene.ethKey.type, 0, 0, 500));
+        answered.checked = true;
+        answered.used = true;
+        answered.setBalance(usdt, chain::Amount::fromU64(70000000));
+        model->upsert(answered);
+        check(scene.payments() == ++count && payments->all().constLast().address == QLatin1String("0xreached"), QStringLiteral("what a row the window reached holds at its first answer is news"));
+        wallet::AddressRow oldOne = model->at(scene.ethRowOf(13));
+        oldOne.checked = false;
+        model->upsert(oldOne);
+        wallet::AddressRow oldAnswered = model->at(scene.ethRowOf(13));
+        oldAnswered.checked = true;
+        oldAnswered.setBalance(usdt, chain::Amount::fromU64(80000000));
+        model->upsert(oldAnswered);
+        check(scene.payments() == count, QStringLiteral("what one that was there all along holds is not"));
+        payments->noteGapsChanged();
+        wallet::AddressRow afterGaps = template_;
+        afterGaps.index = 501;
+        afterGaps.address = QStringLiteral("0xaftergaps");
+        afterGaps.checked = false;
+        afterGaps.used = false;
+        afterGaps.balances.clear();
+        model->upsert(afterGaps);
+        wallet::AddressRow afterGapsAnswered = model->at(model->find(scene.shop, scene.ethereum, scene.ethKey.type, 0, 0, 501));
+        afterGapsAnswered.checked = true;
+        afterGapsAnswered.used = true;
+        afterGapsAnswered.setBalance(usdt, chain::Amount::fromU64(60000000));
+        model->upsert(afterGapsAnswered);
+        check(scene.payments() == count, QStringLiteral("nor what rows back after a change of gaps hold"));
+
+        // A balance told of that goes back down.
+        pause(50);
+        setToken(14, 33000000);
+        check(scene.payments() == ++count, QStringLiteral("(a balance goes up)"));
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Balance went up")); }, 3000), QStringLiteral("it is told as just that: %1").arg(scene.window->lastPaymentAlert()));
+        setToken(14, 0);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("A balance went back down")); }, 3000), QStringLiteral("and is told when it goes back: %1").arg(scene.window->lastPaymentAlert()));
+        check(scene.payments() == count, QStringLiteral("with no new line"));
+
+        // One a server says is in a block when it is first read: that is a server's word.
         pause(50);
         scene.paid(18, QStringLiteral("b1"), 80000);
-        scene.add(transaction({somewhere(31)}, {{scene.scriptOf(18), 80000}}, 31), 900100);
-        check(waitFor([&] { return scene.window->lastPaymentAlert().contains(QStringLiteral("Received")); }, 3000), QStringLiteral("what is in a block when first read is told as received: %1").arg(scene.window->lastPaymentAlert()));
+        const int claimedAt = scene.add(transaction({somewhere(31)}, {{scene.scriptOf(18), 80000}}, 31), 900100);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().contains(QStringLiteral("not verified yet")); }, 3000), QStringLiteral("what a server says is in a block is not told as received: %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->setProven(claimedAt, true);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("proven, it is told so: %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->setStatus(model->at(scene.rowOf(18)).scripthash, QStringLiteral("b1"));
+        // Proven before it is told of: told once, as received.
+        pause(50);
+        scene.paid(18, QStringLiteral("b2"), 90000);
+        const int provenAt = scene.add(transaction({somewhere(38)}, {{scene.scriptOf(18), 10000}}, 39), 900101);
+        scene.book->setProven(provenAt, true);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Received")); }, 3000), QStringLiteral("what is proven by the time it is told of is received: %1").arg(scene.window->lastPaymentAlert()));
+        pause(60);
+        check(scene.window->lastPaymentAlert().startsWith(QStringLiteral("Received")), QStringLiteral("and told once: %1").arg(scene.window->lastPaymentAlert()));
         count = scene.payments();
 
         // What becomes of one told of while in no block.
@@ -645,14 +798,14 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         const int waitingAt = scene.add(transaction({somewhere(32)}, {{scene.scriptOf(19), 90000}}, 32));
         pause(50);
         int settledTimes = 0;
-        QObject::connect(payments, &wallet::PaymentBook::settled, payments, [&settledTimes](const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>&) { settledTimes += int(inABlock.size()); });
+        QObject::connect(payments, &wallet::PaymentBook::settled, payments, [&settledTimes](const wallet::PaymentNews& news) { settledTimes += int(news.inABlock.size()); });
         const QString saidThen = scene.window->lastPaymentAlert();
         const int unreadThen = payments->unread();
         scene.book->setHeight(waitingAt, 900200);
         pause(50);
         check(scene.window->lastPaymentAlert() == saidThen, QStringLiteral("a server saying it is in a block is no proof: nothing is said yet"));
         scene.book->setProven(waitingAt, true);
-        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("In a block")); }, 3000), QStringLiteral("proven in one, it is told again: %1").arg(scene.window->lastPaymentAlert()));
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("proven in one, it is told again: %1").arg(scene.window->lastPaymentAlert()));
         check(scene.window->lastPaymentAlert().contains(QStringLiteral("$90.00")) && scene.window->lastPaymentAlert().contains(QStringLiteral("Shop")), QStringLiteral("with what it is"));
         check(payments->unread() == unreadThen && scene.payments() == count + 1, QStringLiteral("as no new payment"));
         count = scene.payments();
@@ -662,6 +815,19 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         scene.book->setProven(waitingAt, true);
         pause(50);
         check(settledTimes == 1, QStringLiteral("and once: %1").arg(settledTimes));
+        // A block that gives way before it is deep enough. One deep enough is no longer looked at.
+        const int nearTip = std::max(controller->historyOf(scene.bitcoin)->tip(), 900000) + 1;
+        scene.paid(19, QStringLiteral("w2"), 0, 95000);
+        const int shallowAt = scene.add(transaction({somewhere(47)}, {{scene.scriptOf(19), 5000}}, 49), nearTip);
+        scene.book->setProven(shallowAt, true);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Received")); }, 3000), QStringLiteral("(one proven, not deep yet): %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->setStatus(model->at(scene.rowOf(19)).scripthash, QStringLiteral("w2"));
+        scene.book->setHeight(shallowAt, 0);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("No longer confirmed")); }, 3000), QStringLiteral("back in no block, it is told so: %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->setHeight(shallowAt, nearTip + 1);
+        scene.book->setProven(shallowAt, true);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("and proven again, told so too: %1").arg(scene.window->lastPaymentAlert()));
+        count = scene.payments();
 
         // And one that will not come.
         wallet::AddressRow goneRow = model->at(scene.rowOf(0));
@@ -673,8 +839,22 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         const int droppedAt = scene.add(transaction({somewhere(33)}, {{scene.scriptOf(0), 70000}}, 33));
         check(scene.payments() == ++count, QStringLiteral("(one that will be dropped)"));
         pause(50);
+        const QString beforeDropped = scene.window->lastPaymentAlert();
+        // A list that leaves it out for a moment, and the next that has it: nothing to say.
         scene.book->markGone(droppedAt);
-        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Replaced or dropped")); }, 3000), QStringLiteral("dropped, it is told as not paid: %1").arg(scene.window->lastPaymentAlert()));
+        pause(60);
+        check(scene.window->lastPaymentAlert() == beforeDropped, QStringLiteral("a server leaving it out for a moment says nothing yet: %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->setHeight(droppedAt, 0);
+        pause(400);
+        check(scene.window->lastPaymentAlert() == beforeDropped, QStringLiteral("nor once it is listed again: %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->markGone(droppedAt);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Replaced or dropped")); }, 3000), QStringLiteral("dropped for a while, it is told as not paid: %1").arg(scene.window->lastPaymentAlert()));
+        // And it can still turn up.
+        scene.book->setHeight(droppedAt, 0);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("Listed again")); }, 3000), QStringLiteral("listed again after that, it is told: %1").arg(scene.window->lastPaymentAlert()));
+        scene.book->setHeight(droppedAt, 900250);
+        scene.book->setProven(droppedAt, true);
+        check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("and when it is mined: %1").arg(scene.window->lastPaymentAlert()));
 
         // Two at once are one thing to say too.
         scene.paid(13, QStringLiteral("two1"), 0, 11000);
@@ -687,7 +867,7 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         scene.book->setProven(twoA, true);
         scene.book->setHeight(twoB, 900300);
         scene.book->setProven(twoB, true);
-        check(waitFor([&] { return scene.window->lastPaymentAlert().contains(QStringLiteral("2 payments got into a block")); }, 3000), QStringLiteral("a block with two is one thing to say: %1").arg(scene.window->lastPaymentAlert()));
+        check(waitFor([&] { return scene.window->lastPaymentAlert().contains(QStringLiteral("2 confirmed")); }, 3000), QStringLiteral("a block with two is one thing to say: %1").arg(scene.window->lastPaymentAlert()));
 
         // Many at once are one thing to say.
         pause(50);
@@ -696,7 +876,22 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         setToken(5, 10000000);
         setToken(6, 10000000);
         check(waitFor([&] { return told.size() == 3; }, 3000), QStringLiteral("a burst is told"));
-        check(scene.window->lastPaymentAlert().contains(QStringLiteral("3 payments came in")) && scene.window->lastPaymentAlert().contains(QStringLiteral("$30.00")), QStringLiteral("as one: %1").arg(scene.window->lastPaymentAlert()));
+        check(scene.window->lastPaymentAlert().contains(QStringLiteral("3 balances went up")) && scene.window->lastPaymentAlert().contains(QStringLiteral("$30.00")), QStringLiteral("as one: %1").arg(scene.window->lastPaymentAlert()));
+
+        // A stream of them, each within a pause of the last.
+        wallet::PaymentBook::setPauseForTest(300);
+        pause(50);
+        told.clear();
+        int streamTold = 0;
+        const QMetaObject::Connection counting = QObject::connect(payments, &wallet::PaymentBook::told, payments, [&streamTold] { ++streamTold; });
+        setToken(15, 10000000);
+        pause(100);
+        setToken(16, 10000000);
+        pause(100);
+        setToken(17, 10000000);
+        check(waitFor([&] { return told.size() == 3; }, 5000) && streamTold == 1, QStringLiteral("a stream is one thing to say: %1 times, %2 payments").arg(streamTold).arg(told.size()));
+        QObject::disconnect(counting);
+        wallet::PaymentBook::setPauseForTest(10);
 
         // What was dropped goes from the history in time, and a server can list it again.
         pause(50);
@@ -734,6 +929,16 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         scene.add(transaction({somewhere(21)}, {{scene.scriptOf(16), 30000}}, 21));
         check(!payments->all().constLast().whileClosed, QStringLiteral("what moved after it did not"));
         pause(50);
+        // Pending all the same, however long ago it came.
+        scene.book->setStatus(model->at(scene.rowOf(16)).scripthash, QStringLiteral("c2"));
+        controller->setShowingSavedForTest(true);
+        wallet::AddressRow closedPending = model->at(scene.rowOf(16));
+        closedPending.status = QStringLiteral("c3");
+        model->upsert(closedPending);
+        controller->setShowingSavedForTest(false);
+        scene.add(transaction({somewhere(22)}, {{scene.scriptOf(16), 30000}}, 22));
+        check(waitFor([&] { return scene.window->lastPaymentAlert().contains(QStringLiteral("while GitWallet was closed, not confirmed yet")); }, 3000), QStringLiteral("what came while closed and is in no block is not told as come in: %1").arg(scene.window->lastPaymentAlert()));
+        pause(50);
 
         // Locked, nothing is said of what becomes of one.
         wallet::seal::setCostForTest(256, 1);
@@ -743,12 +948,16 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(waitFor([&] { return passwordSet && controller->hasPassword(); }, 15000), QStringLiteral("(a password)"));
         scene.paid(12, QStringLiteral("k1"), 0, 15000);
         const int lockedAt = scene.add(transaction({somewhere(36)}, {{scene.scriptOf(12), 15000}}, 36));
+        scene.paid(11, QStringLiteral("k2"), 0, 16000);
+        const int lockedGone = scene.add(transaction({somewhere(39)}, {{scene.scriptOf(11), 16000}}, 37));
         pause(50);
+        // Under a password, Windows' own list of notifications is not told how much.
         scene.window->lockNow();
         const QString saidLocked = scene.window->lastPaymentAlert();
         scene.book->setHeight(lockedAt, 900400);
         scene.book->setProven(lockedAt, true);
-        pause(100);
+        scene.book->markGone(lockedGone);
+        pause(500);
         check(scene.window->isLocked() && scene.window->lastPaymentAlert() == saidLocked, QStringLiteral("a locked window says nothing of what became of a payment: %1").arg(scene.window->lastPaymentAlert()));
         bool passwordOff = false;
         controller->changePassword(testPassword, QString(), false, scene.window.get(), [&passwordOff](const QString&) { passwordOff = true; });
@@ -756,6 +965,10 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         wallet::seal::setCostForTest(0, 0);
         scene.window->lockPage()->field()->insert(testPassword);
         scene.window->unlockForTest();
+        check(scene.window->lastPaymentAlert().contains(QStringLiteral("1 not paid")) && scene.window->lastPaymentAlert().contains(QStringLiteral("1 confirmed")), QStringLiteral("the unlock says all that became of them, what goes wrong first: %1").arg(scene.window->lastPaymentAlert()));
+        const QString saidAtUnlock = scene.window->lastPaymentAlert();
+        pause(50);
+        check(scene.window->lastPaymentAlert() == saidAtUnlock, QStringLiteral("once"));
 
         // Nothing said when it is not wanted, and the list still kept.
         const int kept2 = scene.payments();
@@ -787,7 +1000,7 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
             check(list->model()->index(0, 1).data(Qt::FontRole).value<QFont>().weight() > QFont::Normal, QStringLiteral("what has not been looked at is bold"));
             const int shownNow = list->model()->rowCount();
             setToken(9, 10000000);
-            check(list->model()->rowCount() == shownNow + 1, QStringLiteral("it goes on filling while it is open"));
+            check(waitFor([&] { return list->model()->rowCount() == shownNow + 1; }, 3000), QStringLiteral("it goes on filling while it is open"));
             auto* open = dialog->findChild<QPushButton*>(QStringLiteral("paymentsOpen"));
             check(open && !open->isEnabled(), QStringLiteral("nothing chosen, nothing to open"));
             list->selectRow(lastRow + 1);
@@ -805,6 +1018,14 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(payments->unread() == 1 && title->unreadPayments() == 1, QStringLiteral("what comes next counts from one"));
         told.clear();
         pause(50);
+
+        // Noticed, and closed before its history was read.
+        wallet::AddressRow atClosing = model->at(scene.changeRowOf(17));
+        atClosing.status = QStringLiteral("closing");
+        atClosing.used = true;
+        atClosing.checked = true;
+        atClosing.unconfirmed = 6600;
+        model->upsert(atClosing);
     }
 
     // Gone with the window, and back with the next.
@@ -822,6 +1043,24 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         QObject::connect(payments, &wallet::PaymentBook::told, payments, [&told2](const QList<wallet::Payment>& some) { told2.append(some); });
         pause(50);
         check(told2.isEmpty(), QStringLiteral("and none is told again"));
+        // What was noticed last time and not read yet is told of now.
+        const int beforeRead = scene.payments();
+        const chain::Transaction atClosing = transaction({somewhere(46)}, {{scene.changeScriptOf(17), 6600}}, 48);
+        scene.add(atClosing);
+        check(scene.payments() == beforeRead + 1 && payments->all().constLast().txid == atClosing.txid && payments->all().constLast().whileClosed, QStringLiteral("an address noticed just before closing still tells of its payment, as having come while closed"));
+        check(waitFor([&] { return !told2.isEmpty(); }, 3000), QStringLiteral("(told)"));
+        // What was pending when it closed is still watched.
+        const auto stillPending = std::find_if(payments->all().cbegin(), payments->all().cend(), [&](const wallet::Payment& one) {
+            const int at = one.hasTx && one.txid != atClosing.txid ? scene.book->find(one.txid) : -1;
+            return at >= 0 && scene.book->at(at).seen == wallet::TxSeen::Alive && scene.book->at(at).height <= 0;
+        });
+        check(stillPending != payments->all().cend(), QStringLiteral("(one pending at the last close)"));
+        if (stillPending != payments->all().cend()) {
+            const int at = scene.book->find(stillPending->txid);
+            scene.book->setHeight(at, 900600);
+            scene.book->setProven(at, true);
+            check(waitFor([&] { return scene.window->lastPaymentAlert().startsWith(QStringLiteral("First confirmation")); }, 3000), QStringLiteral("what was pending when it closed is told of when it is proven: %1").arg(scene.window->lastPaymentAlert()));
+        }
         // Told of before this start, far back by now, gone from the history since, and listed again.
         QList<wallet::Payment> since;
         for (int i = 0; i < 100; ++i) {
@@ -862,6 +1101,8 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         QString removeError;
         const int ofShop = int(std::count_if(payments->all().cbegin(), payments->all().cend(), [&scene](const wallet::Payment& payment) { return payment.wallet == scene.shop; }));
         check(ofShop > 0, QStringLiteral("(some are of that wallet)"));
+        // Its addresses moved this run, and it can be added again.
+        scene.paidOnChange(18, QStringLiteral("forget"), 5100);
         check(scene.controller->removeWallet(scene.shop, &removeError), QStringLiteral("a wallet removed: %1").arg(removeError));
         check(std::none_of(payments->all().cbegin(), payments->all().cend(), [&scene](const wallet::Payment& payment) { return payment.wallet == scene.shop; }), QStringLiteral("takes its payments along"));
         check(scene.window->titleBar()->unreadPayments() == payments->unread(), QStringLiteral("off the bell too"));

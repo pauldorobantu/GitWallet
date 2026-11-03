@@ -69,5 +69,5 @@ if(WIN32)
     # tokens::Radii::small in the reused ThemeManager); NOMINMAX keeps
     # std::min/max usable.
     target_compile_definitions(GitWallet PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(GitWallet PRIVATE bcrypt crypt32 ws2_32 psapi)
+    target_link_libraries(GitWallet PRIVATE bcrypt crypt32 ws2_32 psapi dwmapi)
 endif()

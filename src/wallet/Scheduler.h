@@ -56,6 +56,9 @@ public:
     bool hasWork() const;    // some network has accounts
     bool isScanning() const; // any network
     bool allAnswered() const; // every network with accounts: see ChainScanner::answered()
+    QList<Network> answeredNetworks() const; // those with accounts that have, this run
+    bool rowAnswered(const AddressRow& row) const; // see ChainScanner::rowAnswered()
+    qint64 plannedPassMs(Network network) const;
     bool limitReached() const;
     bool anyConnecting() const;
     NetworkStatus status(Network network) const;

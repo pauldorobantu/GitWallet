@@ -1,7 +1,8 @@
 @echo off
 rem GitWallet - configure + build (MSVC x64 + Ninja + Qt 6.10.3 + vcpkg).
-rem Reuses the shared vcpkg at C:\app-vcpkg and its installed tree so what is already
-rem built there is not built again; a clean machine builds every library in vcpkg.json.
+rem Reuses the shared vcpkg at C:\app-vcpkg, whose cache spares building a library twice, with an
+rem installed tree of its own: vcpkg takes out of a tree whatever the project it runs for does not
+rem list, so two projects cannot share one. A clean machine builds every library in vcpkg.json.
 setlocal
 cd /d "%~dp0"
 
@@ -9,7 +10,7 @@ rem GW_VCPKG / GW_VCPKG_INSTALLED point elsewhere on the build machine (CI);
 rem GW_BUILD_DIR keeps an existing build folder as it is.
 if not defined GW_BUILD_DIR set "GW_BUILD_DIR=build"
 if not defined GW_VCPKG set "GW_VCPKG=C:\app-vcpkg"
-if not defined GW_VCPKG_INSTALLED set "GW_VCPKG_INSTALLED=C:/app-vcpkg-installed"
+if not defined GW_VCPKG_INSTALLED set "GW_VCPKG_INSTALLED=C:/gw-vcpkg-installed"
 if not exist "%GW_VCPKG%\vcpkg.exe" (
     echo [build] vcpkg not found at %GW_VCPKG%
     exit /b 1

@@ -1,5 +1,7 @@
 #include "ui/pages/WalletsPage.h"
 
+#include "ui/TableUtil.h"
+
 #include "app/WalletController.h"
 #include "chain/Address.h"
 #include "net/PriceFeed.h"
@@ -208,7 +210,7 @@ public:
                 }
             case Qt::ToolTipRole:
                 if (column == ColName)
-                    return entry.label;
+                    return plainTip(entry.label);
                 if (column == stateColumn() && state != RowState::UpToDate)
                     return status_; // the whole of it, as the title bar says it
                 if (const wallet::AssetInfo* info = assetOf(column); info && !watches(shown, *info))

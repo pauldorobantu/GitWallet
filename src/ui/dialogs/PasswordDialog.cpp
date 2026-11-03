@@ -20,7 +20,6 @@ namespace app::ui {
 namespace {
 
 constexpr int kLeastChars = 8;
-constexpr int kMostChars = 1024;
 
 void wipeField(QLineEdit* edit)
 {
@@ -33,7 +32,7 @@ void wipeField(QLineEdit* edit)
 
 } // namespace
 
-QLineEdit* PasswordDialog::addField(const QString& title, const char* name)
+QLineEdit* PasswordDialog::addField(const QString& title, const char* name, bool newOne)
 {
     auto* column = static_cast<QVBoxLayout*>(layout());
     auto* label = new QLabel(title, this);
@@ -42,14 +41,16 @@ QLineEdit* PasswordDialog::addField(const QString& title, const char* name)
     edit->setObjectName(QString::fromLatin1(name));
     edit->setEchoMode(QLineEdit::Password);
     edit->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
-    edit->setMaxLength(kMostChars);
+    // A new one with room for one more, to say so rather than cut it where nothing shows: what is
+    // typed where it is asked for afterwards would not be what was set.
+    edit->setMaxLength(newOne ? kMostChars + 1 : kMostChars);
     edit->setAccessibleName(title);
     column->addWidget(edit);
     connect(edit, &QLineEdit::textChanged, this, &PasswordDialog::updateState);
     return edit;
 }
 
-PasswordDialog::PasswordDialog(Mode mode, int oldFiles, const QString& about, const Work& work, QWidget* parent)
+PasswordDialog::PasswordDialog(Mode mode, const OldFiles& oldFiles, const QString& about, const Work& work, QWidget* parent)
     : QDialog(parent), mode_(mode), work_(work)
 {
     setObjectName(QStringLiteral("passwordDialog"));
@@ -105,8 +106,8 @@ PasswordDialog::PasswordDialog(Mode mode, int oldFiles, const QString& about, co
     if (mode_ == Mode::OpenBackup)
         current_ = addField(trText(QStringLiteral("The password of the file")), "passwordCurrent");
     if (mode_ == Mode::SetApp || mode_ == Mode::ChangeApp || mode_ == Mode::MakeBackup) {
-        fresh_ = addField(trText(QStringLiteral("New password")), "passwordNew");
-        repeat_ = addField(trText(QStringLiteral("The same again")), "passwordRepeat");
+        fresh_ = addField(trText(QStringLiteral("New password")), "passwordNew", true);
+        repeat_ = addField(trText(QStringLiteral("The same again")), "passwordRepeat", true);
         auto* hint = new QLabel(trText(QStringLiteral("At least %1 characters. A sentence of five or six words is long and easy to remember.")).arg(kLeastChars), this);
         hint->setWordWrap(true);
         setTone(hint, Tone::Muted);
@@ -118,10 +119,17 @@ PasswordDialog::PasswordDialog(Mode mode, int oldFiles, const QString& about, co
         column->addWidget(understood_);
         connect(understood_, &QCheckBox::toggled, this, &PasswordDialog::updateState);
     }
-    if ((mode_ == Mode::SetApp || mode_ == Mode::ChangeApp) && oldFiles > 0) {
-        deleteOld_ = new QCheckBox(trText(QStringLiteral("Also delete the %1 older wallet files kept beside it: no password reaches them, and those kept because they could not be read may hold other wallets")).arg(oldFiles), this);
-        deleteOld_->setObjectName(QStringLiteral("passwordDeleteOld"));
-        column->addWidget(deleteOld_);
+    if ((mode_ == Mode::SetApp || mode_ == Mode::ChangeApp) && oldFiles.formatCopies > 0) {
+        // On by default: left there, such a copy opens today's database with no password at all.
+        deleteCopies_ = new QCheckBox(trText(QStringLiteral("Also delete the %1 older copies of this wallet file: no password reaches them, and they open today's database")).arg(oldFiles.formatCopies), this);
+        deleteCopies_->setObjectName(QStringLiteral("passwordDeleteCopies"));
+        deleteCopies_->setChecked(true);
+        column->addWidget(deleteCopies_);
+    }
+    if ((mode_ == Mode::SetApp || mode_ == Mode::ChangeApp) && oldFiles.unread > 0) {
+        deleteUnread_ = new QCheckBox(trText(QStringLiteral("Also delete the %1 older files that could not be read: no password reaches them, and they may be the only copy of other wallets")).arg(oldFiles.unread), this);
+        deleteUnread_->setObjectName(QStringLiteral("passwordDeleteUnread"));
+        column->addWidget(deleteUnread_);
     }
 
     status_ = new QLabel(this);
@@ -167,6 +175,9 @@ void PasswordDialog::updateState()
         } else if (fresh.size() < kLeastChars) {
             ready = false;
             why = trText(QStringLiteral("At least %1 characters.")).arg(kLeastChars);
+        } else if (fresh.size() > kMostChars) {
+            ready = false;
+            why = trText(QStringLiteral("At most %1 characters.")).arg(kMostChars);
         } else if (wallet::looksLikeSecret(fresh)) {
             // A seed in the field would be one more place for it to be typed.
             ready = false;
@@ -198,7 +209,8 @@ void PasswordDialog::go()
     Filled filled;
     filled.current = current_ ? current_->text() : QString();
     filled.fresh = fresh_ ? fresh_->text() : QString();
-    filled.deleteOldFiles = deleteOld_ && deleteOld_->isChecked();
+    filled.deleteFormatCopies = deleteCopies_ && deleteCopies_->isChecked();
+    filled.deleteUnreadFiles = deleteUnread_ && deleteUnread_->isChecked();
     const QPointer<PasswordDialog> self(this);
     work_(filled, [self](const QString& error) {
         if (!self)

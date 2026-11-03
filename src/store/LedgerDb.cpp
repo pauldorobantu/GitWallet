@@ -11,7 +11,7 @@ namespace store {
 
 namespace {
 
-constexpr int kSchemaVersion = 3;
+constexpr int kSchemaVersion = 4;
 constexpr int kOutPointBytes = 36;
 
 // Finalizes on every path out of a query.
@@ -376,6 +376,17 @@ bool LedgerDb::migrate(QString* why)
                 is_read INTEGER NOT NULL,
                 while_closed INTEGER NOT NULL
             );
+        )sql";
+        if (!exec(schema, why))
+            return false;
+    }
+    if (have < 4) {
+        // What the list of payments has to know at the next start, by name.
+        const char* schema = R"sql(
+            CREATE TABLE payment_state(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;
         )sql";
         if (!exec(schema, why))
             return false;
@@ -826,6 +837,58 @@ bool LedgerDb::setPaymentsRead(qint64 upTo, QString* why)
         }
         return true;
     }, why);
+}
+
+bool LedgerDb::deletePayment(qint64 id, QString* why)
+{
+    return writeInTransaction([this, id](QString* failure) {
+        Statement remove;
+        if (!prepare("DELETE FROM payment WHERE id = ?", remove.slot(), failure))
+            return false;
+        sqlite3_bind_int64(remove.get(), 1, id);
+        if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+            if (failure)
+                *failure = lastError();
+            return false;
+        }
+        return true;
+    }, why);
+}
+
+bool LedgerDb::savePaymentState(const QHash<QString, QString>& changes, QString* why)
+{
+    return writeInTransaction([this, &changes](QString* failure) {
+        Statement put;
+        Statement remove;
+        if (!prepare("INSERT OR REPLACE INTO payment_state(key, value) VALUES(?,?)", put.slot(), failure)
+            || !prepare("DELETE FROM payment_state WHERE key = ?", remove.slot(), failure))
+            return false;
+        for (auto it = changes.cbegin(); it != changes.cend(); ++it) {
+            sqlite3_stmt* one = it.value().isEmpty() ? remove.get() : put.get();
+            bindText(one, 1, it.key());
+            if (!it.value().isEmpty())
+                bindText(one, 2, it.value());
+            const int done = sqlite3_step(one);
+            sqlite3_reset(one);
+            if (done != SQLITE_DONE) {
+                if (failure)
+                    *failure = lastError();
+                return false;
+            }
+        }
+        return true;
+    }, why);
+}
+
+QHash<QString, QString> LedgerDb::loadPaymentState(QString* why)
+{
+    QHash<QString, QString> out;
+    Statement list;
+    if (!db_ || !prepare("SELECT key, value FROM payment_state", list.slot(), why))
+        return out;
+    while (sqlite3_step(list.get()) == SQLITE_ROW)
+        out.insert(columnText(list.get(), 0), columnText(list.get(), 1));
+    return out;
 }
 
 QList<wallet::Payment> LedgerDb::loadPayments(QString* why)

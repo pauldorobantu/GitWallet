@@ -83,6 +83,7 @@ public:
     // answered; for good while a chain is stopped at the row limit.
     bool isScanning() const override;
     bool answered() const override;
+    bool rowAnswered(const AddressRow& row) const override;
     bool limitReached() const override; // some chain's window reaches past the row limit
     bool connecting() const override;
     bool wrongChain() const override; // the last server tried is on another chain, and none is in use

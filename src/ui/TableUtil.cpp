@@ -15,8 +15,27 @@
 #include <QMouseEvent>
 #include <QSet>
 #include <QTableWidgetItem>
+#include <QTextDocument>
 
 namespace app::ui {
+
+namespace {
+
+QString gLastCopied;
+
+} // namespace
+
+QString plainTip(const QString& text)
+{
+    return Qt::mightBeRichText(text) ? Qt::convertFromPlainText(text) : text;
+}
+
+void forgetOwnClipboard()
+{
+    if (!gLastCopied.isEmpty() && QApplication::clipboard()->text() == gLastCopied)
+        QApplication::clipboard()->clear();
+    gLastCopied.clear();
+}
 
 QTableWidgetItem* makeCell(const QString& text, bool muted)
 {
@@ -25,7 +44,7 @@ QTableWidgetItem* makeCell(const QString& text, bool muted)
     if (muted)
         it->setForeground(page::muted());
     if (text.size() > 40)
-        it->setToolTip(text);
+        it->setToolTip(plainTip(text));
     return it;
 }
 
@@ -59,6 +78,7 @@ void copyTextToClipboard(QWidget* host, const QString& text, const QString& labe
                       off);
 #endif
     QApplication::clipboard()->setMimeData(data); // takes ownership
+    gLastCopied = value;
     QString shown = value;
     if (shown.size() > 72)
         shown = shown.left(69) + QStringLiteral("…");

@@ -91,10 +91,15 @@ public:
     bool hasPassword() const { return store_.hasPassword(); }
     // Opens the file and goes on as loadExisting() would have. `error` empty: it opened.
     void openWithPassword(const QString& password, QObject* guard, const std::function<void(const QString& error)>& done);
-    void checkPassword(const QString& password, QObject* guard, const std::function<void(bool right)>& done);
-    // `current` checked if there is one; `fresh` empty: no password from now on. `deleteOld`: the older
-    // files kept beside it, which no password reaches, go too.
-    void changePassword(const QString& current, const QString& fresh, bool deleteOld, QObject* guard, const std::function<void(const QString& error)>& done);
+    void checkPassword(const QString& password, QObject* guard, const std::function<void(const QString& error)>& done);
+    // Which older files kept beside wallet.dat, which no password reaches, go when a password changes.
+    enum OldFiles {
+        KeepOldFiles = 0,
+        DeleteFormatCopies = 1, // this wallet from before a new format: they hold the key of its database
+        DeleteUnreadFiles = 2,  // could not be read when they were put aside: they may hold other wallets
+    };
+    // `current` checked if there is one; `fresh` empty: no password from now on.
+    void changePassword(const QString& current, const QString& fresh, int deleteOld, QObject* guard, const std::function<void(const QString& error)>& done);
     // A file under a password nobody remembers stays, under another name, and this starts empty.
     bool setAsideLockedFile(QString* error);
     int lockMinutes() const { return store_.lockMinutes; }
@@ -109,16 +114,29 @@ public:
         int walletsAdded = 0;
         int walletsHere = 0;      // this PC has them already: what they gave out is joined
         int walletsRefused = 0;
+        QStringList refused;      // those: the name, and why
+        int keysAdded = 0;        // keys of a wallet here that only the backup had
+        int keysNotAdded = 0;     // the wallet here has another key in that place
         qint64 givenOut = 0;      // addresses given out that this PC had not known of
         int labels = 0;
         int labelsLeftOut = 0;
+        int labelsKept = 0;       // this PC words them otherwise, and that stays
         QString labelsWhy;        // none could go in, for this reason
+        bool serversKept = false; // the backup names other servers, and this PC's stay in use
+        bool gapsRose = false;    // this PC now looks as far ahead as the backup
+        bool gapsKept = false;    // the backup looks further than can be followed: this PC's stay
+        int backupReceiveGap = 0;
+        int backupChangeGap = 0;
+        int backupEvmGap = 0;
         QString error;            // nothing was done
     };
     void restoreBackup(const QString& path, const QString& password, QObject* guard, const std::function<void(const RestoreReport&)>& done);
 
     // The older files removeAllWallets() would delete with wallet.dat.
     int walletFilesKeptAside() const;
+    int walletFormatCopies() const; // of those: this wallet from before a new format
+    int walletFilesUnread() const;  // of those: what could not be read when it was put aside
+    QString unreadFileKept() const; // the latest of those; empty: none
     // And the older databases, which may hold the only copy of labels and notes.
     int databasesKeptAside() const;
     // The file this session last kept aside, as errorOccurred() named it.
@@ -288,6 +306,8 @@ private:
     void queueStatus();                   // throttled statusChanged() for progress and balances
     void onScanFinished();                // every network has its first answers in
     void onScanProgress();
+    void sayFileAside(); // a file put aside on an earlier day is still there, whoever put it there
+    void tellPaymentsWhatAnswered(); // what the first look at a wallet or a coin was over and done with
     void tryLedgerAgain(); // the data folder was held at the start
     void onScannerProblem(wallet::Problem kind, const QString& message, const QString& serverDetail);
     // Opens the database, if this window may write it, and starts scanning once what it
@@ -348,6 +368,7 @@ private:
     bool running_ = false;          // between startServices() and stopServices()
     bool waitingForLedger_ = false; // the scans start when the database has handed over
     bool showingSaved_ = false;
+    QSet<wallet::Network> answeredTold_; // this run
     QDateTime savedAt_;
     // Taken at the first load or write and held until this controller is
     // destroyed, however many days the window stays open.

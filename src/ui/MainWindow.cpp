@@ -15,6 +15,7 @@
 #include "ui/Figures.h"
 #include "ui/dialogs/ImportSeedDialog.h"
 #include "ui/dialogs/PaymentsDialog.h"
+#include "ui/TableUtil.h"
 #include "ui/pages/WalletsPage.h"
 #include "ui/pages/AddressesPage.h"
 #include "ui/pages/HistoryPage.h"
@@ -56,6 +57,11 @@
 #include <chrono>
 #include <limits>
 #include <utility>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <dwmapi.h>
+#endif
 
 namespace app::ui {
 
@@ -652,6 +658,21 @@ void MainWindow::openPayments()
 
 namespace {
 
+// How far a payment can be counted on, by what this PC has checked.
+enum class Stands { Balance, Pending, Unverified, Proven };
+
+Stands standingOf(const WalletController* controller, const wallet::Payment& payment)
+{
+    if (!payment.hasTx)
+        return Stands::Balance;
+    const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
+    const wallet::UtxoHistory* history = info ? controller->historyOf(info->network) : nullptr;
+    const int position = history ? history->book()->find(payment.txid) : -1;
+    if (position < 0 || history->book()->at(position).height <= 0)
+        return Stands::Pending;
+    return history->book()->at(position).proven ? Stands::Proven : Stands::Unverified;
+}
+
 QString worthOf(const wallet::Payment& payment)
 {
     const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
@@ -661,73 +682,134 @@ QString worthOf(const wallet::Payment& payment)
     return text;
 }
 
+// How much, and for whom: the address's label says that better than the wallet's name.
+QString namedOf(const WalletController* controller, const wallet::Payment& payment)
+{
+    QString who = controller->addressLabel(payment.address);
+    if (who.isEmpty()) {
+        const wallet::WalletEntry* entry = controller->store().find(payment.wallet);
+        who = entry ? entry->label : QString();
+    }
+    return who.isEmpty() ? worthOf(payment) : QStringLiteral("%1 · %2").arg(worthOf(payment), who);
+}
+
+constexpr int kPaymentAlertMs = 8000;
+
 } // namespace
 
 void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
 {
     if (payments.isEmpty() || SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) == QLatin1String("0"))
         return;
-    const auto worth = worthOf;
-    // A payment in no block yet can still be replaced: it is not told of as received, here as anywhere.
-    const auto inNoBlock = [this](const wallet::Payment& payment) {
-        const wallet::AssetInfo* info = payment.hasTx ? wallet::findAsset(payment.asset) : nullptr;
-        const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
-        const int position = history ? history->book()->find(payment.txid) : -1;
-        return position >= 0 && history->book()->at(position).height <= 0;
-    };
-    const bool whileClosed = std::any_of(payments.cbegin(), payments.cend(), [](const wallet::Payment& payment) { return payment.whileClosed; });
     QString text;
-    if (payments.size() == 1 && !whileClosed) {
-        const wallet::WalletEntry* entry = controller_->store().find(payments.first().wallet);
-        text = (inNoBlock(payments.first()) ? trText(QStringLiteral("Coming in, not in a block yet: %1 · %2")) : trText(QStringLiteral("Received %1 · %2")))
-                   .arg(worth(payments.first()), entry ? entry->label : QString());
-    } else if (whileClosed) {
-        text = payments.size() == 1 ? trText(QStringLiteral("A payment came in while GitWallet was closed: %1")).arg(worth(payments.first()))
-                                    : trText(QStringLiteral("%1 payments came in while GitWallet was closed")).arg(figures::formatCount(int(payments.size())));
+    bool allProven = true;
+    if (payments.size() == 1) {
+        const wallet::Payment& one = payments.first();
+        const QString named = namedOf(controller_, one);
+        const Stands stands = standingOf(controller_, one);
+        allProven = stands == Stands::Proven;
+        // What is in no block, or in one nobody has proven, can still go: it is not told of as received.
+        switch (stands) {
+        case Stands::Balance:
+            text = (one.whileClosed ? trText(QStringLiteral("Balance went up while GitWallet was closed: %1")) : trText(QStringLiteral("Balance went up: %1"))).arg(named);
+            break;
+        case Stands::Pending:
+            text = (one.whileClosed ? trText(QStringLiteral("Came while GitWallet was closed, not confirmed yet: %1")) : trText(QStringLiteral("Coming in, not confirmed yet: %1"))).arg(named);
+            break;
+        case Stands::Unverified:
+            text = (one.whileClosed ? trText(QStringLiteral("Came while GitWallet was closed, not verified yet: %1")) : trText(QStringLiteral("Coming in, not verified yet: %1"))).arg(named);
+            break;
+        case Stands::Proven:
+            text = (one.whileClosed ? trText(QStringLiteral("Came in while GitWallet was closed: %1")) : trText(QStringLiteral("Received %1"))).arg(named);
+            break;
+        }
     } else {
         double usd = 0.0;
         bool priced = true;
+        int balances = 0;
+        int notYet = 0;
+        int closed = 0;
         for (const wallet::Payment& payment : payments) {
             usd += payment.usd;
             priced = priced && payment.usd > 0.0;
+            const Stands stands = standingOf(controller_, payment);
+            balances += stands == Stands::Balance ? 1 : 0;
+            notYet += stands == Stands::Pending || stands == Stands::Unverified ? 1 : 0;
+            closed += payment.whileClosed ? 1 : 0;
+            allProven = allProven && stands == Stands::Proven;
         }
-        text = priced ? trText(QStringLiteral("%1 payments came in · %2")).arg(figures::formatCount(int(payments.size())), figures::formatUsd(usd))
-                      : trText(QStringLiteral("%1 payments came in")).arg(figures::formatCount(int(payments.size())));
-        const int notYet = int(std::count_if(payments.cbegin(), payments.cend(), inNoBlock));
+        const int count = int(payments.size());
+        const bool onlyBalances = balances == count;
+        if (closed == count) {
+            text = (onlyBalances ? trText(QStringLiteral("%1 balances went up while GitWallet was closed")) : trText(QStringLiteral("%1 payments came in while GitWallet was closed"))).arg(figures::formatCount(count));
+        } else {
+            text = (onlyBalances ? trText(QStringLiteral("%1 balances went up")) : trText(QStringLiteral("%1 payments came in"))).arg(figures::formatCount(count));
+        }
+        if (priced)
+            text += QStringLiteral(" · ") + figures::formatUsd(usd);
+        if (closed > 0 && closed < count)
+            text += QStringLiteral(" · ") + trText(QStringLiteral("%1 while GitWallet was closed")).arg(figures::formatCount(closed));
         if (notYet > 0)
-            text += QStringLiteral(" · ") + trText(QStringLiteral("%1 not in a block yet")).arg(figures::formatCount(notYet));
+            text += QStringLiteral(" · ") + trText(QStringLiteral("%1 pending")).arg(figures::formatCount(notYet));
     }
+    const QString bare = trText(QStringLiteral("A payment came in"));
     // Nothing of it to whoever is looking at a locked window.
-    if (locked_)
-        text = trText(QStringLiteral("A payment came in"));
-    sayPayment(text, int(Feedback::Type::Success));
+    sayPayment(locked_ ? bare : text, bare, int(allProven ? Feedback::Type::Success : Feedback::Type::Info));
 }
 
-void MainWindow::onPaymentsSettled(const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>& gone)
+void MainWindow::onPaymentsSettled(const wallet::PaymentNews& news)
 {
-    // Nothing of it to whoever is looking at a locked window, and the list has it by then.
-    if (locked_ || SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) == QLatin1String("0"))
+    if (SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) == QLatin1String("0"))
         return;
-    const auto named = [this](const wallet::Payment& payment) {
-        const wallet::WalletEntry* entry = controller_->store().find(payment.wallet);
-        return QStringLiteral("%1 · %2").arg(worthOf(payment), entry ? entry->label : QString());
-    };
-    // What was counted on and will not come goes first: it is what someone has to act on.
-    if (!gone.isEmpty()) {
-        sayPayment(gone.size() == 1 ? trText(QStringLiteral("Replaced or dropped, so not paid: %1")).arg(named(gone.first()))
-                                    : trText(QStringLiteral("%1 payments were replaced or dropped, so not paid")).arg(figures::formatCount(int(gone.size()))),
-                   int(Feedback::Type::Warning));
+    // Nothing of it to whoever is looking at a locked window: it waits for whoever opens it.
+    if (locked_) {
+        heldNews_.add(news);
         return;
     }
-    if (!inABlock.isEmpty())
-        sayPayment(inABlock.size() == 1 ? trText(QStringLiteral("In a block: %1")).arg(named(inABlock.first()))
-                                        : trText(QStringLiteral("%1 payments got into a block")).arg(figures::formatCount(int(inABlock.size()))),
-                   int(Feedback::Type::Success));
+    sayNews(news);
+}
+
+void MainWindow::sayNews(const wallet::PaymentNews& news)
+{
+    if (news.isEmpty())
+        return;
+    const auto named = [this](const wallet::Payment& payment) { return namedOf(controller_, payment); };
+    const qsizetype all = news.gone.size() + news.noProof.size() + news.leftABlock.size() + news.wentBack.size() + news.listedAgain.size() + news.inABlock.size();
+    QString text;
+    if (all == 1) {
+        if (!news.gone.isEmpty())
+            text = trText(QStringLiteral("Replaced or dropped, so not paid: %1")).arg(named(news.gone.first()));
+        else if (!news.noProof.isEmpty())
+            text = trText(QStringLiteral("Could not be verified, so do not count it: %1")).arg(named(news.noProof.first()));
+        else if (!news.leftABlock.isEmpty())
+            text = trText(QStringLiteral("No longer confirmed: %1")).arg(named(news.leftABlock.first()));
+        else if (!news.wentBack.isEmpty())
+            text = trText(QStringLiteral("A balance went back down: %1. Check before counting on it")).arg(named(news.wentBack.first()));
+        else if (!news.listedAgain.isEmpty())
+            text = trText(QStringLiteral("Listed again, not confirmed yet: %1")).arg(named(news.listedAgain.first()));
+        else
+            text = trText(QStringLiteral("First confirmation: %1")).arg(named(news.inABlock.first()));
+    } else {
+        // What was counted on and will not come goes first: it is what someone has to act on.
+        QStringList parts;
+        const auto add = [&parts](const QList<wallet::Payment>& some, const QString& words) {
+            if (!some.isEmpty())
+                parts << trText(words).arg(figures::formatCount(int(some.size())));
+        };
+        add(news.gone, QStringLiteral("%1 not paid"));
+        add(news.noProof, QStringLiteral("%1 could not be verified"));
+        add(news.leftABlock, QStringLiteral("%1 no longer confirmed"));
+        add(news.wentBack, QStringLiteral("%1 balances went back down"));
+        add(news.listedAgain, QStringLiteral("%1 listed again"));
+        add(news.inABlock, QStringLiteral("%1 confirmed"));
+        text = trText(QStringLiteral("Payments: %1")).arg(parts.join(QStringLiteral(" · ")));
+    }
+    sayPayment(text, trText(QStringLiteral("News of a payment: see the bell")), int(news.worrying() ? Feedback::Type::Warning : Feedback::Type::Success));
 }
 
 void MainWindow::sayPaymentForTest(const QString& text)
 {
-    sayPayment(text, int(Feedback::Type::Info));
+    sayPayment(text, text, int(Feedback::Type::Info));
 }
 
 bool MainWindow::trayShown() const
@@ -735,13 +817,17 @@ bool MainWindow::trayShown() const
     return tray_ && tray_->isVisible();
 }
 
-void MainWindow::sayPayment(const QString& text, int feedbackType)
+void MainWindow::sayPayment(const QString& text, const QString& bare, int feedbackType)
 {
     lastPaymentAlert_ = text;
+    if (SettingsRepo().get(QStringLiteral("ui.paymentAlertsSound")) == QLatin1String("1"))
+        QApplication::beep();
     if (QGuiApplication::applicationState() == Qt::ApplicationActive) {
-        Feedback::show(this, Feedback::Type(feedbackType), text);
+        Feedback::show(this, Feedback::Type(feedbackType), text, kPaymentAlertMs);
         return;
     }
+    // Windows keeps what it is told, in its own list, whatever locks here later.
+    lastPaymentNotification_ = controller_->hasPassword() ? bare : text;
     if (SettingsRepo().get(QStringLiteral("ui.paymentAlertsWindows")) != QLatin1String("0") && QSystemTrayIcon::isSystemTrayAvailable()) {
         if (!tray_) {
             tray_ = new QSystemTrayIcon(QApplication::windowIcon(), this);
@@ -758,7 +844,7 @@ void MainWindow::sayPayment(const QString& text, int feedbackType)
             });
             tray_->show();
         }
-        tray_->showMessage(QStringLiteral("GitWallet"), text, QSystemTrayIcon::Information);
+        tray_->showMessage(QStringLiteral("GitWallet"), lastPaymentNotification_, QSystemTrayIcon::Information);
     }
     QApplication::alert(this); // the taskbar button says so too
 }
@@ -770,21 +856,26 @@ void MainWindow::lockNow()
     if (locked_ || !controller_->hasPassword())
         return;
     // What is open goes first, a seed being typed included: it must not stay on top of the lock. What
-    // will not close yet, a note that cannot be written, says why itself, and this asks again.
-    bool open = false;
+    // will not close, a note that cannot be written or work under way, goes out of sight all the same,
+    // and comes back with the unlock: the window locks, whatever is open. Only what open() runs comes
+    // to that, as hiding what exec() runs would end it.
     const QWidgetList windows = QApplication::topLevelWidgets();
     for (QWidget* widget : windows) {
-        if (auto* dialog = qobject_cast<QDialog*>(widget); dialog && dialog->isVisible()) {
-            dialog->done(QDialog::Rejected);
-            open = open || dialog->isVisible();
+        auto* dialog = qobject_cast<QDialog*>(widget);
+        if (!dialog || !dialog->isVisible())
+            continue;
+        if (auto* list = qobject_cast<PaymentsDialog*>(dialog))
+            list->closingForLock();
+        dialog->done(QDialog::Rejected);
+        if (dialog->isVisible()) {
+            dialog->hide();
+            const QPointer<QDialog> held(dialog);
+            heldDialogs_.append(held);
+            connect(dialog, &QDialog::finished, this, [this, held] { heldDialogs_.removeAll(held); });
         }
     }
     if (QWidget* popup = QApplication::activePopupWidget())
         popup->close();
-    if (open) {
-        QTimer::singleShot(1000, this, &MainWindow::lockNow);
-        return;
-    }
     showLocked();
 }
 
@@ -794,6 +885,8 @@ void MainWindow::showLocked()
         receive_->leaving();
     locked_ = true;
     idleCheck_->stop();
+    forgetOwnClipboard();
+    showIconOnly(true);
     bodyHost_->hide();
     title_->setUtilityButtonsVisible(false);
     lockPage_->reset();
@@ -802,9 +895,24 @@ void MainWindow::showLocked()
     refreshStatus();
 }
 
+void MainWindow::showIconOnly(bool iconOnly)
+{
+#ifdef Q_OS_WIN
+    // A window left minimized is not drawn again, and Windows goes on showing its last picture in the
+    // taskbar and in Alt+Tab, whatever it was on when it locked.
+    if (QGuiApplication::platformName() == QLatin1String("windows")) {
+        const BOOL value = iconOnly ? TRUE : FALSE;
+        DwmSetWindowAttribute(HWND(winId()), DWMWA_FORCE_ICONIC_REPRESENTATION, &value, sizeof value);
+    }
+#else
+    Q_UNUSED(iconOnly);
+#endif
+}
+
 void MainWindow::showUnlocked()
 {
     locked_ = false;
+    showIconOnly(false);
     lockPage_->reset();
     lockPage_->hide();
     bodyHost_->show();
@@ -812,6 +920,13 @@ void MainWindow::showUnlocked()
     idleClock_.restart();
     afterPasswordChange();
     refreshStatus();
+    const QList<QPointer<QDialog>> held = std::exchange(heldDialogs_, {});
+    for (const QPointer<QDialog>& dialog : held) {
+        if (dialog)
+            dialog->open();
+    }
+    sayNews(std::exchange(heldNews_, {}));
+    emit unlocked();
 }
 
 void MainWindow::tryUnlock(const QString& password)
@@ -829,9 +944,7 @@ void MainWindow::tryUnlock(const QString& password)
         controller_->openWithPassword(password, this, finish);
         return;
     }
-    controller_->checkPassword(password, this, [finish](bool right) {
-        finish(right ? QString() : trText(QStringLiteral("That is not the password.")));
-    });
+    controller_->checkPassword(password, this, finish);
 }
 
 void MainWindow::forgotPassword()

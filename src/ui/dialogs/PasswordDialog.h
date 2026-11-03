@@ -28,15 +28,21 @@ public:
     struct Filled {
         QString current;
         QString fresh;
-        bool deleteOldFiles = false;
+        bool deleteFormatCopies = false;
+        bool deleteUnreadFiles = false;
     };
+    // Older wallet files kept beside this one, which a password does not reach.
+    struct OldFiles {
+        int formatCopies = 0; // this wallet from before a new format: they open its database too
+        int unread = 0;       // could not be read when put aside: they may hold other wallets
+    };
+    static constexpr int kMostChars = 1024;
     // `done` is called with an empty string when the work has gone well, and the dialog then closes;
     // otherwise it says why, and the dialog stays.
     using Finish = std::function<void(const QString& error)>;
     using Work = std::function<void(const Filled& filled, const Finish& finish)>;
 
-    // `oldFiles`: older wallet files kept beside this one, which a password would not reach.
-    PasswordDialog(Mode mode, int oldFiles, const QString& about, const Work& work, QWidget* parent = nullptr);
+    PasswordDialog(Mode mode, const OldFiles& oldFiles, const QString& about, const Work& work, QWidget* parent = nullptr);
     ~PasswordDialog() override;
 
     void done(int result) override;
@@ -44,7 +50,7 @@ public:
 private:
     void updateState();
     void go();
-    QLineEdit* addField(const QString& title, const char* name);
+    QLineEdit* addField(const QString& title, const char* name, bool newOne = false);
 
     Mode mode_;
     Work work_;
@@ -52,7 +58,8 @@ private:
     QLineEdit* fresh_ = nullptr;
     QLineEdit* repeat_ = nullptr;
     QCheckBox* understood_ = nullptr;
-    QCheckBox* deleteOld_ = nullptr;
+    QCheckBox* deleteCopies_ = nullptr;
+    QCheckBox* deleteUnread_ = nullptr;
     QLabel* status_ = nullptr;
     QPushButton* ok_ = nullptr;
     QPushButton* cancel_ = nullptr;

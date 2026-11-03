@@ -63,7 +63,6 @@ constexpr int kMaxWalletRows = UtxoScanner::kMaxFollowedRows;
 // The end of a chain's indices. Only a gap window larger than the row limit (a
 // caller other than the controller) gets near it; well below 2^31, where
 // non-hardened BIP32 indices end.
-constexpr int kMaxChainRows = 100000;
 
 // Failed requests (a refused subscription, a failed balance) go out again
 // after this delay, doubling per round: a server busy for a moment is asked
@@ -693,6 +692,12 @@ bool UtxoScanner::answered() const
     // this scan does follow has answered all the same.
     return running_ && !deriveScheduled_ && checked_ >= tracked_.size() && subQueue_.isEmpty() && readQueue_.isEmpty()
            && subSent_ == 0 && retry_.isEmpty() && balanceQueue_.isEmpty() && balanceSent_ == 0 && balanceRetry_.isEmpty();
+}
+
+bool UtxoScanner::rowAnswered(const AddressRow& row) const
+{
+    const auto it = tracked_.constFind(row.scripthash);
+    return it != tracked_.cend() && it->confirmed;
 }
 
 QDateTime UtxoScanner::balancesAt() const

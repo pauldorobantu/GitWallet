@@ -21,8 +21,9 @@ public:
     enum class Type { Success, Warning, Error, Info };
 
     // `context`: orice widget din fereastra în care s-a făcut acțiunea (sau null
-    // → fereastra activă).
-    static void show(QWidget* context, Type type, const QString& message);
+    // → fereastra activă). `holdMs`: above 0, nobody's click caused it and someone has to read it:
+    // it stays that long, under the bell, with no pulse.
+    static void show(QWidget* context, Type type, const QString& message, int holdMs = 0);
 
     // Standard outcome of a single-row action (delete / restore / toggle):
     // Ok → Success `doneMessage`; NotFound → Info "<subject> was already

@@ -141,6 +141,30 @@ bool Scheduler::allAnswered() const
     });
 }
 
+QList<Network> Scheduler::answeredNetworks() const
+{
+    QList<Network> out;
+    if (!running_)
+        return out;
+    for (const ChainScanner* s : scanners_) {
+        if (s->hasAccounts() && s->answered())
+            out.append(s->network());
+    }
+    return out;
+}
+
+bool Scheduler::rowAnswered(const AddressRow& row) const
+{
+    const auto scanner = std::find_if(scanners_.cbegin(), scanners_.cend(), [&row](const ChainScanner* s) { return s->network() == row.network; });
+    return scanner != scanners_.cend() && (*scanner)->rowAnswered(row);
+}
+
+qint64 Scheduler::plannedPassMs(Network network) const
+{
+    const auto scanner = std::find_if(scanners_.cbegin(), scanners_.cend(), [network](const ChainScanner* s) { return s->network() == network; });
+    return scanner != scanners_.cend() ? (*scanner)->plannedPassMs() : 0;
+}
+
 bool Scheduler::hasWork() const
 {
     return std::any_of(scanners_.cbegin(), scanners_.cend(), [](const ChainScanner* s) { return s->hasAccounts(); });

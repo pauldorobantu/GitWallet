@@ -115,7 +115,11 @@ public:
     // What came in, as the window was told: the file keeps the latest `kept`.
     bool savePayment(const wallet::Payment& payment, int kept, QString* why);
     bool setPaymentsRead(qint64 upTo, QString* why);
+    bool deletePayment(qint64 id, QString* why);
     QList<wallet::Payment> loadPayments(QString* why);
+    // What the list of payments keeps of itself: an empty value takes a name away.
+    bool savePaymentState(const QHash<QString, QString>& changes, QString* why);
+    QHash<QString, QString> loadPaymentState(QString* why);
 
     // Whatever can still be read of labels and notes in a file set aside, which stays as it is.
     static SavedLabels salvageLabels(const QString& path, const QByteArray& key);

@@ -24,11 +24,12 @@ constexpr int kPillH = 26;      // înălțimea pastilei
 constexpr int kPillPadX = 10;   // padding orizontal în pastilă
 constexpr int kIconD = 14;      // diametrul discului cu icon
 constexpr int kGap = 7;         // icon → text
-constexpr int kTextMaxW = 300;  // textul lung se elidează
+constexpr int kTextMaxW = 560;  // textul lung se elidează
 constexpr int kOffsetX = 14;    // pastila: la dreapta-jos de vârful cursorului
 constexpr int kOffsetY = 16;
 constexpr int kMargin = 8;      // distanța minimă față de marginile ferestrei
 constexpr int kShadow = 6;      // loc pt umbra pastilei
+constexpr int kUnderTheBell = 44;
 
 QColor statusColor(Feedback::Type type)
 {
@@ -46,10 +47,11 @@ QColor statusColor(Feedback::Type type)
 class FeedbackWidget : public QWidget
 {
 public:
-    FeedbackWidget(QWidget* window, Feedback::Type type, const QString& message)
+    FeedbackWidget(QWidget* window, Feedback::Type type, const QString& message, int holdMs)
         : QWidget(window)
         , type_(type)
         , color_(statusColor(type))
+        , pulse_(holdMs <= 0)
     {
         setAttribute(Qt::WA_TransparentForMouseEvents, true);
         setAttribute(Qt::WA_NoSystemBackground, true);
@@ -57,7 +59,8 @@ public:
 
         font_ = window->font();
         const QFontMetrics fm(font_);
-        text_ = fm.elidedText(message.simplified(), Qt::ElideMiddle, kTextMaxW);
+        const int textRoom = qMin(kTextMaxW, window->width() - 2 * kMargin - 2 * kPillPadX - kIconD - kGap);
+        text_ = fm.elidedText(message.simplified(), Qt::ElideMiddle, textRoom);
         const int pillW = kPillPadX + kIconD + kGap + fm.horizontalAdvance(text_) + kPillPadX;
 
         // Vârful cursorului, în coordonatele ferestrei (limitat la fereastră).
@@ -73,9 +76,13 @@ public:
             pill.moveBottom(tip.y() - kOffsetY / 2);
         pill.moveLeft(qMax(kMargin, pill.left()));
         pill.moveTop(qMax(kMargin, pill.top()));
+        if (!pulse_) {
+            pill.moveTopRight(QPoint(window->width() - kMargin, kUnderTheBell));
+            tip = pill.center();
+        }
 
         const QRect ring(tip - QPoint(kRingMax, kRingMax), QSize(2 * kRingMax, 2 * kRingMax));
-        const QRect area = ring.united(pill.adjusted(-kShadow, -kShadow, kShadow, kShadow + 2));
+        const QRect area = (pulse_ ? ring : pill).united(pill.adjusted(-kShadow, -kShadow, kShadow, kShadow + 2));
         setGeometry(area);
         tip_ = tip - area.topLeft();
         pill_ = pill.translated(-area.topLeft());
@@ -84,7 +91,7 @@ public:
         // Erorile/avertismentele stau mai mult (trebuie citite); confirmările scurt.
         const bool important =
             type == Feedback::Type::Error || type == Feedback::Type::Warning;
-        const int total = important ? 2600 : 1400;
+        const int total = holdMs > 0 ? holdMs : important ? 2600 : 1400;
         total_ = total;
 
         raise();
@@ -113,7 +120,7 @@ protected:
         auto* tm = theme::ThemeManager::instance();
 
         // ---- Pulsul (doar cu animații): un inel care se lărgește și se stinge ----
-        if (animated_ && elapsed_ < 420.0) {
+        if (pulse_ && animated_ && elapsed_ < 420.0) {
             const qreal t = elapsed_ / 420.0;                 // 0 → 1
             const qreal ease = 1.0 - (1.0 - t) * (1.0 - t);   // out-quad
             const qreal r = 4.0 + (kRingMax - 5.0) * ease;
@@ -207,6 +214,7 @@ private:
     QString text_;
     QPoint tip_;
     QRect pill_;
+    bool pulse_ = true;
     bool animated_ = false;
     qreal elapsed_ = 0.0;
     qreal total_ = 1.0;
@@ -214,7 +222,7 @@ private:
 
 } // namespace
 
-void Feedback::show(QWidget* context, Type type, const QString& message)
+void Feedback::show(QWidget* context, Type type, const QString& message, int holdMs)
 {
     // Every failure shown to the user also lands in the log (Logs page / file):
     // the pill fades in seconds, the diagnostic trail must not. Local only: the
@@ -231,7 +239,7 @@ void Feedback::show(QWidget* context, Type type, const QString& message)
     static QPointer<FeedbackWidget> current;
     if (current)
         current->deleteLater();
-    current = new FeedbackWidget(window, type, message);
+    current = new FeedbackWidget(window, type, message, holdMs);
 }
 
 bool Feedback::showRowResult(QWidget* context, db::RowResult result,

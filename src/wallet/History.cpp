@@ -217,6 +217,7 @@ void HistoryBook::noteOutput(int position, int outputAt)
         addEffect(*it, address, 0, output.value);
         updateFee(*it);
         touch(*it);
+        emit spendFound(*it);
     }
 }
 
@@ -501,6 +502,7 @@ void HistoryBook::setStatus(const QString& scripthash, const QString& status)
     statuses_.insert(scripthash, status);
     dirtyAddresses_.insert(scripthash);
     removedAddresses_.remove(scripthash);
+    emit statusSet(scripthash);
     emit changed();
 }
 

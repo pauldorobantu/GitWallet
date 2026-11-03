@@ -1,5 +1,7 @@
 #include "ui/pages/LockPage.h"
 
+#include "ui/dialogs/PasswordDialog.h"
+
 #include "ui/AppIcon.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
@@ -57,6 +59,7 @@ LockPage::LockPage(QWidget* parent) : QWidget(parent)
     field_->setPlaceholderText(QStringLiteral("Password"));
     field_->setAccessibleName(QStringLiteral("Password"));
     field_->setFixedWidth(kFieldWidth);
+    field_->setMaxLength(PasswordDialog::kMostChars);
     root->addWidget(field_, 0, Qt::AlignHCenter);
     root->addSpacing(page::kFormVSpacing);
 

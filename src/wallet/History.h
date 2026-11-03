@@ -210,6 +210,8 @@ public:
 signals:
     void changed(); // lines of the table may have moved; comes as often as things do
     void added(int position); // a transaction not here before came off the wire, not off the database
+    void spendFound(int position); // a transaction here turned out to spend one of the wallets' coins
+    void statusSet(const QString& scripthash); // its history is complete up to a status
     void cleared();
     void positionsAboutToMove(); // still as they were
     void positionsMoved(); // what was at a position may be gone: nobody goes by one kept from before
