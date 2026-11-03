@@ -223,9 +223,11 @@ public:
         beginFilterChange();
         anyHolds_ = false;
         anyWatched_ = false;
+        anyDust_ = false;
         const QAbstractItemModel* source = sourceModel();
         for (int row = 0; source && row < source->rowCount(); ++row) {
             anyHolds_ = anyHolds_ || holdsEnough(source->index(row, 0));
+            anyDust_ = anyDust_ || source->index(row, 0).data(kDustRole).toBool();
             anyWatched_ = anyWatched_ || source->index(row, 0).data(kWatchedRole).toBool();
         }
         endFilterChange(Direction::Rows);
@@ -240,10 +242,14 @@ protected:
         const QModelIndex first = source->index(row, 0, parent);
         if (holdsEnough(first))
             return true;
-        if (!hide_ && !(hideDust_ && first.data(kDustRole).toBool()))
+        const bool dust = hideDust_ && first.data(kDustRole).toBool();
+        if (!hide_ && !dust)
             return true;
         if (anyHolds_)
             return false;
+        // All there is being dust, a page of it says more than a page of nothing.
+        if (hideDust_ && anyDust_)
+            return dust;
         return first.data(kWatchedRole).toBool() || !anyWatched_;
     }
 
@@ -257,6 +263,7 @@ private:
     bool hideDust_ = false;
     bool anyHolds_ = false;
     bool anyWatched_ = false;
+    bool anyDust_ = false;
 };
 
 // A mark and two lines of text in one cell.

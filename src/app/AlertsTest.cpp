@@ -441,6 +441,44 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     check(controller->removeAllWallets(&error), QStringLiteral("it goes: %1").arg(error));
 }
 
+// All a wallet holds being dust, its dust stays on the page and what holds nothing still goes.
+void testOnlyDust(const Check& check, const QList<wallet::AccountKey>& keys)
+{
+    QString error;
+    Scene scene;
+    if (!makeScene(&scene, keys, check))
+        return;
+    wallet::AddressRow row = scene.model->at(scene.ethRowOf(1));
+    row.setBalance(wallet::networkInfo(scene.ethereum).coin, chain::Amount::fromU64(1000));
+    row.checked = true;
+    row.used = true;
+    scene.model->upsert(row);
+    scene.window->showPage(QStringLiteral("portfolio"));
+    auto* portfolio = scene.window->findChild<ui::PortfolioPage*>();
+    QTableView* coins = portfolio->table()->view();
+    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
+    portfolio->findChild<QCheckBox*>(QStringLiteral("hideDust"))->setChecked(true);
+    const wallet::Asset eth = wallet::networkInfo(scene.ethereum).coin;
+    check(waitFor([&] {
+              answerAll(scene.model, scene.shop);
+              pause(50);
+              return ui::holdingOf(scene.controller, eth).complete;
+          }, 8000), QStringLiteral("every row has answered"));
+    pause(450);
+    const auto names = [&] {
+        QStringList out;
+        for (int line = 0; line < coins->model()->rowCount(); ++line)
+            out << coins->model()->index(line, 0).data().toString();
+        return out;
+    };
+    check(names() == QStringList{QStringLiteral("Ethereum")}, QStringLiteral("all there is being dust, it stays, and what holds nothing goes: %1").arg(names().join(QStringLiteral(", "))));
+    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(false);
+    pause(100);
+    check(names().size() == coins->model()->rowCount() && names().contains(QStringLiteral("Bitcoin")) && names().contains(QStringLiteral("Ethereum")), QStringLiteral("with zeros shown, those too: %1").arg(names().join(QStringLiteral(", "))));
+    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
+    check(scene.controller->removeAllWallets(&error), QStringLiteral("it goes: %1").arg(error));
+}
+
 void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
 {
     QString error;
@@ -861,6 +899,7 @@ bool checkTrayAlert(const QString& file)
 void runAlertsTest(const Check& check, const QList<wallet::AccountKey>& someKeys)
 {
     testDust(check, someKeys);
+    testOnlyDust(check, someKeys);
     testPayments(check, someKeys);
 }
 
