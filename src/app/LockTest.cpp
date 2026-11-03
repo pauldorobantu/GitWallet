@@ -881,7 +881,8 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
             second = came;
             over = true;
         });
-        check(waitFor([&] { return over; }, 30000) && second.error.isEmpty() && second.walletsAdded == 0 && shown.controller->store().wallets.size() == 3, QStringLiteral("a wallet known only by such a key is not added again: %1 added, %2 wallets").arg(second.walletsAdded).arg(shown.controller->store().wallets.size()));
+        check(waitFor([&] { return over; }, 30000) && second.error.isEmpty() && second.walletsAdded == 0 && second.walletsHere == 2 && second.walletsRefused == 0 && shown.controller->store().wallets.size() == 3,
+              QStringLiteral("a wallet known only by such a key is known as here: %1 added, %2 here, %3 refused, %4 wallets").arg(second.walletsAdded).arg(second.walletsHere).arg(second.walletsRefused).arg(shown.controller->store().wallets.size()));
         check(waitFor([&] { QString why; return shown.controller->removeAllWallets(&why); }, 15000), QStringLiteral("all removed"));
     }
 
