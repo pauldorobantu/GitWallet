@@ -378,15 +378,15 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     // One address was asked for by name.
     ui::Place place;
     place.root = ui::Place::Root::Addresses;
-    place.address = model->at(scene.ethRowOf(3));
+    place.address = model->at(scene.ethRowOf(2)); // dust of its coin, beside more of a token
     scene.window->goTo(place, ui::Place::Tab::Holdings);
     pause(450);
     ui::HoldingsPage* holdingsPage = scene.window->findChild<ui::HoldingsPage*>();
     QTableView* assets = holdingsPage->table()->view();
-    bool usdcShown = false;
+    bool dustShown = false;
     for (int row = 0; row < assets->model()->rowCount(); ++row)
-        usdcShown = usdcShown || assets->model()->index(row, 0).data().toString() == QLatin1String("USD Coin");
-    check(usdcShown, QStringLiteral("the page of one address shows its dust"));
+        dustShown = dustShown || assets->model()->index(row, 0).data().toString() == QLatin1String("Ethereum");
+    check(dustShown, QStringLiteral("the page of one address shows its dust"));
     scene.window->showPage(QStringLiteral("history"));
 
     // The history.
@@ -597,6 +597,24 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         check(waitFor([&] { return told.size() == 3; }, 3000), QStringLiteral("a burst is told"));
         check(scene.window->lastPaymentAlert().contains(QStringLiteral("3 payments came in")) && scene.window->lastPaymentAlert().contains(QStringLiteral("$30.00")), QStringLiteral("as one: %1").arg(scene.window->lastPaymentAlert()));
 
+        // What was dropped goes from the history in time, and a server can list it again.
+        pause(50);
+        const int toldBefore = scene.payments();
+        scene.paid(17, QStringLiteral("x1"), 0, 40000);
+        const chain::Transaction listedAgain = transaction({somewhere(30)}, {{scene.scriptOf(17), 40000}}, 30);
+        const int listedAt = scene.add(listedAgain);
+        check(scene.payments() == toldBefore + 1, QStringLiteral("(one told of)"));
+        scene.book->markGone(listedAt);
+        scene.book->forgetGoneBefore(QDateTime::currentSecsSinceEpoch() + 10);
+        check(scene.book->find(listedAgain.txid) < 0, QStringLiteral("(gone from the history)"));
+        scene.book->setStatus(model->at(scene.rowOf(17)).scripthash, QStringLiteral("x1"));
+        scene.paid(17, QStringLiteral("x2"), 0, 40000);
+        const int listedBack = scene.add(listedAgain);
+        check(scene.book->find(listedAgain.txid) >= 0 && scene.payments() == toldBefore + 1, QStringLiteral("what was told of and comes back is not told again"));
+        scene.book->markGone(listedBack);
+        scene.book->forgetGoneBefore(QDateTime::currentSecsSinceEpoch() + 10);
+        pause(50);
+
         // At the start, with the saved figures still being checked.
         controller->setShowingSavedForTest(true);
         setToken(7, 10000000);
@@ -679,12 +697,13 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
         QObject::connect(payments, &wallet::PaymentBook::told, payments, [&told2](const QList<wallet::Payment>& some) { told2.append(some); });
         pause(50);
         check(told2.isEmpty(), QStringLiteral("and none is told again"));
-        // A server telling of it once more, after a start, on an address that moved.
-        wallet::AddressRow row = scene.model->at(scene.rowOf(1));
-        row.status = QStringLiteral("s9");
-        scene.model->upsert(row);
-        scene.add(transaction({somewhere(1)}, {{scene.scriptOf(1), 50000}}, 1));
-        check(scene.payments() == count, QStringLiteral("nor counted twice"));
+        // Told of before this start, gone from the history since, and listed again.
+        const chain::Transaction listedAgain = transaction({somewhere(30)}, {{scene.scriptOf(17), 40000}}, 30);
+        check(scene.book->find(listedAgain.txid) < 0, QStringLiteral("(not in the history)"));
+        scene.book->setStatus(scene.model->at(scene.rowOf(17)).scripthash, scene.model->at(scene.rowOf(17)).status);
+        scene.paid(17, QStringLiteral("x3"), 0, 40000);
+        scene.add(listedAgain);
+        check(scene.book->find(listedAgain.txid) >= 0 && scene.payments() == count, QStringLiteral("nor counted twice"));
 
         // The latest so many stay.
         QList<wallet::Payment> many;

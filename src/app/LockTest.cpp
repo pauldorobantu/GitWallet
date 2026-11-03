@@ -429,7 +429,9 @@ void testLockInTheWindow(const Check& check, const QList<wallet::AccountKey>& ke
         check(shown.statusLine().contains(QLatin1String("not the password")), QStringLiteral("and says so: %1").arg(shown.statusLine()));
         shown.type(QString::fromLatin1(kPassword));
         check(waitFor([&] { return !shown.window->isLocked(); }, 10000), QStringLiteral("the right one opens it"));
-        check(shown.controller->hasWallet() && shown.controller->store().wallets.first().label == QLatin1String("Shop renamed"), QStringLiteral("with what was saved under it"));
+        check(shown.controller->hasWallet() && shown.controller->store().wallets.value(0).label == QLatin1String("Shop renamed"), QStringLiteral("with what was saved under it"));
+        if (!shown.controller->hasWallet())
+            return;
         check(shown.controller->lockMinutes() == 5, QStringLiteral("how long it waits to lock"));
         const quint32 shop = shown.controller->store().wallets.first().id;
         check(shown.controller->store().wallets.first().accounts.first().given.contains(4), QStringLiteral("and what was given out"));
@@ -544,6 +546,27 @@ void testOlderFile(const Check& check, const QList<wallet::AccountKey>& keys)
 
 void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
 {
+    {
+        wallet::GivenOut mine;
+        mine.add(1);
+        mine.add(2);
+        mine.add(10);
+        wallet::GivenOut other;
+        other.add(2);
+        other.add(3);
+        other.add(20);
+        mine.merge(other);
+        check(mine.runs.size() == 3 && mine.count() == 5 && mine.contains(3) && mine.contains(10) && mine.contains(20) && !mine.contains(4), QStringLiteral("what two lists gave out, joined, is all of each, in runs"));
+        wallet::GivenOut touching;
+        touching.add(4);
+        mine.merge(touching);
+        check(mine.runs.size() == 3 && mine.count() == 6 && mine.runs.first().to == 5, QStringLiteral("what touches a run joins it"));
+        mine.merge({});
+        check(mine.count() == 6, QStringLiteral("and nothing adds nothing"));
+        wallet::GivenOut none;
+        none.merge(mine);
+        check(none.count() == 6 && none.runs.size() == 3, QStringLiteral("into nothing it is all of it"));
+    }
     QString error;
     QTemporaryDir folder;
     const QString path = folder.filePath(QStringLiteral("a.gwbackup"));
@@ -603,6 +626,22 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         check(wallet::seal::open(wallet::seal::makeKey(wallet::seal::passwordBytes(QString::fromLatin1(kPassword)), cost), sealed, &plain), QStringLiteral("(it opens)"));
         check(plain.contains(xpub.toLatin1()) && plain.contains("A till by the door") && plain.contains("Refund"), QStringLiteral("what it holds is all there"));
         check(!shown.controller->store().databaseKey.isEmpty() && !plain.contains(shown.controller->store().databaseKey.toHex()), QStringLiteral("but for the key of this PC's database"));
+
+        // Through the page, as anyone would.
+        const QString viaPage = folder.filePath(QStringLiteral("page.gwbackup"));
+        settingsPage->makeBackupAt(viaPage);
+        auto* asking = settingsPage->findChild<ui::PasswordDialog*>();
+        check(asking && asking->isVisible(), QStringLiteral("a backup asks for a password of its own"));
+        if (asking) {
+            auto* ok = asking->findChild<QPushButton*>(QStringLiteral("primaryButton"));
+            asking->findChild<QLineEdit*>(QStringLiteral("passwordNew"))->setText(QString::fromLatin1(kOtherPassword));
+            asking->findChild<QLineEdit*>(QStringLiteral("passwordRepeat"))->setText(QString::fromLatin1(kOtherPassword));
+            check(!ok->isEnabled(), QStringLiteral("and that nobody can get it back be understood"));
+            asking->findChild<QCheckBox*>(QStringLiteral("passwordUnderstood"))->setChecked(true);
+            check(ok->isEnabled(), QStringLiteral("then it can be made"));
+            ok->click();
+            check(waitFor([&] { return QFile::exists(viaPage) && !asking->isVisible(); }, 15000), QStringLiteral("it is there, and the dialog goes"));
+        }
 
         // A second wallet after it: the page says the backup does not hold it.
         const QList<wallet::AccountKey> otherKeys = wallet::WalletStore::deriveAccounts(chain::bip39::split("legal winner thank year wave sausage worth useful legal winner thank yellow"), {});
@@ -700,6 +739,8 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         if (box)
             box->done(0);
         check(shown.controller->hasWallet() && shown.controller->store().wallets.size() == 1, QStringLiteral("the wallet is back"));
+        if (!shown.controller->hasWallet())
+            return;
         const wallet::WalletEntry& entry = shown.controller->store().wallets.first();
         check(entry.label == QLatin1String("Shop") && entry.fromKeys && entry.accounts.size() == added.size(), QStringLiteral("named and made as it was"));
         const auto own = std::find_if(entry.accounts.cbegin(), entry.accounts.cend(), [&](const wallet::AccountKey& key) { return key.type == btc.type; });
@@ -739,6 +780,14 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
         secret.address = knownAddress + QStringLiteral("x");
         secret.label = QStringLiteral("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
         edited.insert(QStringLiteral("labels"), edited.value(QStringLiteral("labels")).toString() + QString::fromUtf8(wallet::writeLabelLine(secret)));
+        // A wallet of a key some later version made, which this one can only keep.
+        QJsonObject editedStore = edited.value(QStringLiteral("store")).toObject();
+        QJsonArray editedWallets = editedStore.value(QStringLiteral("wallets")).toArray();
+        editedWallets.append(QJsonObject{{QStringLiteral("id"), 77},
+                                         {QStringLiteral("label"), QStringLiteral("Later kind")},
+                                         {QStringLiteral("accounts"), QJsonArray{QJsonObject{{QStringLiteral("type"), QStringLiteral("something-later")}, {QStringLiteral("account"), 0}, {QStringLiteral("xpub"), QStringLiteral("a key of that kind")}}}}});
+        editedStore.insert(QStringLiteral("wallets"), editedWallets);
+        edited.insert(QStringLiteral("store"), editedStore);
         const wallet::seal::Cost cost = wallet::seal::newCost();
         const QJsonObject resealed = wallet::seal::lock(wallet::seal::makeKey(wallet::seal::passwordBytes(QString::fromLatin1(kPassword)), cost), cost, QJsonDocument(edited).toJson(QJsonDocument::Compact), QStringLiteral("gitwallet-backup"));
         const QString editedPath = folder.filePath(QStringLiteral("edited.gwbackup"));
@@ -754,8 +803,9 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
             over = true;
         });
         check(waitFor([&] { return over; }, 30000) && report.error.isEmpty(), QStringLiteral("a backup goes in under an app password: %1").arg(report.error));
-        check(report.walletsAdded == 1 && shown.controller->store().wallets.size() == 2, QStringLiteral("beside what is here"));
-        check(shown.controller->store().wallets.at(1).label == QLatin1String("Shop 1"), QStringLiteral("under a name of its own: %1").arg(shown.controller->store().wallets.at(1).label));
+        check(report.walletsAdded == 2 && shown.controller->store().wallets.size() == 3, QStringLiteral("beside what is here"));
+        check(shown.controller->store().wallets.value(1).label == QLatin1String("Shop 1"), QStringLiteral("under a name of its own: %1").arg(shown.controller->store().wallets.value(1).label));
+        check(shown.controller->store().wallets.value(2).label == QLatin1String("Later kind") && shown.controller->store().wallets.value(2).keptAccounts.size() == 1, QStringLiteral("and a key of a kind this version does not read stays with its wallet"));
         check(report.labelsLeftOut == 1 && shown.controller->addressLabel(secret.address).isEmpty(), QStringLiteral("seed words in a label stay out, whatever file they came in"));
         check(report.labels == 2, QStringLiteral("and the rest goes in: %1").arg(report.labels));
         check(wallet::WalletStore::readRawForTest(&error).contains("gitwallet-sealed") && shown.controller->hasPassword(), QStringLiteral("what it wrote is under the app's password"));
