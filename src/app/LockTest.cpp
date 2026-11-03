@@ -185,8 +185,8 @@ void testSeal(const Check& check, QString* report)
     inKdf(greedy, "passes", 1000000);
     check(!costOf(greedy, &asked), QStringLiteral("so are more passes"));
     greedy = sealed;
-    inKdf(greedy, "memoryKib", 4.0 * 1024 * 1024);
-    inKdf(greedy, "passes", 64);
+    inKdf(greedy, "memoryKib", 2.0 * 1024 * 1024);
+    inKdf(greedy, "passes", 17);
     check(!costOf(greedy, &asked), QStringLiteral("and a cost that would hold the window for minutes, with no way out"));
     greedy = sealed;
     inKdf(greedy, "lanes", 0);
@@ -954,14 +954,16 @@ void testBackup(const Check& check, const QList<wallet::AccountKey>& keys)
             QJsonObject first = wallets.at(0).toObject();
             QJsonArray accounts = first.value(QStringLiteral("accounts")).toArray();
             QJsonObject account = accounts.at(0).toObject();
-            account.insert(QStringLiteral("given"), QJsonArray{QJsonArray{0, 2147483647}});
+            QJsonArray runs;
+            runs.append(QJsonArray{0, wallet::kMaxChainRows + 1});
+            account.insert(QStringLiteral("given"), runs);
             accounts.replace(0, account);
             first.insert(QStringLiteral("accounts"), accounts);
             wallets.replace(0, first);
             store.insert(QStringLiteral("wallets"), wallets);
         });
         const WalletController::RestoreReport refused = restoring(shown.controller, shown.window.get(), tooMany);
-        check(refused.error.contains(QLatin1String("damaged")) && !shown.controller->hasWallet(), QStringLiteral("two billion addresses given out read as damaged: %1").arg(refused.error));
+        check(refused.error.contains(QLatin1String("given out")) && !shown.controller->hasWallet(), QStringLiteral("more addresses given out than a wallet can have read as damaged: %1").arg(refused.error));
 
         // A name that is seed words: the wallet goes in, under another.
         const QList<wallet::AccountKey> thirdKeys = wallet::WalletStore::deriveAccounts(chain::bip39::split("letter advice cage absurd amount doctor acoustic avoid letter advice cage above"), {});
