@@ -8,6 +8,7 @@
 #include "ui/MainWindow.h"
 #include "ui/PlaceBar.h"
 #include "ui/TitleBar.h"
+#include "ui/design/Style.h"
 #include "ui/dialogs/PaymentsDialog.h"
 #include "ui/pages/LockPage.h"
 #include "wallet/Seal.h"
@@ -483,6 +484,19 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     scene.book->setProven(dustLine, true);
     lines->rebuildNow();
     check(lines->receivedShown() >= 500 && !shownLine(dustLine), QStringLiteral("what the lines came to counts it, hidden or not: %1").arg(lines->receivedShown()));
+    // Green is for money that came and is believed: what can still be replaced does not read as paid.
+    const auto amountIsGreen = [&](int position) {
+        for (int row = 0; row < lines->rowCount(); ++row) {
+            if (lines->lineAt(row)->position == position)
+                return lines->index(row, ui::HistoryTableModel::ColAmount).data(Qt::ForegroundRole) == QVariant(ui::toneColor(ui::Tone::Success));
+        }
+        return false;
+    };
+    check(!amountIsGreen(bigLine), QStringLiteral("what is only coming in is not green"));
+    scene.book->setHeight(bigLine, dustTip);
+    scene.book->setProven(bigLine, true);
+    lines->rebuildNow();
+    check(amountIsGreen(bigLine), QStringLiteral("once proven in a block it is"));
     // A label on its address says it was meant.
     const QString sixAddress = model->at(scene.rowOf(6)).address;
     check(controller->setAddressLabel(sixAddress, QStringLiteral("Meant"), &error), QStringLiteral("(a label: %1)").arg(error));
