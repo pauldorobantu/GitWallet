@@ -258,7 +258,7 @@ ReceivePage::ReceivePage(WalletController* controller, QWidget* parent) : QWidge
     card->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
     column->addWidget(card);
 
-    ui_->listTitle = new QLabel(QStringLiteral("Given out so far"), ui_->body);
+    ui_->listTitle = new QLabel(QStringLiteral("Addresses you gave out"), ui_->body);
     ui_->listTitle->setObjectName(QStringLiteral("sectionTitle"));
     column->addWidget(ui_->listTitle);
     auto* list = new HoverRowTableWidget(ui_->body);
@@ -771,8 +771,8 @@ void ReceivePage::updateList()
     ui_->list->setVisible(!rows.isEmpty());
     ui_->listTitle->setVisible(!rows.isEmpty());
     const int givenAll = controller_->givenOutCount(ui_->wallet->currentData().toUInt(), chosenNetwork(), chosenType());
-    ui_->listTitle->setText(givenAll > rows.size() ? trText(QStringLiteral("Given out: the latest %1 of %2")).arg(figures::formatCount(int(rows.size())), figures::formatCount(givenAll))
-                                                   : trText(QStringLiteral("Given out so far")));
+    ui_->listTitle->setText(givenAll > rows.size() ? trText(QStringLiteral("Addresses you gave out: the latest %1 of %2")).arg(figures::formatCount(int(rows.size())), figures::formatCount(givenAll))
+                                                   : trText(QStringLiteral("Addresses you gave out")));
     const bool saved = controller_->showingSaved();
     QString since;
     const bool stale = notCurrent(chosenNetwork(), &since);
@@ -827,7 +827,7 @@ void ReceivePage::updateList()
             state = since.isEmpty() ? trText(QStringLiteral("No server answering")) : trText(QStringLiteral("As of %1")).arg(since);
             tone = Tone::Warning;
         } else if (row.isUtxo() && row.unconfirmed > 0) {
-            state = trText(QStringLiteral("Not in a block yet"));
+            state = trText(QStringLiteral("Pending"));
             tone = Tone::Warning;
         } else if (row.state() == wallet::AddressState::Funded) {
             state = trText(QStringLiteral("Received"));

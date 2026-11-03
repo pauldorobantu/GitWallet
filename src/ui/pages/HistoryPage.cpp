@@ -20,6 +20,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDate>
@@ -124,7 +125,9 @@ struct HistoryPage::Ui : QObject
     QComboBox* type = nullptr;
     QComboBox* state = nullptr;
     QComboBox* period = nullptr;
-    QCheckBox* hideDust = nullptr;
+    QAction* hideDust = nullptr;
+    page::ColumnChoice* columns = nullptr;
+    QLabel* statusProblem = nullptr; // what is not as it should be, apart from what is under way
     QLabel* count = nullptr;
     QPushButton* details = nullptr;
     QPushButton* exportCsv = nullptr;
@@ -173,8 +176,16 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->status = new QLabel(this);
     ui_->status->setObjectName(QStringLiteral("historyStatus"));
     ui_->status->setTextFormat(Qt::PlainText);
+    ui_->status->setWordWrap(true);
     setTone(ui_->status, Tone::Muted);
     root->addWidget(ui_->status);
+    ui_->statusProblem = new QLabel(this);
+    ui_->statusProblem->setObjectName(QStringLiteral("historyProblem"));
+    ui_->statusProblem->setTextFormat(Qt::PlainText);
+    ui_->statusProblem->setWordWrap(true);
+    setTone(ui_->statusProblem, Tone::Warning);
+    ui_->statusProblem->hide();
+    root->addWidget(ui_->statusProblem);
 
     ui_->model = new HistoryTableModel(controller_, this);
     auto* view = new HistoryView(this);
@@ -193,6 +204,12 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     header->setSortIndicator(HistoryTableModel::ColDate, Qt::DescendingOrder);
     view->setSortingEnabled(true);
     installCopyOnClick(view, {HistoryTableModel::ColTx});
+    // The state beside the amount: it says whether the amount can be counted on. The order of the file stays.
+    const QList<int> order{HistoryTableModel::ColDate, HistoryTableModel::ColType, HistoryTableModel::ColAmount, HistoryTableModel::ColState,
+                           HistoryTableModel::ColUsdThen, HistoryTableModel::ColUsdNow, HistoryTableModel::ColWallet, HistoryTableModel::ColLabel,
+                           HistoryTableModel::ColFee, HistoryTableModel::ColTx};
+    for (int at = 0; at < order.size(); ++at)
+        header->moveSection(header->visualIndex(order.at(at)), at);
     applyColumnWidths();
     root->addWidget(view, 1);
 
@@ -224,7 +241,7 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->type = new QComboBox(bar.widget);
     ui_->type->setObjectName(QStringLiteral("historyType"));
     ui_->type->addItem(QStringLiteral("All types"), -1);
-    ui_->type->addItem(QStringLiteral("Received"), int(TxKind::Received));
+    ui_->type->addItem(QStringLiteral("Incoming"), int(TxKind::Received));
     ui_->type->addItem(QStringLiteral("Sent"), int(TxKind::Sent));
     ui_->type->addItem(QStringLiteral("Moved"), int(TxKind::Moved));
     ui_->type->setSizeAdjustPolicy(QComboBox::AdjustToContents);
@@ -232,8 +249,8 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->state->setObjectName(QStringLiteral("historyState"));
     ui_->state->addItem(QStringLiteral("All states"), -1);
     ui_->state->addItem(QStringLiteral("Pending"), int(HistoryTableModel::kStatePending));
-    ui_->state->addItem(QStringLiteral("In a block"), int(HistoryTableModel::kStateConfirmed));
-    ui_->state->addItem(QStringLiteral("Proof did not hold"), int(HistoryTableModel::kStateProofFailed));
+    ui_->state->addItem(QStringLiteral("Confirmed"), int(HistoryTableModel::kStateConfirmed));
+    ui_->state->addItem(QStringLiteral("Not verified"), int(HistoryTableModel::kStateProofFailed));
     ui_->state->addItem(QStringLiteral("Replaced or dropped"), int(HistoryTableModel::kStateGone));
     ui_->state->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->period = new QComboBox(bar.widget);
@@ -241,20 +258,20 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
     ui_->period->addItems({QStringLiteral("All time"), QStringLiteral("Last 24 hours"), QStringLiteral("Last 7 days"),
                            QStringLiteral("Last 30 days"), QStringLiteral("This year"), QStringLiteral("Last year")});
     ui_->period->setSizeAdjustPolicy(QComboBox::AdjustToContents);
-    ui_->hideDust = new QCheckBox(QStringLiteral("Hide dust"), bar.widget);
-    ui_->hideDust->setObjectName(QStringLiteral("historyHideDust"));
-    ui_->hideDust->setChecked(figures::hideDust());
-    connect(ui_->hideDust, &QCheckBox::toggled, this, [this](bool on) {
+    const page::ViewMenu viewMenu = page::makeViewMenu(bar.widget);
+    ui_->hideDust = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide dust"), "historyHideDust", figures::hideDust());
+    connect(ui_->hideDust, &QAction::toggled, this, [this](bool on) {
         figures::setHideDust(on);
         applyFilter();
     });
+    ui_->columns = new page::ColumnChoice(view, QStringLiteral("history"), {HistoryTableModel::ColFee, HistoryTableModel::ColTx}, viewMenu.menu);
     ui_->count = page::makeBarCount(bar.widget);
     bar.left->addWidget(ui_->search);
     bar.left->addWidget(ui_->wallet);
     bar.left->addWidget(ui_->type);
     bar.left->addWidget(ui_->state);
     bar.left->addWidget(ui_->period);
-    bar.left->addWidget(ui_->hideDust);
+    bar.left->addWidget(viewMenu.button);
     page::finishBarLeft(bar, ui_->search, ui_->count);
     ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
     ui_->details = new QPushButton(QStringLiteral("Details"), bar.widget);
@@ -317,7 +334,6 @@ HistoryPage::HistoryPage(WalletController* controller, QWidget* parent)
         ui_->type->setToolTip(trText(QStringLiteral("Moved: every output came back to the addresses shown, so only a fee left.")));
         ui_->exportCsv->setToolTip(trText(QStringLiteral("Save these transactions to a spreadsheet file, dust included, so that its amounts add up. It is not encrypted: anyone who reads it "
                                                          "sees these transactions, labels and notes.")));
-        ui_->count->setToolTip(trText(QStringLiteral("In and out: what these transactions came to, of those proven in a block, dust included.")));
         ui_->hideDust->setToolTip(trText(QStringLiteral("Less than %1 coming in leaves this list, unless the address was given out or has a label, or the line has a note. It still counts in every balance, and a search still finds it.")).arg(figures::dustLimits()));
     };
     setTips();
@@ -406,7 +422,7 @@ void HistoryPage::rebuildWalletFilter()
     }
     ui_->wallet->setVisible(wallets.size() > 1 && !ui_->inPlace);
     if (!ui_->inPlace)
-        ui_->view->setColumnHidden(HistoryTableModel::ColWallet, wallets.size() < 2);
+        ui_->columns->forceHidden(HistoryTableModel::ColWallet, wallets.size() < 2);
     if (chosen != ui_->wallet->currentData().toUInt())
         applyFilter();
 }
@@ -463,7 +479,7 @@ void HistoryPage::showPlace(quint32 wallet, std::optional<wallet::Network> netwo
         ui_->wallet->setCurrentIndex(index >= 0 ? index : 0);
     }
     ui_->wallet->setVisible(false);
-    ui_->view->setColumnHidden(HistoryTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
+    ui_->columns->forceHidden(HistoryTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
     applyFilter();
 }
 
@@ -541,18 +557,22 @@ void HistoryPage::updateState()
 
     // What the lines shown came to, in the only coin there is so far.
     QString line;
+    QString inAndOut;
     if (hasWallet) {
         // Of the same moment: what comes in between two rebuilds is no filter.
         const int all = ui_->model->totalAtRebuild();
         line = shown == all ? trText(all == 1 ? QStringLiteral("%1 transaction") : QStringLiteral("%1 transactions")).arg(grouped(all))
                             : trText(QStringLiteral("%1 of %2 transactions")).arg(grouped(shown), grouped(all));
         const wallet::NetworkInfo* utxo = wallet::firstOf(wallet::Family::Utxo);
+        // Where it answers a question: of a period, a wallet or one address. Of all of it, on the tooltip.
         if (utxo && (shown > 0 || ui_->model->dustHidden() > 0)) {
             const wallet::AssetInfo& coin = wallet::assetInfo(utxo->coin);
             try {
-                line += QStringLiteral(" · %1 %2 · %3 %4")
-                            .arg(trText(QStringLiteral("in")), amountText(ui_->model->receivedShown(), coin),
-                                 trText(QStringLiteral("out")), amountText(ui_->model->spentShown(), coin));
+                inAndOut = QStringLiteral("%1 %2 · %3 %4")
+                               .arg(trText(QStringLiteral("in")), amountText(ui_->model->receivedShown(), coin),
+                                    trText(QStringLiteral("out")), amountText(ui_->model->spentShown(), coin));
+                if (shown != all || ui_->inPlace)
+                    line += QStringLiteral(" · ") + inAndOut;
             } catch (const std::exception&) {
             }
         }
@@ -579,10 +599,17 @@ void HistoryPage::updateState()
         }
     }
     QStringList said;
-    Tone tone = Tone::Muted;
+    QStringList problems;
+    QString allRead;
     if (sum.working()) {
-        said << trText(QStringLiteral("Reading the history: %1 addresses, %2 transactions and %3 proofs to go"))
-                    .arg(grouped(sum.addressesLeft), grouped(sum.transactionsLeft), grouped(sum.proofsLeft));
+        QStringList toGo;
+        if (sum.addressesLeft > 0)
+            toGo << figures::counted(sum.addressesLeft, QStringLiteral("%1 address"), QStringLiteral("%1 addresses"));
+        if (sum.transactionsLeft > 0)
+            toGo << figures::counted(sum.transactionsLeft, QStringLiteral("%1 transaction"), QStringLiteral("%1 transactions"));
+        if (sum.proofsLeft > 0)
+            toGo << figures::counted(sum.proofsLeft, QStringLiteral("%1 check"), QStringLiteral("%1 checks"));
+        said << trText(QStringLiteral("Reading the history: %1 to go")).arg(toGo.join(QStringLiteral(", ")));
         if (!connected)
             said << trText(QStringLiteral("waiting for a server"));
     } else if (hasWallet && total > 0 && sum.refused == 0 && sum.unproven == 0 && sum.differing == 0 && controller_->figuresCurrent()) {
@@ -594,8 +621,15 @@ void HistoryPage::updateState()
             if (history->running())
                 read << wallet::networkInfo(history->network()).name;
         }
-        said << trText(QStringLiteral("Every %1 transaction is read, and what is in a block has its proof checked on this PC")).arg(read.join(QStringLiteral(", ")));
+        // On a good day nothing over the table: the table gets the room, and this stays one hover away.
+        allRead = trText(QStringLiteral("All %1 transactions read; those in a block are proven on this PC")).arg(read.join(QStringLiteral(", ")));
     }
+    QStringList countTip;
+    if (!inAndOut.isEmpty())
+        countTip << trText(QStringLiteral("In and out, of what is proven in a block, tiny amounts included: %1")).arg(inAndOut);
+    if (!allRead.isEmpty())
+        countTip << allRead;
+    ui_->count->setToolTip(countTip.join(QLatin1Char('\n')));
     // A key on a network with no history yet has transactions nobody here has read.
     QStringList unread;
     if (hasWallet) {
@@ -611,23 +645,18 @@ void HistoryPage::updateState()
             }
         }
         if (!unread.isEmpty())
-            said << trText(QStringLiteral("The history of %1 is not read yet")).arg(unread.join(QStringLiteral(", ")));
+            said << trText(QStringLiteral("%1 is not listed here yet: what came in on it is under the bell")).arg(unread.join(QStringLiteral(", ")));
     }
-    if (sum.refused > 0) {
-        said << trText(QStringLiteral("%1 addresses could not be read whole from this server")).arg(grouped(sum.refused));
-        tone = Tone::Warning;
-    }
-    if (sum.unproven > 0) {
-        said << trText(QStringLiteral("%1 proofs did not check out")).arg(grouped(sum.unproven));
-        tone = Tone::Warning;
-    }
-    if (sum.differing > 0) {
-        said << trText(QStringLiteral("%1 addresses do not add up to their balance")).arg(grouped(sum.differing));
-        tone = Tone::Warning;
-    }
+    if (sum.refused > 0)
+        problems << trText(QStringLiteral("%1 addresses could not be read whole from this server")).arg(grouped(sum.refused));
+    if (sum.unproven > 0)
+        problems << trText(QStringLiteral("%1 transactions could not be verified")).arg(grouped(sum.unproven));
+    if (sum.differing > 0)
+        problems << trText(QStringLiteral("%1 addresses do not match their balance")).arg(grouped(sum.differing));
     ui_->status->setText(said.join(QStringLiteral(" · ")));
-    setTone(ui_->status, tone);
     ui_->status->setVisible(!said.isEmpty());
+    ui_->statusProblem->setText(problems.join(QStringLiteral(" · ")));
+    ui_->statusProblem->setVisible(!problems.isEmpty());
 
     // Only a network with no book in what the place covers: nothing below could say anything of it.
     bool anyBook = false;
@@ -652,6 +681,7 @@ void HistoryPage::updateState()
     ui_->hideDust->setVisible(!notRead && ui_->scripthash.isEmpty());
     if (notRead) {
         ui_->status->hide();
+        ui_->statusProblem->hide();
         ui_->view->hide();
         ui_->noWallet->hide();
         ui_->waiting->hide();
@@ -763,13 +793,13 @@ void HistoryPage::applyColumnWidths()
         header->resizeSection(column, width);
     };
     fit(HistoryTableModel::ColDate, {QStringLiteral("2026-12-31 23:59")});
-    fit(HistoryTableModel::ColType, {trText(QStringLiteral("Received")), trText(QStringLiteral("Moved"))});
+    fit(HistoryTableModel::ColType, {trText(QStringLiteral("Not received")), trText(QStringLiteral("Coming in")), trText(QStringLiteral("Received"))});
     fit(HistoryTableModel::ColWallet, {QStringLiteral("A wallet name")});
     fit(HistoryTableModel::ColAmount, {QStringLiteral("-1,234.12345678 BTC")});
     fit(HistoryTableModel::ColUsdNow, {QStringLiteral("$1,234,567.00")});
     fit(HistoryTableModel::ColUsdThen, {QStringLiteral("$1,234,567.00")});
     fit(HistoryTableModel::ColFee, {QStringLiteral("0.00012345 BTC")});
-    fit(HistoryTableModel::ColState, {trText(QStringLiteral("In a block, proof on its way")), trText(QStringLiteral("In a block, proof did not hold")), trText(QStringLiteral("5 confirmations"))});
+    fit(HistoryTableModel::ColState, {trText(QStringLiteral("Not verified")), trText(QStringLiteral("5 confirmations"))});
     fit(HistoryTableModel::ColTx, {QStringLiteral("00000000…00000000")});
     header->setSectionResizeMode(HistoryTableModel::ColLabel, QHeaderView::Stretch);
 }

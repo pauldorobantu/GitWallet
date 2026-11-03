@@ -63,7 +63,7 @@ QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: rgba(
 QPushButton {
     background-color: %SURFACEALT%; color: %TEXT%;
     border: 1px solid %BORDERS%; border-radius: %RBTN%px;
-    padding: 0 12px; min-width: 0; min-height: 30px; font-size: %FBODY%px;
+    padding: 0 12px; min-height: 30px; font-size: %FBODY%px;
     font-weight: 500;
 }
 QPushButton:hover { background-color: %HOVERSURF%; border-color: %ACCENT%; color: %ACCENT%; }
@@ -111,7 +111,7 @@ QHeaderView::section {
     border-right: none; border-bottom: 1px solid %TBBORDER%;
     /* 13px stânga = padding-ul celulei (10) + marginea internă de ~3px pe care
        Qt o adaugă în item-uri; aliniază antetul cu textul din celule. */
-    padding: 6px 10px 6px 13px; font-size: %FSMALL%px; font-weight: 600; letter-spacing: 0.3px;
+    padding: 6px 13px 6px 13px; font-size: %FSMALL%px; font-weight: 600;
     min-height: 22px;
 }
 QTableCornerButton::section { background-color: %TBHEADBG%; border: none; }
@@ -264,7 +264,7 @@ QToolButton#tbClose:pressed { background-color: rgba(0,0,0,0.28); color: #ffffff
 #receiveQr { background: white; border-radius: %RSMALL%px; }
 #receiveAddress { color: %TEXT%; font-family: Consolas, "Cascadia Mono", monospace; font-size: 16px; background: transparent; }
 #pathHere { color: %TEXT%; font-size: %FBODY%px; font-weight: 600; background: transparent; }
-QPushButton#pathLink { background: transparent; border: none; color: %MUTED%; padding: 0 2px; min-height: 20px; max-height: 20px; font-weight: 400; }
+QPushButton#pathLink { background: transparent; border: none; color: %MUTED%; padding: 0 2px; min-width: 0; min-height: 20px; max-height: 20px; font-weight: 400; }
 QPushButton#pathLink:hover { background: transparent; color: %ACCENT%; }
 QPushButton#pathLink:pressed { background: transparent; color: %ACCENT%; }
 #pageTitle { color: %TEXT%; font-size: %FTITLE%px; font-weight: 600; background: transparent; }
@@ -275,7 +275,13 @@ QPushButton#pathLink:pressed { background: transparent; color: %ACCENT%; }
 /* Secțiuni (PageKit::makeSection): titlu + descriere, aceleași peste tot. */
 #sectionTitle { color: %TEXT%; font-size: %FBIG%px; font-weight: 600; background: transparent; }
 #sectionDesc { color: %MUTED%; font-size: %FBODY%px; background: transparent; }
-#formSectionLabel { color: %TEXTSOFT%; font-size: %FDESC%px; font-weight: 600; background: transparent; padding-top: 2px; }
+#formSectionLabel { color: %TEXTSOFT%; font-size: %FDESC%px; font-weight: 600; background: transparent; padding-top: 2px; qproperty-indent: 0; }
+#placeAddress { color: %TEXT%; font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; background: transparent; }
+#lockForgot { background: transparent; border: none; color: %MUTED%; font-weight: 400; }
+#lockForgot:hover { background: transparent; color: %ACCENT%; }
+#viewButton::menu-indicator { image: none; width: 0; }
+QMenu::indicator { width: 14px; height: 14px; left: 6px; border: 1px solid rgba(%MUTEDRGB%,0.55); border-radius: %RCHECK%px; background: %SURFACEALT%; }
+QMenu::indicator:checked { background: %ACCENT%; border-color: %ACCENT%; image: url(:/icons/lucide/%CHECK%.svg); }
 #emptyState { color: %MUTED%; font-size: %FBIG%px; background: transparent; }
 #emptyState QLabel { background: transparent; color: %MUTED%; }
 #emptyTitle { color: %TEXTSOFT%; font-size: %FBIG%px; font-weight: 600; background: transparent; }

@@ -5,6 +5,7 @@
 #include <QList>
 #include <QWidget>
 
+class QAction;
 class QCheckBox;
 class QLabel;
 class QPushButton;
@@ -59,8 +60,8 @@ private:
     QLabel* pricesLabel_ = nullptr; // under the total: why it is not final yet, then the prices
     AllocationBar* allocation_ = nullptr;
     HoldingsTable* table_ = nullptr;
-    QCheckBox* hideZero_ = nullptr;
-    QCheckBox* hideDust_ = nullptr;
+    QAction* hideZero_ = nullptr;
+    QAction* hideDust_ = nullptr;
     QLabel* countLabel_ = nullptr;
     QString countText_;
     QWidget* details_ = nullptr;

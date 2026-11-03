@@ -194,10 +194,13 @@ private:
         if (tx->seen == wallet::TxSeen::Dropped)
             return trText(QStringLiteral("Dropped"));
         if (tx->height <= 0)
-            return trText(QStringLiteral("Not in a block yet"));
-        if (tx->proven)
-            return trText(QStringLiteral("In a block"));
-        return proofFailed(payment) ? trText(QStringLiteral("In a block, proof did not hold")) : trText(QStringLiteral("In a block, proof on its way"));
+            return trText(QStringLiteral("Pending"));
+        if (tx->proven) {
+            const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
+            const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
+            return figures::confirmations(history ? qMax(1, history->tip() - tx->height + 1) : 1);
+        }
+        return proofFailed(payment) ? trText(QStringLiteral("Not verified")) : trText(QStringLiteral("Verifying"));
     }
 
     WalletController* controller_ = nullptr;
@@ -210,7 +213,7 @@ PaymentsDialog::PaymentsDialog(WalletController* controller, QWidget* parent)
     : QDialog(parent), controller_(controller)
 {
     setObjectName(QStringLiteral("paymentsDialog"));
-    setWindowTitle(trText(QStringLiteral("Payments received")));
+    setWindowTitle(trText(QStringLiteral("Incoming payments")));
     applyDialogChrome(this);
     auto* root = new QVBoxLayout(this);
     page::applyDialogLayout(root);

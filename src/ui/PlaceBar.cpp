@@ -122,6 +122,11 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
     title_->setTextFormat(Qt::PlainText);
     // On a narrow window the text is cut, never a button.
     title_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    address_ = new MiddleLabel(card);
+    address_->setObjectName(QStringLiteral("placeAddress"));
+    address_->setTextFormat(Qt::PlainText);
+    address_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    address_->hide();
     detail_ = new QLabel(card);
     detail_->setObjectName(QStringLiteral("placeDetail"));
     detail_->setTextFormat(Qt::PlainText);
@@ -130,6 +135,7 @@ PlaceBar::PlaceBar(WalletController* controller, QWidget* parent) : QWidget(pare
     detail_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     setTone(detail_, Tone::Muted);
     column->addWidget(title_);
+    column->addWidget(address_);
     column->addWidget(detail_);
     row->addLayout(column, 1);
 
@@ -381,12 +387,14 @@ void PlaceBar::refresh()
     const wallet::WalletEntry* entry = place_.wallet != 0 ? controller_->store().find(place_.wallet) : nullptr;
     QIcon icon;
     QString title;
+    QString addressLine;
     QStringList detail;
     if (atAddress) {
         const wallet::AddressRow row = currentRow();
         const QString label = controller_->addressLabel(row.address);
         icon = coinIcon(wallet::assetInfo(wallet::networkInfo(row.network).coin));
-        title = label.isEmpty() ? row.address : QStringLiteral("%1 · %2").arg(label, row.address);
+        title = figures::dash();
+        addressLine = label.isEmpty() ? row.address : QStringLiteral("%1 · %2").arg(label, row.address);
         detail << row.path();
         if (const wallet::WalletEntry* own = controller_->store().find(row.wallet))
             detail << own->label;
@@ -397,22 +405,24 @@ void PlaceBar::refresh()
             // The same figures as the table under it: an address nobody answered for holds no zero.
             double usd = 0.0;
             bool priced = true;
-            bool any = false;
+            QStringList amounts;
             for (const wallet::Asset asset : wallet::networkInfo(row.network).assets) {
                 const Holding holding = holdingAt(controller_, row, asset);
-                if (holding.holds() || (row.checked && asset == wallet::networkInfo(row.network).coin)) {
-                    detail << holding.amountText();
-                    any = true;
-                }
+                if (holding.holds())
+                    amounts << holding.amountText();
                 priced = priced && holding.readable && (holding.price > 0.0 || !holding.holds());
                 usd += holding.usd;
             }
-            if (!row.checked && !any)
+            // Of what it holds; of the coin, if that is nothing and it has answered.
+            if (amounts.isEmpty() && row.checked)
+                amounts << holdingAt(controller_, row, wallet::networkInfo(row.network).coin).amountText();
+            detail += amounts;
+            if (!row.checked && amounts.isEmpty())
                 detail << trText(QStringLiteral("Not checked yet"));
-            else if (priced && any)
-                detail << (row.checked ? figures::formatUsd(usd) : figures::atLeast(figures::formatUsd(usd)));
+            else if (priced && !amounts.isEmpty())
+                title = row.checked ? figures::formatUsd(usd) : figures::atLeast(figures::formatUsd(usd));
             if (!row.used && row.state() != wallet::AddressState::Funded && controller_->isGivenOut(row))
-                detail << trText(QStringLiteral("Given out"));
+                detail << trText(QStringLiteral("Waiting for payment"));
             detail << addressNotes(controller_, row);
         }
     } else if (place_.asset) {
@@ -423,17 +433,14 @@ void PlaceBar::refresh()
         detail << holding.usdText();
         if (holding.price > 0.0)
             detail << QStringLiteral("1 %1 = %2").arg(info.symbol, figures::formatUsd(holding.price));
-        if (entry && !place_.onlyWallet)
-            detail << entry->label;
         if (holding.watched && (holding.complete || holding.holders > 0))
-            detail << trText(holding.complete && holding.holders == 1 ? QStringLiteral("%1 address holds it") : QStringLiteral("%1 addresses hold it")).arg(holding.holdersText());
+            detail << trText(holding.complete && holding.holders == 1 ? QStringLiteral("on %1 address") : QStringLiteral("on %1 addresses")).arg(holding.holdersText());
         const QString note = holdingNote(controller_, holding);
         if (!note.isEmpty())
             detail << note;
     } else if (entry) {
         icon = nameIcon(entry->label);
         title = totalOf(controller_, entry->id).text();
-        detail << entry->label;
         const wallet::WalletCounts counts = controller_->model()->counts(entry->id);
         if (counts.rows > 0)
             detail << trText(QStringLiteral("%1 funded of %2 addresses")).arg(figures::countSoFar(counts.funded, counts.checked == counts.rows), figures::formatCount(counts.rows));
@@ -443,6 +450,8 @@ void PlaceBar::refresh()
     }
     mark_->setPixmap(icon.pixmap(QSize(kMarkSize, kMarkSize)));
     static_cast<MiddleLabel*>(title_)->setFull(title);
+    address_->setVisible(atAddress);
+    static_cast<MiddleLabel*>(address_)->setFull(addressLine);
     detail_->setText(detail.join(QStringLiteral(" · ")));
 }
 

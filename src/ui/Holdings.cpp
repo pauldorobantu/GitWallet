@@ -361,7 +361,7 @@ QString networkNote(const WalletController* controller, wallet::Network network,
 
 QString incomingNote(const wallet::AssetInfo& coin, qint64 units)
 {
-    return trText(QStringLiteral("%1 not in a block yet")).arg(figures::formatAmount(chain::Amount::fromU64(quint64(units)), coin) + QLatin1Char(' ') + coin.symbol);
+    return trText(QStringLiteral("%1 pending")).arg(figures::formatAmount(chain::Amount::fromU64(quint64(units)), coin) + QLatin1Char(' ') + coin.symbol);
 }
 
 } // namespace

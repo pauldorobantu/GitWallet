@@ -95,6 +95,8 @@ public:
     // As an export writes it, under what it was narrowed to when it began.
     ExportLine exportLine(const Line& line, const Filter& filter) const;
     QString stateText(const Line& line) const;
+    // Received only once it is believed: what is in no block, or in one nobody has proven, is coming in.
+    QString kindShown(const Line& line) const;
     QList<QString> walletsOf(const Line& line) const;
     int tipOf(const wallet::HistoryBook& book) const; // -1 while no chain stands
     qint64 feeShown(const Line& line) const; // what the wallets shown paid; -1: not theirs, or not known

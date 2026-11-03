@@ -22,6 +22,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QAction>
 #include <QAbstractButton>
 #include <QAbstractItemModel>
 #include <QAbstractProxyModel>
@@ -553,7 +554,7 @@ void Walkthrough::buildSteps()
         {QStringLiteral("portfolio"),
          [this] {
              window_->showPage(QStringLiteral("portfolio"));
-             if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero"))) {
+             if (auto* hide = window_->findChild<QAction*>(QStringLiteral("hideZero"))) {
                  hideZeroWas_ = hide->isChecked();
                  hide->setChecked(false);
              }
@@ -781,6 +782,8 @@ void Walkthrough::buildSteps()
         {QStringLiteral("addresses-of-wallet"),
          [this, selectWallet, walletsPage, clickLater] {
              selectWallet(kSecondName);
+             if (auto* state = window_->findChild<ui::AddressesPage*>()->findChild<QComboBox*>(QStringLiteral("stateFilter")))
+                 state->setCurrentIndex(1); // every address, not only those in use
              clickLater(findButton(walletsPage(), QStringLiteral("View addresses")));
          },
          nullptr, 3000,
@@ -927,7 +930,9 @@ void Walkthrough::buildSteps()
              auto* page = window_->findChild<ui::AddressesPage*>();
              for (QComboBox* combo : page ? page->findChildren<QComboBox*>() : QList<QComboBox*>())
                  combo->setCurrentIndex(0);
-             if (auto* hide = page ? page->findChild<QCheckBox*>(QStringLiteral("addressesHideDust")) : nullptr)
+             if (auto* state = page ? page->findChild<QComboBox*>(QStringLiteral("stateFilter")) : nullptr)
+                 state->setCurrentIndex(1); // every address
+             if (auto* hide = page ? page->findChild<QAction*>(QStringLiteral("addressesHideDust")) : nullptr)
                  hide->setChecked(true);
          },
          nullptr, 3000,
@@ -941,7 +946,7 @@ void Walkthrough::buildSteps()
                      ++dust;
              }
              expect(tableRows() + dust == controller()->model()->size(), QStringLiteral("Hide dust takes off what holds only dust: %1 rows and %2 of dust, of %3").arg(tableRows()).arg(dust).arg(controller()->model()->size()));
-             window_->findChild<ui::AddressesPage*>()->findChild<QCheckBox*>(QStringLiteral("addressesHideDust"))->setChecked(false);
+             window_->findChild<ui::AddressesPage*>()->findChild<QAction*>(QStringLiteral("addressesHideDust"))->setChecked(false);
          },
          nullptr},
         // The history of what those addresses did.
@@ -1610,7 +1615,7 @@ void Walkthrough::finish()
 {
     // One setting per Windows user: as it was found. The steps that open a coin need it off, whatever the
     // public seeds happen to hold.
-    if (auto* hide = window_->findChild<QCheckBox*>(QStringLiteral("hideZero")); hide && hideZeroWas_)
+    if (auto* hide = window_->findChild<QAction*>(QStringLiteral("hideZero")); hide && hideZeroWas_)
         hide->setChecked(*hideZeroWas_);
     ui::figures::setHideDust(hideDustWas_);
     const QJsonObject summary{{QStringLiteral("failures"), failures_}, {QStringLiteral("steps"), results_}};

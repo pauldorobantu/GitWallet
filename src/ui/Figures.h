@@ -32,5 +32,11 @@ void setHideDust(bool hide);
 
 // A count of what has answered so far: plain once all of it has, "≥ 3" before that, "—" for none yet.
 QString countSoFar(int count, bool complete);
+// Blocks over one, for it to read as settled.
+inline constexpr int kEnoughConfirmations = 6;
+// "1 confirmation", "3 confirmations", or "Confirmed" from enough on: one set of words on every page.
+QString confirmations(int blocks);
+// "1 wallet", "3 wallets": the words are keys of the list of translations, with %1 for the figure.
+QString counted(int n, const QString& one, const QString& many);
 
 } // namespace app::ui::figures

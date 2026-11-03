@@ -7,7 +7,9 @@
 #include "ui/LanguageManager.h"
 #include "ui/PageKit.h"
 
-#include <QCheckBox>
+#include <QAction>
+#include <QMenu>
+#include <QPushButton>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QVBoxLayout>
@@ -24,29 +26,28 @@ HoldingsPage::HoldingsPage(WalletController* controller, QWidget* parent)
     root->addWidget(table_, 1);
 
     const page::ActionBar bar = page::makeActionBar(this);
-    hideZero_ = new QCheckBox(QStringLiteral("Hide zero balances"), bar.widget);
-    hideZero_->setChecked(SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
+    view_ = page::makeViewMenu(bar.widget).button;
+    QMenu* menu = view_->menu();
+    hideZero_ = page::addViewToggle(this, menu, QStringLiteral("Hide zero balances"), "holdingsHideZero", SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
     table_->setHideZero(hideZero_->isChecked());
-    connect(hideZero_, &QCheckBox::toggled, this, [this](bool on) {
+    connect(hideZero_, &QAction::toggled, this, [this](bool on) {
         SettingsRepo().set(QStringLiteral("ui.hideZero"), on ? QStringLiteral("1") : QStringLiteral("0"));
         table_->setHideZero(on);
         updateCount();
     });
-    bar.left->addWidget(hideZero_);
-    hideDust_ = new QCheckBox(QStringLiteral("Hide dust"), bar.widget);
-    hideDust_->setChecked(figures::hideDust());
+    hideDust_ = page::addViewToggle(this, menu, QStringLiteral("Hide dust"), "holdingsHideDust", figures::hideDust());
     table_->setHideDust(hideDust_->isChecked());
     const auto dustTip = [this] {
         hideDust_->setToolTip(trText(QStringLiteral("Less than %1 in all leaves this list. It still counts in the total.")).arg(figures::dustLimits()));
     };
     dustTip();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
-    connect(hideDust_, &QCheckBox::toggled, this, [this](bool on) {
+    connect(hideDust_, &QAction::toggled, this, [this](bool on) {
         figures::setHideDust(on);
         table_->setHideDust(on);
         updateCount();
     });
-    bar.left->addWidget(hideDust_);
+    bar.left->addWidget(view_);
     count_ = page::makeBarCount(bar.widget);
     bar.left->addWidget(count_);
     bar.left->addStretch(1);

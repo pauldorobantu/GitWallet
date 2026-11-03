@@ -1,5 +1,6 @@
 #include "ui/PageKit.h"
 
+#include "core/SettingsRepo.h"
 #include "ui/DialogChrome.h"
 #include "ui/Icons.h"
 #include "ui/LanguageManager.h"
@@ -20,13 +21,17 @@
 #include <QIcon>
 #include <QHeaderView>
 #include <QLabel>
+#include <QHelpEvent>
 #include <QLineEdit>
+#include <QMenu>
 #include <QPainter>
 #include <QPixmap>
+#include <QPushButton>
 #include <QScreen>
 #include <QStyle>
 #include <QTableView>
 #include <QToolButton>
+#include <QToolTip>
 #include <QTreeView>
 #include <QVBoxLayout>
 
@@ -191,6 +196,15 @@ public:
     using QLabel::QLabel;
 
 protected:
+    // What is cut can still be read, unless the page has said something else to say here.
+    bool event(QEvent* event) override
+    {
+        if (event->type() == QEvent::ToolTip && toolTip().isEmpty() && fontMetrics().horizontalAdvance(text()) > contentsRect().width()) {
+            QToolTip::showText(static_cast<QHelpEvent*>(event)->globalPos(), text(), this);
+            return true;
+        }
+        return QLabel::event(event);
+    }
     void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
@@ -201,6 +215,119 @@ protected:
 };
 
 } // namespace
+
+ViewMenu makeViewMenu(QWidget* parent)
+{
+    ViewMenu view;
+    view.button = new QPushButton(QStringLiteral("View"), parent);
+    view.button->setObjectName(QStringLiteral("viewButton"));
+    view.menu = new QMenu(view.button);
+    view.menu->setToolTipsVisible(true);
+    view.button->setMenu(view.menu);
+    return view;
+}
+
+QAction* addViewToggle(QObject* owner, QMenu* menu, const QString& text, const char* name, bool checked)
+{
+    auto* action = new QAction(text, owner);
+    action->setObjectName(QString::fromLatin1(name));
+    action->setCheckable(true);
+    action->setChecked(checked);
+    menu->addAction(action);
+    return action;
+}
+
+ColumnChoice::ColumnChoice(QTableView* view, const QString& key, const QList<int>& hiddenByDefault, QMenu* menu)
+    : QObject(view), view_(view), key_(QStringLiteral("ui.columns.") + key)
+{
+    const QString saved = SettingsRepo().get(key_);
+    QSet<int> hidden(hiddenByDefault.cbegin(), hiddenByDefault.cend());
+    if (!saved.isEmpty()) {
+        hidden.clear();
+        const QStringList parts = saved.split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString& part : parts) {
+            bool ok = false;
+            const int column = part.toInt(&ok);
+            if (ok)
+                hidden.insert(column);
+        }
+    }
+    if (menu && !menu->isEmpty())
+        menu->addSeparator();
+    QAbstractItemModel* model = view_->model();
+    const QHeaderView* header = view_->horizontalHeader();
+    for (int visual = 0; model && visual < header->count(); ++visual) {
+        const int column = header->logicalIndex(visual);
+        auto* action = new QAction(this);
+        action->setCheckable(true);
+        action->setChecked(!hidden.contains(column));
+        action->setData(QStringLiteral("column"));
+        actions_.insert(column, action);
+        if (menu)
+            menu->addAction(action);
+        connect(action, &QAction::toggled, this, [this, column] {
+            apply(column);
+            save();
+        });
+        view_->setColumnHidden(column, hidden.contains(column));
+    }
+    retitle();
+    connect(LanguageManager::instance(), &LanguageManager::changed, this, &ColumnChoice::retitle);
+    view_->horizontalHeader()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(view_->horizontalHeader(), &QWidget::customContextMenuRequested, this, [this](const QPoint& at) {
+        QMenu choice(view_);
+        const QHeaderView* top = view_->horizontalHeader();
+        for (int visual = 0; visual < top->count(); ++visual) {
+            QAction* action = actions_.value(top->logicalIndex(visual));
+            if (action && action->isVisible())
+                choice.addAction(action);
+        }
+        choice.exec(view_->horizontalHeader()->mapToGlobal(at));
+    });
+}
+
+void ColumnChoice::retitle()
+{
+    const QAbstractItemModel* model = view_->model();
+    if (!model)
+        return;
+    for (auto it = actions_.cbegin(); it != actions_.cend(); ++it)
+        it.value()->setText(model->headerData(it.key(), Qt::Horizontal, Qt::DisplayRole).toString());
+}
+
+void ColumnChoice::apply(int column)
+{
+    const QAction* action = actions_.value(column);
+    view_->setColumnHidden(column, forced_.contains(column) || (action && !action->isChecked()));
+}
+
+void ColumnChoice::save() const
+{
+    QStringList hidden;
+    for (auto it = actions_.cbegin(); it != actions_.cend(); ++it) {
+        if (!it.value()->isChecked())
+            hidden << QString::number(it.key());
+    }
+    // Nothing hidden is a choice too: an empty value would read as no choice made.
+    SettingsRepo().set(key_, hidden.isEmpty() ? QStringLiteral(",") : hidden.join(QLatin1Char(',')));
+}
+
+void ColumnChoice::forceHidden(int column, bool hidden)
+{
+    if (hidden)
+        forced_.insert(column);
+    else
+        forced_.remove(column);
+    if (QAction* action = actions_.value(column))
+        action->setVisible(!hidden);
+    apply(column);
+}
+
+bool ColumnChoice::chosen(int column) const
+{
+    const QAction* action = actions_.value(column);
+    return action && action->isChecked();
+}
 
 QLabel* makeBarCount(QWidget* parent)
 {

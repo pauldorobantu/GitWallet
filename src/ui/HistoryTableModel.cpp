@@ -31,7 +31,6 @@ namespace {
 constexpr int kMinRebuildMs = 400;
 constexpr int kRebuildFactor = 10;
 // As many blocks as a merchant usually waits for: past it a block says "Confirmed".
-constexpr int kEnoughConfirmations = 6;
 
 const wallet::AssetInfo& coinOf(const wallet::HistoryBook& book)
 {
@@ -223,7 +222,7 @@ TxState HistoryTableModel::stateOf(const wallet::TxRecord& tx, int tip, const wa
         return TxState::Pending;
     if (!tx.proven)
         return history && history->proofFailed(tx.txid) ? TxState::ProofFailed : TxState::Unproven;
-    return tip - tx.height + 1 >= kEnoughConfirmations ? TxState::Confirmed : TxState::Confirming;
+    return tip - tx.height + 1 >= figures::kEnoughConfirmations ? TxState::Confirmed : TxState::Confirming;
 }
 
 bool HistoryTableModel::makeLine(wallet::HistoryBook* book, const wallet::UtxoHistory* history, int position, int scope, int tip, const Filter& filter, Line* out) const
@@ -314,11 +313,12 @@ bool HistoryTableModel::matches(const Line& line, const wallet::HistoryBook& boo
     if (filter_.state >= 0) {
         const bool pending = line.state == TxState::Pending;
         const bool gone = line.state == TxState::Replaced || line.state == TxState::Dropped;
-        const bool failed = line.state == TxState::ProofFailed;
+        const bool doubt = line.state == TxState::ProofFailed || line.state == TxState::Unproven;
+        const bool believed = line.state == TxState::Confirming || line.state == TxState::Confirmed;
         if (filter_.state == kStatePending ? !pending
             : filter_.state == kStateGone ? !gone
-            : filter_.state == kStateProofFailed ? !failed
-                                                 : (pending || gone))
+            : filter_.state == kStateProofFailed ? !doubt
+                                                 : !believed)
             return false;
     }
     if (filter_.from > 0 && line.time < filter_.from)
@@ -627,7 +627,7 @@ QVariant HistoryTableModel::data(const QModelIndex& index, int role) const
             case ColDate:
                 return dateText(tx.time);
             case ColType:
-                return kindText(line.kind);
+                return kindShown(line);
             case ColWallet:
                 return walletText(line);
             case ColAmount:
@@ -708,14 +708,11 @@ QVariant HistoryTableModel::data(const QModelIndex& index, int role) const
         case Qt::ForegroundRole:
             if (!stands)
                 return toneColor(Tone::Muted);
-            if (column == ColAmount && net > 0 && line.kind == TxKind::Received)
+            // Green for money that came and is believed, and for nothing else.
+            if (column == ColAmount && net > 0 && line.kind == TxKind::Received && (line.state == TxState::Confirming || line.state == TxState::Confirmed))
                 return toneColor(Tone::Success);
-            if (column == ColState) {
-                if (line.state == TxState::Pending || line.state == TxState::Unproven || line.state == TxState::ProofFailed)
-                    return toneColor(Tone::Warning);
-                if (line.state == TxState::Confirmed)
-                    return toneColor(Tone::Success);
-            }
+            if (column == ColState && (line.state == TxState::Pending || line.state == TxState::Unproven || line.state == TxState::ProofFailed))
+                return toneColor(Tone::Warning);
             break;
         default:
             break;
@@ -773,22 +770,39 @@ QString HistoryTableModel::stateText(const Line& line) const
     switch (line.state) {
     case TxState::Pending:
         return trText(QStringLiteral("Pending"));
-    case TxState::Confirming: {
-        const int blocks = qMax(1, tipOf(*line.book) - tx.height + 1);
-        return blocks == 1 ? trText(QStringLiteral("1 confirmation")) : trText(QStringLiteral("%1 confirmations")).arg(blocks);
-    }
+    case TxState::Confirming:
+        return figures::confirmations(qMax(1, tipOf(*line.book) - tx.height + 1));
     case TxState::Confirmed:
         return trText(QStringLiteral("Confirmed"));
     case TxState::Unproven:
-        return trText(QStringLiteral("In a block, proof on its way"));
+        return trText(QStringLiteral("Verifying"));
     case TxState::ProofFailed:
-        return trText(QStringLiteral("In a block, proof did not hold"));
+        return trText(QStringLiteral("Not verified"));
     case TxState::Replaced:
         return trText(QStringLiteral("Replaced"));
     case TxState::Dropped:
         return trText(QStringLiteral("Dropped"));
     }
     return {};
+}
+
+QString HistoryTableModel::kindShown(const Line& line) const
+{
+    if (line.kind != TxKind::Received)
+        return kindText(line.kind);
+    switch (line.state) {
+    case TxState::Confirming:
+    case TxState::Confirmed:
+        return trText(QStringLiteral("Received"));
+    case TxState::Pending:
+    case TxState::Unproven:
+        return trText(QStringLiteral("Coming in"));
+    case TxState::ProofFailed:
+    case TxState::Replaced:
+    case TxState::Dropped:
+        return trText(QStringLiteral("Not received"));
+    }
+    return kindText(line.kind);
 }
 
 HistoryTableModel::ExportLine HistoryTableModel::exportLine(const Line& line, const Filter& filter) const
@@ -799,7 +813,7 @@ HistoryTableModel::ExportLine HistoryTableModel::exportLine(const Line& line, co
     const double price = priceNow(*line.book);
     ExportLine e;
     e.date = tx.time > 0 ? QDateTime::fromSecsSinceEpoch(tx.time).toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")) : QString();
-    e.kind = kindText(line.kind);
+    e.kind = kindShown(line);
     e.wallet = walletNames(line, filter, 0).join(QStringLiteral(" · "));
     e.amount = exactCoin(netOf(line), coin);
     e.coin = coin.symbol;

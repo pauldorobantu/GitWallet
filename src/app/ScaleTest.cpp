@@ -185,13 +185,13 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
     }
     if (auto* combo = page ? page->findChild<QComboBox*>(QStringLiteral("stateFilter")) : nullptr) {
         clock.restart();
-        combo->setCurrentIndex(1);
+        combo->setCurrentIndex(2);
         settle();
         say(QStringLiteral("showing the funded rows only"), clock.elapsed());
         if (table && table->model()->rowCount() != model->fundedCount())
             report += QStringLiteral("FAIL  the funded rows are %1, not %2\n").arg(table->model()->rowCount()).arg(model->fundedCount());
         clock.restart();
-        combo->setCurrentIndex(0);
+        combo->setCurrentIndex(1);
         settle();
         say(QStringLiteral("showing all again"), clock.elapsed());
         if (table && table->model()->rowCount() != model->size())
@@ -232,9 +232,15 @@ QString runWindowScaleTest(ui::MainWindow* window, int rows)
         window->showPage(QStringLiteral("addresses"));
         settle();
         const qint64 whole = clock.elapsed();
-        say(QStringLiteral("coming back to all of them"), whole);
+        say(QStringLiteral("coming back to those in use"), whole);
         if (whole > 10000)
             report += QStringLiteral("FAIL  coming back took %1 ms\n").arg(whole);
+        if (auto* combo = page->findChild<QComboBox*>(QStringLiteral("stateFilter"))) {
+            clock.restart();
+            combo->setCurrentIndex(1);
+            settle();
+            say(QStringLiteral("and to all of them"), clock.elapsed());
+        }
         if (table->model()->rowCount() != model->size())
             report += QStringLiteral("FAIL  all rows are %1, not %2, after a place\n").arg(table->model()->rowCount()).arg(model->size());
     }

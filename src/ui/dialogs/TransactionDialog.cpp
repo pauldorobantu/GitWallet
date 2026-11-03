@@ -261,17 +261,7 @@ void TransactionDialog::refresh()
     const qint64 net = line_.received - line_.spent;
     const double whole = double(net < 0 ? -net : net) / 100000000.0;
 
-    switch (line_.kind) {
-    case TxKind::Received:
-        kindValue_->setText(trText(QStringLiteral("Received")));
-        break;
-    case TxKind::Sent:
-        kindValue_->setText(trText(QStringLiteral("Sent")));
-        break;
-    case TxKind::Moved:
-        kindValue_->setText(trText(QStringLiteral("Moved")));
-        break;
-    }
+    kindValue_->setText(model_->kindShown(line_));
 
     QString state = model_->stateText(line_);
     if (tx.height > 0)

@@ -21,8 +21,10 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QElapsedTimer>
@@ -294,8 +296,11 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     scene.window->showPage(QStringLiteral("addresses"));
     auto* addresses = scene.window->findChild<ui::AddressesPage*>();
     auto* table = addresses->findChild<QTableView*>();
-    auto* hide = addresses->findChild<QCheckBox*>(QStringLiteral("addressesHideDust"));
+    auto* hide = addresses->findChild<QAction*>(QStringLiteral("addressesHideDust"));
+    addresses->findChild<QComboBox*>(QStringLiteral("stateFilter"))->setCurrentIndex(1);
     pause(200);
+    answerAll(model, scene.shop);
+    pause(150);
     const auto listed = [&](const QString& address) {
         for (int row = 0; row < table->model()->rowCount(); ++row) {
             if (table->model()->index(row, ui::AddressTableModel::ColAddress).data().toString() == address)
@@ -400,8 +405,8 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
         return ui::holdingOf(controller, usdc).complete;
     };
     check(waitFor(settled, 8000), QStringLiteral("every row has answered"));
-    auto* hideCoins = portfolio->findChild<QCheckBox*>(QStringLiteral("hideDust"));
-    auto* hideZero = portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"));
+    auto* hideCoins = portfolio->findChild<QAction*>(QStringLiteral("hideDust"));
+    auto* hideZero = portfolio->findChild<QAction*>(QStringLiteral("hideZero"));
     hideZero->setChecked(true);
     hideCoins->setChecked(true);
     pause(450);
@@ -435,18 +440,14 @@ void testDust(const Check& check, const QList<wallet::AccountKey>& keys)
     for (int row = 0; row < assets->model()->rowCount(); ++row)
         dustShown = dustShown || assets->model()->index(row, 0).data().toString() == QLatin1String("Ethereum");
     check(dustShown, QStringLiteral("the page of one address shows its dust"));
-    QCheckBox* holdingsHide = nullptr;
-    for (QCheckBox* box : holdingsPage->findChildren<QCheckBox*>()) {
-        if (box->text().contains(QLatin1String("dust")))
-            holdingsHide = box;
-    }
+    QAction* holdingsHide = holdingsPage->findChild<QAction*>(QStringLiteral("holdingsHideDust"));
     check(holdingsHide && !holdingsHide->isVisible(), QStringLiteral("with nothing to untick: it would change every other list and hide nothing there"));
     scene.window->showPage(QStringLiteral("history"));
 
     // The history.
     auto* history = scene.window->findChild<ui::HistoryPage*>();
     ui::HistoryTableModel* lines = history->tableModel();
-    auto* hideLines = history->findChild<QCheckBox*>(QStringLiteral("historyHideDust"));
+    auto* hideLines = history->findChild<QAction*>(QStringLiteral("historyHideDust"));
     hideLines->setChecked(true);
     const int dustLine = scene.add(transaction({somewhere(1)}, {{scene.scriptOf(6), 500}}, 1));
     const int bigLine = scene.add(transaction({somewhere(2)}, {{scene.scriptOf(6), 500000}}, 2));
@@ -522,8 +523,8 @@ void testOnlyDust(const Check& check, const QList<wallet::AccountKey>& keys)
     scene.window->showPage(QStringLiteral("portfolio"));
     auto* portfolio = scene.window->findChild<ui::PortfolioPage*>();
     QTableView* coins = portfolio->table()->view();
-    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
-    portfolio->findChild<QCheckBox*>(QStringLiteral("hideDust"))->setChecked(true);
+    portfolio->findChild<QAction*>(QStringLiteral("hideZero"))->setChecked(true);
+    portfolio->findChild<QAction*>(QStringLiteral("hideDust"))->setChecked(true);
     const wallet::Asset eth = wallet::networkInfo(scene.ethereum).coin;
     check(waitFor([&] {
               answerAll(scene.model, scene.shop);
@@ -538,10 +539,10 @@ void testOnlyDust(const Check& check, const QList<wallet::AccountKey>& keys)
         return out;
     };
     check(names() == QStringList{QStringLiteral("Ethereum")}, QStringLiteral("all there is being dust, it stays, and what holds nothing goes: %1").arg(names().join(QStringLiteral(", "))));
-    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(false);
+    portfolio->findChild<QAction*>(QStringLiteral("hideZero"))->setChecked(false);
     pause(100);
     check(names().size() == coins->model()->rowCount() && names().contains(QStringLiteral("Bitcoin")) && names().contains(QStringLiteral("Ethereum")), QStringLiteral("with zeros shown, those too: %1").arg(names().join(QStringLiteral(", "))));
-    portfolio->findChild<QCheckBox*>(QStringLiteral("hideZero"))->setChecked(true);
+    portfolio->findChild<QAction*>(QStringLiteral("hideZero"))->setChecked(true);
 
     // A place of nothing but dust says so, rather than that a search found nothing.
     auto* addresses = scene.window->findChild<ui::AddressesPage*>();
@@ -556,7 +557,7 @@ void testOnlyDust(const Check& check, const QList<wallet::AccountKey>& keys)
     scene.add(transaction({somewhere(1)}, {{scene.scriptOf(1), 500}}, 1));
     auto* history = scene.window->findChild<ui::HistoryPage*>();
     scene.window->showPage(QStringLiteral("history"));
-    history->findChild<QCheckBox*>(QStringLiteral("historyHideDust"))->setChecked(true);
+    history->findChild<QAction*>(QStringLiteral("historyHideDust"))->setChecked(true);
     history->tableModel()->rebuildNow();
     pause(300);
     auto* onlyDustLines = history->findChild<QWidget*>(QStringLiteral("historyOnlyDust"));
@@ -1078,11 +1079,11 @@ void testPayments(const Check& check, const QList<wallet::AccountKey>& keys)
             check(list->model()->index(0, 3).data().toString() == QStringLiteral("Shop"), QStringLiteral("named by its wallet"));
             check(list->model()->index(0, 5).data().toString() == QStringLiteral("Balance went up"), QStringLiteral("saying what that rests on"));
             const int lastRow = list->model()->rowCount() - 1;
-            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Not in a block yet"), QStringLiteral("a transaction by how it stands: %1").arg(list->model()->index(lastRow, 5).data().toString()));
+            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Pending"), QStringLiteral("a transaction by how it stands: %1").arg(list->model()->index(lastRow, 5).data().toString()));
             scene.book->setHeight(first, 900000);
-            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("In a block, proof on its way"), QStringLiteral("on a server's word: %1").arg(list->model()->index(lastRow, 5).data().toString()));
+            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Verifying"), QStringLiteral("on a server's word: %1").arg(list->model()->index(lastRow, 5).data().toString()));
             scene.book->setProven(first, true);
-            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("In a block"), QStringLiteral("proven"));
+            check(list->model()->index(lastRow, 5).data().toString() == QStringLiteral("Confirmed") || list->model()->index(lastRow, 5).data().toString().contains(QLatin1String("confirmation")), QStringLiteral("proven: %1").arg(list->model()->index(lastRow, 5).data().toString()));
             check(list->model()->index(0, 1).data(Qt::FontRole).value<QFont>().weight() > QFont::Normal, QStringLiteral("what has not been looked at is bold"));
             const int shownNow = list->model()->rowCount();
             setToken(9, 10000000);

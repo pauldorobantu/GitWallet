@@ -73,6 +73,7 @@ private:
     QHBoxLayout* path_ = nullptr;
     QLabel* mark_ = nullptr;
     QLabel* title_ = nullptr;
+    QLabel* address_ = nullptr; // of one address: which one
     QLabel* detail_ = nullptr;
     QPushButton* copy_ = nullptr;
     QPushButton* explorer_ = nullptr;

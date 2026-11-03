@@ -2,7 +2,8 @@
 
 #include <QWidget>
 
-class QCheckBox;
+class QAction;
+class QPushButton;
 class QLabel;
 
 namespace app {
@@ -30,8 +31,9 @@ private:
 
     WalletController* controller_ = nullptr;
     HoldingsTable* table_ = nullptr;
-    QCheckBox* hideZero_ = nullptr;
-    QCheckBox* hideDust_ = nullptr;
+    QAction* hideZero_ = nullptr;
+    QAction* hideDust_ = nullptr;
+    QPushButton* view_ = nullptr;
     QLabel* count_ = nullptr;
 };
 

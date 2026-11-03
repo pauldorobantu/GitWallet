@@ -1,6 +1,7 @@
 #include "ui/Figures.h"
 
 #include "core/SettingsRepo.h"
+#include "ui/LanguageManager.h"
 
 #include <QLocale>
 #include <QStringList>
@@ -63,6 +64,18 @@ bool hideDust()
 void setHideDust(bool hide)
 {
     SettingsRepo().set(QStringLiteral("ui.hideDust"), hide ? QStringLiteral("1") : QStringLiteral("0"));
+}
+
+QString confirmations(int blocks)
+{
+    if (blocks >= kEnoughConfirmations)
+        return trText(QStringLiteral("Confirmed"));
+    return blocks <= 1 ? trText(QStringLiteral("1 confirmation")) : trText(QStringLiteral("%1 confirmations")).arg(blocks);
+}
+
+QString counted(int n, const QString& one, const QString& many)
+{
+    return trText(n == 1 ? one : many).arg(formatCount(n));
 }
 
 QString countSoFar(int count, bool complete)

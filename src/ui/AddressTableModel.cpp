@@ -250,9 +250,9 @@ bool notInABlock(const wallet::AddressRow& row)
 QString stateLabel(const wallet::AddressRow& row, bool givenOut)
 {
     if (givenOut && row.state() == wallet::AddressState::Unused)
-        return trText(QStringLiteral("Given out"));
+        return trText(QStringLiteral("Waiting"));
     if (notInABlock(row))
-        return trText(QStringLiteral("Not in a block yet"));
+        return trText(QStringLiteral("Pending"));
     switch (row.state()) {
     case wallet::AddressState::Funded:
         return trText(QStringLiteral("Funded"));
@@ -439,7 +439,7 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
         case Qt::ToolTipRole:
             switch (column) {
             case ColAddress:
-                return row.address;
+                return QStringLiteral("%1\n%2 · %3 · %4").arg(row.address, wallet::networkInfo(row.network).name, typeLabel(row.type), row.path());
             case ColBalance:
                 return balanceTip(row);
             case ColUsd:
@@ -466,7 +466,7 @@ QVariant AddressTableModel::data(const QModelIndex& index, int role) const
                 if (state == wallet::AddressState::Funded)
                     return toneColor(Tone::Success);
                 if (waitingForPayment(row))
-                    return toneColor(Tone::Accent);
+                    return toneColor(Tone::Neutral);
                 if (state != wallet::AddressState::Used)
                     return toneColor(Tone::Muted);
             }

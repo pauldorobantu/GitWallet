@@ -17,6 +17,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QAction>
 #include <QCheckBox>
 #include <QDate>
 #include <QDateTime>
@@ -263,32 +264,28 @@ QWidget* PortfolioPage::buildWalletState()
     details_->hide();
 
     const page::ActionBar bar = page::makeActionBar(host);
-    hideZero_ = new QCheckBox(QStringLiteral("Hide zero balances"), bar.widget);
-    hideZero_->setObjectName(QStringLiteral("hideZero"));
-    hideZero_->setToolTip(QStringLiteral("A coin that holds nothing leaves this list. One nobody has answered for yet stays."));
-    hideZero_->setChecked(SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
+    const page::ViewMenu viewMenu = page::makeViewMenu(bar.widget);
+    hideZero_ = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide zero balances"), "hideZero", SettingsRepo().get(QStringLiteral("ui.hideZero")) != QLatin1String("0"));
+    hideZero_->setToolTip(QStringLiteral("Hides coins with no balance. A coin no server has answered for yet stays."));
     table_->setHideZero(hideZero_->isChecked());
-    connect(hideZero_, &QCheckBox::toggled, this, [this](bool on) {
+    connect(hideZero_, &QAction::toggled, this, [this](bool on) {
         SettingsRepo().set(QStringLiteral("ui.hideZero"), on ? QStringLiteral("1") : QStringLiteral("0"));
         table_->setHideZero(on);
         refreshView();
     });
-    bar.left->addWidget(hideZero_);
-    hideDust_ = new QCheckBox(QStringLiteral("Hide dust"), bar.widget);
-    hideDust_->setObjectName(QStringLiteral("hideDust"));
-    hideDust_->setChecked(figures::hideDust());
+    hideDust_ = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide dust"), "hideDust", figures::hideDust());
     table_->setHideDust(hideDust_->isChecked());
     const auto dustTip = [this] {
         hideDust_->setToolTip(trText(QStringLiteral("Less than %1 in all leaves this list. It still counts in the total.")).arg(figures::dustLimits()));
     };
     dustTip();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
-    connect(hideDust_, &QCheckBox::toggled, this, [this](bool on) {
+    connect(hideDust_, &QAction::toggled, this, [this](bool on) {
         figures::setHideDust(on);
         table_->setHideDust(on);
         refreshView();
     });
-    bar.left->addWidget(hideDust_);
+    bar.left->addWidget(viewMenu.button);
     countLabel_ = page::makeBarCount(bar.widget);
     bar.left->addWidget(countLabel_);
     bar.left->addStretch(1);

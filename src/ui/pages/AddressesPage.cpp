@@ -19,6 +19,7 @@
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
+#include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
@@ -54,7 +55,7 @@ namespace {
 // What the chain filter holds when it shows every network.
 constexpr int kAllChains = -1;
 // Combo indices of the state filter.
-enum StateFilter { StateAll, StateFunded, StateUsed, StateGivenOut };
+enum StateFilter { StateInUse, StateAll, StateFunded, StateUsed, StateGivenOut };
 
 // Ctrl+C is Copy address: Qt's own would hand out the cell as it reads, unmarked.
 class AddressView : public HoverRowTableView
@@ -153,7 +154,7 @@ public:
         });
     }
     // A combo narrows the list (the search text is reported separately).
-    bool filtered() const { return wallet_ != 0 || chain_ != kAllChains || state_ != StateAll; }
+    bool filtered() const { return wallet_ != 0 || chain_ != kAllChains || (state_ != StateAll && state_ != StateInUse); }
     // The search text or a combo hides rows; otherwise every row passes.
     bool narrowed() const { return filtered() || !query_.isEmpty(); }
     bool accepts(int sourceRow) const { return filterAcceptsRow(sourceRow, QModelIndex()); }
@@ -178,7 +179,12 @@ private:
             return false;
         if (chain_ != kAllChains && first.data(AddressTableModel::NetworkRole).toInt() != chain_)
             return false;
-        if (state_ == StateGivenOut) {
+        if (state_ == StateInUse) {
+            // What the scan only looks past stays out; a search looks at all of it.
+            if (query_.isEmpty() && static_cast<wallet::AddressState>(first.data(AddressTableModel::StateRole).toInt()) == wallet::AddressState::Unused
+                && !first.data(AddressTableModel::GivenOutRole).toBool())
+                return false;
+        } else if (state_ == StateGivenOut) {
             if (!first.data(AddressTableModel::GivenOutRole).toBool())
                 return false;
         } else if (state_ != StateAll) {
@@ -224,7 +230,7 @@ private:
     QString query_;
     quint32 wallet_ = 0; // 0: every wallet
     int chain_ = kAllChains;
-    int state_ = StateAll;
+    int state_ = StateInUse;
     std::optional<wallet::Asset> held_;
     const wallet::WalletModel* model_ = nullptr;
 };
@@ -253,7 +259,7 @@ QString csvTitle(const wallet::AssetInfo& info)
 
 // "500 addresses · 3 funded", or "12 of 500 addresses · 1 funded" while a
 // filter hides some.
-QString countText(int shown, int total, int funded)
+QString countText(int shown, int total, int funded, bool complete)
 {
     // English-first like the rest of the UI: "12,345" whatever the Windows format.
     static const QLocale english(QLocale::English, QLocale::UnitedStates);
@@ -261,7 +267,7 @@ QString countText(int shown, int total, int funded)
     const QString count = shown == total ? english.toString(total)
                                          : trText(QStringLiteral("%1 of %2"))
                                                .arg(english.toString(shown), english.toString(total));
-    return trText(QStringLiteral("%1 %2 · %3 funded")).arg(count, noun, english.toString(funded));
+    return trText(QStringLiteral("%1 %2 · %3 funded")).arg(count, noun, figures::countSoFar(funded, complete));
 }
 
 // Funded rows among the first `rows` of the wallet model, the ones the table
@@ -301,7 +307,8 @@ struct AddressesPage::Ui : QObject
     QComboBox* wallet = nullptr;
     QComboBox* chain = nullptr;
     QComboBox* state = nullptr;
-    QCheckBox* hideDust = nullptr;
+    QAction* hideDust = nullptr;
+    page::ColumnChoice* columns = nullptr;
     QLabel* count = nullptr;
     QPushButton* exportCsv = nullptr;
     QPushButton* refresh = nullptr;
@@ -317,6 +324,7 @@ struct AddressesPage::Ui : QObject
     QTimer* cooldown = nullptr;  // Refresh stays disabled while it runs
     QWidget* nothingHere = nullptr; // a place where no address holds what it is about
     QWidget* onlyDust = nullptr;    // every row that would show is under the limit
+    QWidget* noneInUse = nullptr;   // every row has answered, and none has been used or given out
     bool inPlace = false;        // the wallet and chain come from the place, and their combos are gone
     int placeState = 0;          // the state a place came up on: anything else is the reader's own
     quint32 placeWallet = 0;
@@ -361,14 +369,19 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     root->addWidget(view, 1);
 
     ui_->noWallet = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("No wallet yet"),
-                                         QStringLiteral("Add a wallet on the Wallets page."));
+                                         QStringLiteral("Add a wallet to see its addresses."));
     ui_->waiting = page::makeEmptyState(this, int(icon::Kind::Refresh), QStringLiteral("Scanning addresses"),
-                                        QStringLiteral("Addresses appear here as GitWallet derives and checks them."));
+                                        QStringLiteral("Addresses in use appear here as servers answer for them."));
+    ui_->noneInUse = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("No address in use yet"),
+                                          QStringLiteral("Choose All states below to see every address."));
+    ui_->noneInUse->setObjectName(QStringLiteral("addressesNoneInUse"));
     ui_->noResults = page::makeNoResultsState(this);
-    ui_->nothingHere = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("Nothing here holds it"),
-                                            QStringLiteral("No address of this holds any. All states, below, shows them all."));
+    ui_->nothingHere = page::makeEmptyState(this, int(icon::Kind::ListRows), QStringLiteral("No address here holds this coin"),
+                                            QStringLiteral("Choose All states below to see every address."));
     root->addWidget(ui_->noWallet, 1);
     root->addWidget(ui_->waiting, 1);
+    root->addWidget(ui_->noneInUse, 1);
+    ui_->noneInUse->hide();
     root->addWidget(ui_->noResults, 1);
     root->addWidget(ui_->nothingHere, 1);
     ui_->nothingHere->hide();
@@ -379,7 +392,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->onlyDust->hide();
 
     const page::ActionBar bar = page::makeActionBar(this);
-    ui_->search = page::makeSearch(bar.widget, QStringLiteral("Search address, label or path"));
+    ui_->search = page::makeSearch(bar.widget, QStringLiteral("Address, label or path"));
     ui_->wallet = new QComboBox(bar.widget);
     ui_->wallet->setObjectName(QStringLiteral("walletFilter"));
     ui_->wallet->setSizeAdjustPolicy(QComboBox::AdjustToContents);
@@ -391,19 +404,20 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     ui_->chain->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     ui_->state = new QComboBox(bar.widget);
     ui_->state->setObjectName(QStringLiteral("stateFilter"));
-    ui_->state->addItems({QStringLiteral("All states"), QStringLiteral("Funded"), QStringLiteral("Used"), QStringLiteral("Given out")});
+    ui_->state->addItems({QStringLiteral("In use"), QStringLiteral("All states"), QStringLiteral("Funded"), QStringLiteral("Used"), QStringLiteral("Waiting for payment")});
     ui_->state->setSizeAdjustPolicy(QComboBox::AdjustToContents);
-    ui_->state->setToolTip(trText(QStringLiteral("Funded: holds a balance now. Used: has transactions or a balance. Given out: handed to someone, and nothing has come in yet.")));
-    ui_->hideDust = new QCheckBox(QStringLiteral("Hide dust"), bar.widget);
-    ui_->hideDust->setObjectName(QStringLiteral("addressesHideDust"));
-    ui_->hideDust->setChecked(figures::hideDust());
+    ui_->state->setToolTip(trText(QStringLiteral("In use: holds a balance, has transactions, or is waiting for a payment. Funded: holds a balance now. Used: has transactions or a balance. Waiting for payment: handed to someone, and nothing has come in yet.")));
+    const page::ViewMenu viewMenu = page::makeViewMenu(bar.widget);
+    ui_->hideDust = page::addViewToggle(this, viewMenu.menu, QStringLiteral("Hide dust"), "addressesHideDust", figures::hideDust());
     ui_->filter->setHideDust(ui_->hideDust->isChecked());
+    // What says which address it is stays; chain, type and path are in its tooltip and on its page.
+    ui_->columns = new page::ColumnChoice(view, QStringLiteral("addresses"), {AddressTableModel::ColChain, AddressTableModel::ColType, AddressTableModel::ColPath}, viewMenu.menu);
     const auto dustTip = [this] {
         ui_->hideDust->setToolTip(trText(QStringLiteral("An address holding only less than %1 leaves this list, unless it was given out or has a label. It still counts in every total, and a search still finds it.")).arg(figures::dustLimits()));
     };
     dustTip();
     connect(LanguageManager::instance(), &LanguageManager::changed, this, dustTip);
-    connect(ui_->hideDust, &QCheckBox::toggled, this, [this](bool on) {
+    connect(ui_->hideDust, &QAction::toggled, this, [this](bool on) {
         figures::setHideDust(on);
         ui_->filter->setHideDust(on);
         updateState();
@@ -413,7 +427,7 @@ AddressesPage::AddressesPage(WalletController* controller, QWidget* parent)
     bar.left->addWidget(ui_->wallet);
     bar.left->addWidget(ui_->chain);
     bar.left->addWidget(ui_->state);
-    bar.left->addWidget(ui_->hideDust);
+    bar.left->addWidget(viewMenu.button);
     page::finishBarLeft(bar, ui_->search, ui_->count);
 
     ui_->exportCsv = new QPushButton(QStringLiteral("Export CSV"), bar.widget);
@@ -543,7 +557,7 @@ void AddressesPage::rebuildWalletFilter()
     ui_->filter->setWallet(ui_->wallet->currentData().toUInt());
     ui_->wallet->setVisible(wallets.size() > 1 && !ui_->inPlace);
     if (!ui_->inPlace)
-        ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallets.size() < 2);
+        ui_->columns->forceHidden(AddressTableModel::ColWallet, wallets.size() < 2);
 }
 
 void AddressesPage::showWallet(quint32 id)
@@ -556,7 +570,7 @@ void AddressesPage::showPlace(quint32 wallet, std::optional<wallet::Asset> asset
 {
     ui_->inPlace = true;
     ui_->wholeOwed = false;
-    ui_->placeState = asset ? StateFunded : StateAll;
+    ui_->placeState = asset ? StateFunded : StateInUse;
     ui_->placeWallet = wallet;
     ui_->placeAsset = asset;
     {
@@ -574,8 +588,8 @@ void AddressesPage::showPlace(quint32 wallet, std::optional<wallet::Asset> asset
     ui_->filter->setAll(wallet, ui_->chain->currentData().toInt(), ui_->placeState, asset, controller_ ? controller_->model() : nullptr);
     ui_->wallet->setVisible(false);
     ui_->chain->setVisible(!asset.has_value());
-    ui_->view->setColumnHidden(AddressTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
-    ui_->view->setColumnHidden(AddressTableModel::ColChain, asset.has_value());
+    ui_->columns->forceHidden(AddressTableModel::ColWallet, wallet != 0 || (controller_ && controller_->store().wallets.size() < 2));
+    ui_->columns->forceHidden(AddressTableModel::ColChain, asset.has_value());
     updateState();
 }
 
@@ -602,12 +616,12 @@ void AddressesPage::becomeWhole()
         const QSignalBlocker quietSearch(ui_->search);
         ui_->wallet->setCurrentIndex(0);
         ui_->chain->setCurrentIndex(0);
-        ui_->state->setCurrentIndex(StateAll);
+        ui_->state->setCurrentIndex(StateInUse);
         ui_->search->clear();
     }
-    ui_->filter->setAll(0, kAllChains, StateAll, std::nullopt, nullptr);
+    ui_->filter->setAll(0, kAllChains, StateInUse, std::nullopt, nullptr);
     ui_->chain->setVisible(true);
-    ui_->view->setColumnHidden(AddressTableModel::ColChain, false);
+    ui_->columns->forceHidden(AddressTableModel::ColChain, false);
     rebuildWalletFilter();
     updateState();
 }
@@ -725,9 +739,12 @@ void AddressesPage::chooseExportFile()
         return;
     QString error;
     if (exportCsv(path, &error)) {
+        // A file of those in use leaves out what was never used: said, as it may be taken for all of them.
         Feedback::show(ui_->exportCsv, Feedback::Type::Success,
                        controller_ && controller_->showingSaved()
                            ? trText(QStringLiteral("Addresses exported, with saved balances still being checked"))
+                       : ui_->state->currentIndex() == StateInUse
+                           ? trText(QStringLiteral("Addresses exported: only those in use. All states exports every address."))
                            : trText(QStringLiteral("Addresses exported")));
     } else
         Feedback::show(this, Feedback::Type::Error, error);
@@ -916,9 +933,13 @@ void AddressesPage::updateState()
                 ++funded;
         }
     }
-    QString countLine = hasWallet ? countText(shown, total, funded) : QString();
+    const wallet::WalletModel* rows = controller_ ? controller_->model() : nullptr;
+    const int notChecked = rows ? qMax(0, rows->size() - rows->checkedCount()) : 0;
+    QString countLine = hasWallet ? countText(shown, total, funded, notChecked == 0) : QString();
     if (hasWallet && dustHidden > 0)
         countLine += QStringLiteral(" · ") + trText(QStringLiteral("%1 dust hidden")).arg(figures::formatCount(dustHidden));
+    if (hasWallet && notChecked > 0)
+        countLine += QStringLiteral(" · ") + trText(QStringLiteral("%1 not checked yet")).arg(figures::formatCount(notChecked));
     if (hasWallet && controller_->showingSaved())
         countLine += QStringLiteral(" · ") + trText(QStringLiteral("saved, being checked"));
     ui_->count->setText(countLine);
@@ -931,8 +952,10 @@ void AddressesPage::updateState()
     const bool nothing = hasWallet && ui_->inPlace && !scanning && shown == 0 && dustHidden == 0 && ui_->placeAsset && holdingOf(controller_, *ui_->placeAsset, ui_->placeWallet).complete;
     // What is there is hidden, which is neither nothing nor nothing found.
     const bool onlyDust = hasWallet && shown == 0 && dustHidden > 0;
-    QWidget* empty = !hasWallet ? ui_->noWallet : onlyDust ? ui_->onlyDust : nothing ? ui_->nothingHere : ui_->waiting;
-    for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->nothingHere, ui_->onlyDust}) {
+    // Only once every row has answered: until then nobody knows.
+    const bool noneInUse = hasWallet && shown == 0 && !scanning && notChecked == 0 && ui_->state->currentIndex() == StateInUse;
+    QWidget* empty = !hasWallet ? ui_->noWallet : onlyDust ? ui_->onlyDust : nothing ? ui_->nothingHere : noneInUse ? ui_->noneInUse : ui_->waiting;
+    for (QWidget* other : {ui_->noWallet, ui_->waiting, ui_->nothingHere, ui_->onlyDust, ui_->noneInUse}) {
         if (other != empty)
             other->hide();
     }

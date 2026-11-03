@@ -3,11 +3,19 @@
 #include "ui/design/Tokens.h"
 
 #include <QColor>
+#include <QList>
+#include <QMap>
+#include <QObject>
+#include <QSet>
 #include <QSize>
 #include <QString>
 
 class QAbstractButton;
 class QAbstractItemView;
+class QAction;
+class QMenu;
+class QPushButton;
+class QTableView;
 class QBoxLayout;
 class QDialog;
 class QFormLayout;
@@ -175,6 +183,35 @@ void applyDialogLayout(QBoxLayout* root);
 // transparent în dreapta + glyph coborât 1px; setează și iconSize. Pentru
 // butoanele doar-icon folosește setIcon() normal.
 void setLabeledIcon(QAbstractButton* button, const QIcon& icon);
+
+// One "View" button per list: what the list leaves out, and which of its columns show.
+struct ViewMenu {
+    QPushButton* button = nullptr;
+    QMenu* menu = nullptr;
+};
+ViewMenu makeViewMenu(QWidget* parent);
+// A checkable entry of it, under the name a setting or a test knows it by.
+QAction* addViewToggle(QObject* owner, QMenu* menu, const QString& text, const char* name, bool checked);
+
+// Which columns of a table show: one entry per column in the View menu and on a right click of the
+// header, kept between runs. What a place or a count hides stays hidden whatever was chosen.
+class ColumnChoice : public QObject
+{
+public:
+    ColumnChoice(QTableView* view, const QString& key, const QList<int>& hiddenByDefault, QMenu* menu);
+    void forceHidden(int column, bool hidden);
+    bool chosen(int column) const;
+
+private:
+    void retitle();
+    void apply(int column);
+    void save() const;
+
+    QTableView* view_ = nullptr;
+    QString key_;
+    QMap<int, QAction*> actions_;
+    QSet<int> forced_;
+};
 
 // Buton-icon standard de rând: pătrat kIconBtn, autoRaise, tooltip. `iconKind`
 // e un ui::icon::Kind; `color` o culoare de temă (ex. page::danger()).
