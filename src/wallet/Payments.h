@@ -40,7 +40,8 @@ struct Payment {
 // wallet's own change or a move between its addresses. A network with no history yet has only the
 // balance to go by: more of an asset on a row that had answered, unless that is what it held before a
 // source behind the others said less for a moment. Less than counts as dust goes untold while the lists
-// hide it, unless the address was given out or has a label. GUI thread only.
+// hide it, unless the address was given out or has a label. What was told of while in no block is told of
+// again once it is proven in one, or replaced or dropped. GUI thread only.
 class PaymentBook : public QObject
 {
     Q_OBJECT
@@ -74,6 +75,8 @@ signals:
     void changed();
     // What came in over the last moment, together: many at once are one thing to say.
     void told(const QList<wallet::Payment>& payments);
+    // What became of those told of while in no block, this run: proven in one, or replaced or dropped.
+    void settled(const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>& gone);
 
 private:
     void onRowMoved(int row, const AddressRow& before);
@@ -81,6 +84,7 @@ private:
     bool isDust(Asset asset, const chain::Amount& amount, const QList<int>& rows) const;
     void record(Asset asset, const chain::Amount& amount, quint32 wallet, const QString& address, int addresses, const chain::Hash256* txid, bool whileClosed);
     void tellNow();
+    void lookAtWaiting();
 
     struct Fall {
         chain::Amount from;
@@ -95,7 +99,9 @@ private:
     QSet<chain::Hash256> told_;
     QHash<Network, QHash<QString, bool>> expecting_; // addresses whose status moved on from a history complete here, and whether that was at the start
     QHash<QString, Fall> falls_;              // by asset and address
+    QHash<chain::Hash256, qint64> waiting_;   // told of while in no block: which payment
     QTimer* pause_ = nullptr;
+    QTimer* lookAgain_ = nullptr;
     qint64 lastId_ = 0;
     int unread_ = 0;
 };

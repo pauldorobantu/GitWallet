@@ -375,7 +375,7 @@ int main(int argc, char** argv)
                                 QStringLiteral("--scan-report"), QStringLiteral("--screenshot"),
                                 QStringLiteral("--store-test"), QStringLiteral("--screens-test"), QStringLiteral("--screen-pictures"), QStringLiteral("--demo-wallets"),
                                 QStringLiteral("--coins-file"), QStringLiteral("--live-places"),
-                                QStringLiteral("--scale-test")}) {
+                                QStringLiteral("--scale-test"), QStringLiteral("--tray-check")}) {
         if (!args.contains(name)) continue;
         if (dataDir.isEmpty() || sameFolder(wallet::WalletStore::dataDir(), realDataDir())) {
             attachParentConsole();
@@ -414,6 +414,9 @@ int main(int argc, char** argv)
     const QString screenPictures = argValue(args, QStringLiteral("--screen-pictures"));
     if (!screenPictures.isEmpty())
         return app::writeScreenPictures(screenPictures) ? 0 : 1;
+    const QString trayCheck = argValue(args, QStringLiteral("--tray-check"));
+    if (!trayCheck.isEmpty())
+        return app::checkTrayAlert(trayCheck) ? 0 : 1;
     // The walkthrough finds buttons by their English text, whatever this user chose.
     if (!args.contains(QStringLiteral("--walkthrough")))
         app::ui::LanguageManager::instance()->loadFromSettings();

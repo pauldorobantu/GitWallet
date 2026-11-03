@@ -43,10 +43,17 @@ PaymentBook::PaymentBook(WalletModel* model, const QList<HistoryBook*>& books, Q
     pause_ = new QTimer(this);
     pause_->setSingleShot(true);
     connect(pause_, &QTimer::timeout, this, &PaymentBook::tellNow);
+    lookAgain_ = new QTimer(this);
+    lookAgain_->setSingleShot(true);
+    connect(lookAgain_, &QTimer::timeout, this, &PaymentBook::lookAtWaiting);
     connect(model_, &WalletModel::rowMoved, this, &PaymentBook::onRowMoved);
     for (HistoryBook* book : std::as_const(books_)) {
         connect(book, &HistoryBook::added, this, [this, book](int position) { onAdded(book, position); });
         connect(book, &HistoryBook::cleared, this, [this, book] { expecting_.remove(book->network()); });
+        connect(book, &HistoryBook::changed, this, [this] {
+            if (!waiting_.isEmpty() && !lookAgain_->isActive())
+                lookAgain_->start(gPauseMs);
+        });
     }
 }
 
@@ -139,6 +146,8 @@ void PaymentBook::onAdded(HistoryBook* book, int position)
             continue;
         const int old = book->find(earlier.txid);
         if (old >= 0 && spendTheSame(book->at(old), tx)) {
+            waiting_.remove(earlier.txid);
+            waiting_.insert(tx.txid, earlier.id);
             earlier.txid = tx.txid;
             told_.insert(tx.txid);
             emit recorded(earlier);
@@ -149,7 +158,11 @@ void PaymentBook::onAdded(HistoryBook* book, int position)
     if (isDust(networkInfo(book->network()).coin, amount, rows))
         return;
     told_.insert(tx.txid);
-    record(networkInfo(book->network()).coin, amount, wallet, first, addresses, &tx.txid, whileClosed);
+    const bool pending = tx.height <= 0;
+    const chain::Hash256 txid = tx.txid;
+    record(networkInfo(book->network()).coin, amount, wallet, first, addresses, &txid, whileClosed);
+    if (pending)
+        waiting_.insert(txid, lastId_);
 }
 
 bool PaymentBook::isDust(Asset asset, const chain::Amount& amount, const QList<int>& rows) const
@@ -208,6 +221,35 @@ void PaymentBook::tellNow()
         emit told(payments);
 }
 
+void PaymentBook::lookAtWaiting()
+{
+    QList<Payment> inABlock;
+    QList<Payment> gone;
+    for (auto it = waiting_.begin(); it != waiting_.end();) {
+        const auto payment = std::find_if(payments_.crbegin(), payments_.crend(), [&it](const Payment& one) { return one.id == it.value(); });
+        const AssetInfo* info = payment != payments_.crend() ? findAsset(payment->asset) : nullptr;
+        const auto own = info ? std::find_if(books_.cbegin(), books_.cend(), [info](const HistoryBook* book) { return book->network() == info->network; }) : books_.cend();
+        const int position = own != books_.cend() ? (*own)->find(it.key()) : -1;
+        // Forgotten, or the wallet it was for is gone: nothing left to say of it.
+        if (position < 0) {
+            it = waiting_.erase(it);
+            continue;
+        }
+        const TxRecord& tx = (*own)->at(position);
+        if (tx.seen != TxSeen::Alive) {
+            gone.append(*payment);
+            it = waiting_.erase(it);
+        } else if (tx.height > 0 && tx.proven) {
+            inABlock.append(*payment);
+            it = waiting_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!inABlock.isEmpty() || !gone.isEmpty())
+        emit settled(inABlock, gone);
+}
+
 void PaymentBook::markAllRead()
 {
     if (unread_ == 0)
@@ -254,9 +296,11 @@ void PaymentBook::clear()
     pause_->stop();
     payments_.clear();
     toTell_.clear();
+    lookAgain_->stop();
     told_.clear();
     expecting_.clear();
     falls_.clear();
+    waiting_.clear();
     unread_ = 0;
     emit changed();
 }

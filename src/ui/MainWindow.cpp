@@ -23,8 +23,10 @@
 #include "ui/pages/PortfolioPage.h"
 #include "ui/pages/ReceivePage.h"
 #include "ui/pages/SettingsPage.h"
+#include "wallet/History.h"
 #include "wallet/Payments.h"
 #include "wallet/Types.h"
+#include "wallet/UtxoHistory.h"
 #include "wallet/WalletModel.h"
 #include "wallet/WalletStore.h"
 
@@ -270,6 +272,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     // missing or stale. They go on screen.
     connect(controller_, &WalletController::errorOccurred, this, &MainWindow::onWalletError);
     connect(controller_->payments(), &wallet::PaymentBook::told, this, &MainWindow::onPaymentsTold);
+    connect(controller_->payments(), &wallet::PaymentBook::settled, this, &MainWindow::onPaymentsSettled);
     connect(controller_->payments(), &wallet::PaymentBook::changed, this, &MainWindow::refreshBell);
     connect(controller_, &WalletController::passwordChanged, this, &MainWindow::afterPasswordChange);
     connect(controller_, &WalletController::walletChanged, this, &MainWindow::afterPasswordChange);
@@ -647,22 +650,37 @@ void MainWindow::openPayments()
     dialog->open();
 }
 
+namespace {
+
+QString worthOf(const wallet::Payment& payment)
+{
+    const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
+    QString text = info ? figures::formatAmount(payment.amount, *info) + QLatin1Char(' ') + info->symbol : payment.asset;
+    if (payment.usd > 0.0)
+        text += QStringLiteral(" (%1)").arg(figures::formatUsd(payment.usd));
+    return text;
+}
+
+} // namespace
+
 void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
 {
     if (payments.isEmpty() || SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) == QLatin1String("0"))
         return;
-    const auto worth = [](const wallet::Payment& payment) {
-        const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
-        QString text = info ? figures::formatAmount(payment.amount, *info) + QLatin1Char(' ') + info->symbol : payment.asset;
-        if (payment.usd > 0.0)
-            text += QStringLiteral(" (%1)").arg(figures::formatUsd(payment.usd));
-        return text;
+    const auto worth = worthOf;
+    // A payment in no block yet can still be replaced: it is not told of as received, here as anywhere.
+    const auto inNoBlock = [this](const wallet::Payment& payment) {
+        const wallet::AssetInfo* info = payment.hasTx ? wallet::findAsset(payment.asset) : nullptr;
+        const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
+        const int position = history ? history->book()->find(payment.txid) : -1;
+        return position >= 0 && history->book()->at(position).height <= 0;
     };
     const bool whileClosed = std::any_of(payments.cbegin(), payments.cend(), [](const wallet::Payment& payment) { return payment.whileClosed; });
     QString text;
     if (payments.size() == 1 && !whileClosed) {
         const wallet::WalletEntry* entry = controller_->store().find(payments.first().wallet);
-        text = trText(QStringLiteral("Received %1 · %2")).arg(worth(payments.first()), entry ? entry->label : QString());
+        text = (inNoBlock(payments.first()) ? trText(QStringLiteral("Coming in, not in a block yet: %1 · %2")) : trText(QStringLiteral("Received %1 · %2")))
+                   .arg(worth(payments.first()), entry ? entry->label : QString());
     } else if (whileClosed) {
         text = payments.size() == 1 ? trText(QStringLiteral("A payment came in while GitWallet was closed: %1")).arg(worth(payments.first()))
                                     : trText(QStringLiteral("%1 payments came in while GitWallet was closed")).arg(figures::formatCount(int(payments.size())));
@@ -675,13 +693,53 @@ void MainWindow::onPaymentsTold(const QList<wallet::Payment>& payments)
         }
         text = priced ? trText(QStringLiteral("%1 payments came in · %2")).arg(figures::formatCount(int(payments.size())), figures::formatUsd(usd))
                       : trText(QStringLiteral("%1 payments came in")).arg(figures::formatCount(int(payments.size())));
+        const int notYet = int(std::count_if(payments.cbegin(), payments.cend(), inNoBlock));
+        if (notYet > 0)
+            text += QStringLiteral(" · ") + trText(QStringLiteral("%1 not in a block yet")).arg(figures::formatCount(notYet));
     }
     // Nothing of it to whoever is looking at a locked window.
     if (locked_)
         text = trText(QStringLiteral("A payment came in"));
+    sayPayment(text, int(Feedback::Type::Success));
+}
+
+void MainWindow::onPaymentsSettled(const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>& gone)
+{
+    // Nothing of it to whoever is looking at a locked window, and the list has it by then.
+    if (locked_ || SettingsRepo().get(QStringLiteral("ui.paymentAlerts")) == QLatin1String("0"))
+        return;
+    const auto named = [this](const wallet::Payment& payment) {
+        const wallet::WalletEntry* entry = controller_->store().find(payment.wallet);
+        return QStringLiteral("%1 · %2").arg(worthOf(payment), entry ? entry->label : QString());
+    };
+    // What was counted on and will not come goes first: it is what someone has to act on.
+    if (!gone.isEmpty()) {
+        sayPayment(gone.size() == 1 ? trText(QStringLiteral("Replaced or dropped, so not paid: %1")).arg(named(gone.first()))
+                                    : trText(QStringLiteral("%1 payments were replaced or dropped, so not paid")).arg(figures::formatCount(int(gone.size()))),
+                   int(Feedback::Type::Warning));
+        return;
+    }
+    if (!inABlock.isEmpty())
+        sayPayment(inABlock.size() == 1 ? trText(QStringLiteral("In a block: %1")).arg(named(inABlock.first()))
+                                        : trText(QStringLiteral("%1 payments got into a block")).arg(figures::formatCount(int(inABlock.size()))),
+                   int(Feedback::Type::Success));
+}
+
+void MainWindow::sayPaymentForTest(const QString& text)
+{
+    sayPayment(text, int(Feedback::Type::Info));
+}
+
+bool MainWindow::trayShown() const
+{
+    return tray_ && tray_->isVisible();
+}
+
+void MainWindow::sayPayment(const QString& text, int feedbackType)
+{
     lastPaymentAlert_ = text;
     if (QGuiApplication::applicationState() == Qt::ApplicationActive) {
-        Feedback::show(this, Feedback::Type::Success, text);
+        Feedback::show(this, Feedback::Type(feedbackType), text);
         return;
     }
     if (SettingsRepo().get(QStringLiteral("ui.paymentAlertsWindows")) != QLatin1String("0") && QSystemTrayIcon::isSystemTrayAvailable()) {

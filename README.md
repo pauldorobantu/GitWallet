@@ -100,7 +100,8 @@ something is still being read a figure says so: "≥" for what is known so far, 
    latest 5,000, with what each was worth then and how it stands now. On Bitcoin a payment is a transaction
    read because an address moved on from a history complete here, and that spends nothing of the wallets':
    so the first look at a wallet tells of nothing, nor do change and moves between its addresses, and a higher
-   fee on the same payment is no second one. It reads "Not in a block yet" until it is. Ethereum has no history
+   fee on the same payment is no second one. It is told as "Coming in, not in a block yet", and told again
+   once proven in a block, or as not paid if it is replaced or dropped. Ethereum has no history
    here yet and goes by the balance going up, past a source behind the others saying less for a moment; a
    move between its own addresses reads as a payment there until the next stage. It can only say so while
    it runs: what came while it was closed is told at the next start, as that. Dust goes untold while it is

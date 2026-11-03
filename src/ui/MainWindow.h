@@ -58,6 +58,9 @@ public:
     TitleBar* titleBar() const { return title_; }
     void openPayments(); // the list of what came in
     QString lastPaymentAlert() const { return lastPaymentAlert_; } // for tests
+    bool trayShown() const;                                        // for a check on the real platform
+    void sayPaymentForTest(const QString& text);
+    void unlockForTest() { showUnlocked(); }
 
     // Covers everything with the page that asks for the password. The scans go on behind it, and
     // nothing shows of them. With no password there is nothing to lock with.
@@ -129,6 +132,8 @@ private:
     void dismissNotices();
     void flushToast();
     void onPaymentsTold(const QList<wallet::Payment>& payments);
+    void onPaymentsSettled(const QList<wallet::Payment>& inABlock, const QList<wallet::Payment>& gone);
+    void sayPayment(const QString& text, int feedbackType); // on the spot, or as a Windows notification
     void refreshBell();
     void showLocked();
     void showUnlocked();

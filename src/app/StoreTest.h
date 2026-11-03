@@ -24,5 +24,7 @@ StoreTestResult runScreensTestAlone(); // the part of it that is about the scree
 bool writeQrSamples(const QString& folder);
 // The screens with made-up figures in them, as pictures. On a throw-away --data-dir.
 bool writeScreenPictures(const QString& folder);
+// Whether a notification gets as far as Windows, into a file, on the real platform.
+bool checkTrayAlert(const QString& file);
 
 } // namespace app

@@ -161,6 +161,13 @@ private:
         return position >= 0 ? &history->book()->at(position) : nullptr;
     }
 
+    bool proofFailed(const wallet::Payment& payment) const
+    {
+        const wallet::AssetInfo* info = wallet::findAsset(payment.asset);
+        const wallet::UtxoHistory* history = info ? controller_->historyOf(info->network) : nullptr;
+        return history && history->proofFailed(payment.txid);
+    }
+
     QString stateKey(const wallet::Payment& payment) const
     {
         if (!payment.hasTx)
@@ -168,9 +175,9 @@ private:
         const wallet::TxRecord* tx = recordOf(payment);
         if (!tx)
             return QStringLiteral("gone");
-        if (tx->seen != wallet::TxSeen::Alive)
+        if (tx->seen != wallet::TxSeen::Alive || (tx->height > 0 && !tx->proven && proofFailed(payment)))
             return QStringLiteral("gone");
-        return tx->height > 0 ? QStringLiteral("block") : QStringLiteral("pending");
+        return tx->height > 0 && tx->proven ? QStringLiteral("block") : QStringLiteral("pending");
     }
 
     QString stateText(const wallet::Payment& payment) const
@@ -184,7 +191,11 @@ private:
             return trText(QStringLiteral("Replaced"));
         if (tx->seen == wallet::TxSeen::Dropped)
             return trText(QStringLiteral("Dropped"));
-        return tx->height > 0 ? trText(QStringLiteral("In a block")) : trText(QStringLiteral("Not in a block yet"));
+        if (tx->height <= 0)
+            return trText(QStringLiteral("Not in a block yet"));
+        if (tx->proven)
+            return trText(QStringLiteral("In a block"));
+        return proofFailed(payment) ? trText(QStringLiteral("In a block, proof did not hold")) : trText(QStringLiteral("In a block, proof on its way"));
     }
 
     WalletController* controller_ = nullptr;
